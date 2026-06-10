@@ -443,7 +443,7 @@ def _do_run(opts: dict) -> int:
                     gateway=gateway_client,
                 )
             else:
-                _register_internal(
+                state.worker_pids = _register_internal(
                     model=opts["model"],
                     backend=opts["backend"],
                     model_path=opts["model_path"],
@@ -457,8 +457,12 @@ def _do_run(opts: dict) -> int:
                     router=router_client,
                     log_dir=log_dir,
                 )
+                state.save()
         except BaseException:
-            kill_pids([gateway_pid, router_pid], grace_s=5.0)
+            kill_pids(
+                [gateway_pid, router_pid, *state.worker_pids],
+                grace_s=5.0,
+            )
             DaemonState.remove()
             raise
 
@@ -625,11 +629,9 @@ def _do_stop(grace: float, force: bool) -> int:
         DaemonState.remove()
         return 0
 
-    pids = [p for p in (s.gateway_pid, s.router_pid) if p > 0]
-    if not any(gateway_alive(s) for _ in [None]):
-        click.echo("daemon pid not alive; removing state", err=True)
-        DaemonState.remove()
-        return 0
+    pids = [
+        p for p in (s.gateway_pid, s.router_pid, *s.worker_pids) if p > 0
+    ]
 
     if force:
         for p in pids:

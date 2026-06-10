@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import json
-import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from areal.experimental.cli.state import areal_home, atomic_write_json, pid_alive
@@ -34,6 +33,7 @@ class DaemonState:
     router_url: str
     admin_api_key: str
     started_at: float
+    worker_pids: list[int] = field(default_factory=list)
 
     def save(self) -> None:
         atomic_write_json(state_path(), asdict(self))

@@ -798,3 +798,155 @@ def _load_running_state() -> DaemonState:
     if not gateway_alive(s):
         raise click.ClickException("daemon pid not alive")
     return s
+
+
+# =============================================================================
+# inf reward
+# =============================================================================
+
+
+@inf.command(name="reward", help="Set reward on a session (closes the active trajectory).")
+@click.argument("session_api_key")
+@click.argument("reward_value", type=float)
+@click.option("--model", default=None, help="Model name (optional, used for routing).")
+def _reward_cmd(session_api_key: str, reward_value: float, model: str | None) -> None:
+    raise SystemExit(_do_reward(session_api_key, reward_value, model) or 0)
+
+
+def _do_reward(skey: str, reward: float, model: str | None) -> int:
+    s = _load_running_state()
+    gateway = GatewayClient(s.gateway_url, s.admin_api_key)
+    try:
+        gateway.set_reward(session_api_key=skey, reward=reward, model=model)
+    except (GatewayUnreachable, GatewayHTTPError) as e:
+        raise click.ClickException(f"set_reward failed: {e}") from e
+    return 0
+
+
+# =============================================================================
+# inf collect — client-side batch orchestrator
+# =============================================================================
+
+
+@inf.command(
+    name="collect",
+    help="Start N sessions, wait for trajectories to be ready, export and dump them.",
+)
+@click.argument("model")
+@click.option("--batch-size", type=int, required=True, help="Number of sessions / trajectories to collect.")
+@click.option("--task-id", default="cli-collect", help="Logical task identifier passed to start_session.")
+@click.option("--sessions-out", "sessions_out", type=click.Path(path_type=Path), default=None,
+              help="Write the (session_id, session_api_key) list here so an external agent can pick it up.")
+@click.option("--output", "-o", type=click.Path(path_type=Path), default=None,
+              help="Write collected trajectories as JSONL here.  Defaults to stdout.")
+@click.option("--timeout", type=float, default=1800.0, show_default=True,
+              help="Max seconds to wait for the batch.")
+@click.option("--poll-interval", type=float, default=2.0, show_default=True,
+              help="Seconds between /export_trajectories polls.")
+@click.option("--discount", type=float, default=1.0, show_default=True,
+              help="Reward discount passed to export_trajectories.")
+@click.option("--style",
+              type=click.Choice(["individual", "concat"]),
+              default="individual", show_default=True)
+def _collect_cmd(
+    model: str, batch_size: int, task_id: str,
+    sessions_out: Path | None, output: Path | None,
+    timeout: float, poll_interval: float,
+    discount: float, style: str,
+) -> None:
+    raise SystemExit(_do_collect(
+        model=model, batch_size=batch_size, task_id=task_id,
+        sessions_out=sessions_out, output=output,
+        timeout=timeout, poll_interval=poll_interval,
+        discount=discount, style=style,
+    ) or 0)
+
+
+def _do_collect(
+    *, model: str, batch_size: int, task_id: str,
+    sessions_out: Path | None, output: Path | None,
+    timeout: float, poll_interval: float,
+    discount: float, style: str,
+) -> int:
+    s = _load_running_state()
+    gateway = GatewayClient(s.gateway_url, s.admin_api_key)
+
+    logger.info("starting %d session(s) for model %r ...", batch_size, model)
+    try:
+        resp = gateway.start_session(model=model, task_id=task_id, group_size=batch_size)
+    except (GatewayUnreachable, GatewayHTTPError) as e:
+        raise click.ClickException(f"start_session failed: {e}") from e
+
+    group_id = resp.get("group_id", "")
+    sessions = resp.get("sessions") or []
+    sids = [sess["session_id"] for sess in sessions]
+    if len(sids) != batch_size:
+        logger.warning(
+            "server returned %d sessions but %d were requested",
+            len(sids), batch_size,
+        )
+
+    if sessions_out:
+        sessions_out.parent.mkdir(parents=True, exist_ok=True)
+        with open(sessions_out, "w") as f:
+            json.dump({"group_id": group_id, "sessions": sessions}, f, indent=2)
+        logger.info("wrote %d session(s) to %s", len(sessions), sessions_out)
+    else:
+        click.echo(json.dumps({"group_id": group_id, "sessions": sessions}, indent=2))
+
+    logger.info(
+        "polling /export_trajectories every %.1fs (timeout=%.0fs) ...",
+        poll_interval, timeout,
+    )
+    collected: dict[str, dict] = {}
+    deadline = time.time() + timeout
+    while len(collected) < batch_size and time.time() < deadline:
+        try:
+            r = gateway.export_trajectories(
+                session_ids=sids, group_id=group_id,
+                remove_session=False, discount=discount, style=style,
+            )
+        except GatewayHTTPError as e:
+            raise click.ClickException(f"export_trajectories failed: {e}") from e
+        except GatewayUnreachable as e:
+            logger.warning("gateway unreachable mid-poll: %s", e)
+            time.sleep(poll_interval)
+            continue
+        traj = r.get("traj") or {}
+        for tid, interaction in traj.items():
+            if tid not in collected:
+                collected[tid] = interaction
+        if len(collected) < batch_size:
+            logger.info("collected %d/%d, waiting ...", len(collected), batch_size)
+            time.sleep(poll_interval)
+
+    try:
+        r = gateway.export_trajectories(
+            session_ids=sids, group_id=group_id,
+            remove_session=True, discount=discount, style=style,
+        )
+        for tid, interaction in (r.get("traj") or {}).items():
+            if tid not in collected:
+                collected[tid] = interaction
+    except (GatewayHTTPError, GatewayUnreachable) as e:
+        logger.warning("final cleanup export failed: %s", e)
+
+    if len(collected) < batch_size:
+        logger.warning(
+            "collected %d/%d trajectories before timeout (%.0fs)",
+            len(collected), batch_size, timeout,
+        )
+    else:
+        logger.info("collected %d trajectories", len(collected))
+
+    if output:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with open(output, "w") as f:
+            for tid, interaction in collected.items():
+                f.write(json.dumps({"trajectory_id": tid, **interaction}) + "\n")
+        click.echo(f"wrote {len(collected)} trajectories to {output}")
+    else:
+        for tid, interaction in collected.items():
+            click.echo(json.dumps({"trajectory_id": tid, **interaction}))
+
+    return 0 if len(collected) >= batch_size else 1

@@ -68,6 +68,54 @@ class GatewayClient:
             timeout=timeout,
         )
 
+    def start_session(
+        self, *, model: str, task_id: str, group_size: int,
+        timeout: float = 30.0,
+    ) -> dict:
+        return _request(
+            f"{self.base}/rl/start_session",
+            method="POST",
+            payload={"model": model, "task_id": task_id, "group_size": group_size},
+            bearer=self.key,
+            timeout=timeout,
+        )
+
+    def set_reward(
+        self, *, session_api_key: str, reward: float, model: str | None = None,
+        timeout: float = 10.0,
+    ) -> dict:
+        payload: dict = {"reward": reward}
+        if model:
+            payload["model"] = model
+        return _request(
+            f"{self.base}/rl/set_reward",
+            method="POST",
+            payload=payload,
+            bearer=session_api_key,
+            timeout=timeout,
+        )
+
+    def export_trajectories(
+        self, *, session_ids: list[str], group_id: str | None = None,
+        remove_session: bool = True, discount: float = 1.0,
+        style: str = "individual", timeout: float = 30.0,
+    ) -> dict:
+        payload: dict = {
+            "session_ids": session_ids,
+            "remove_session": remove_session,
+            "discount": discount,
+            "style": style,
+        }
+        if group_id:
+            payload["group_id"] = group_id
+        return _request(
+            f"{self.base}/export_trajectories",
+            method="POST",
+            payload=payload,
+            bearer=self.key,
+            timeout=timeout,
+        )
+
 
 class RouterClient:
     def __init__(self, base_url: str, admin_api_key: str) -> None:

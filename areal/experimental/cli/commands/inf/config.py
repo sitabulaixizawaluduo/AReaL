@@ -49,8 +49,9 @@ _BINDINGS: dict[tuple[str, str], tuple[str, str]] = {
     ("collect", "batch_size"):        ("collect",  "batch_size"),
     ("collect", "timeout"):           ("collect",  "timeout"),
     ("collect", "poll_interval"):     ("collect",  "poll_interval"),
-    ("collect", "discount"):          ("collect",  "discount"),
-    ("collect", "style"):             ("collect",  "style"),
+    ("collect", "turn_discount"):     ("collect",  "turn_discount"),
+    ("collect", "export_style"):      ("collect",  "export_style"),
+    ("collect", "format"):            ("collect",  "format"),
 }
 
 

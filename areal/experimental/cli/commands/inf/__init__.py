@@ -44,8 +44,17 @@ from areal.experimental.cli.state import pid_alive
 
 
 @click.group(help="Manage the local AReaL inference service.")
-def inf() -> None:
-    pass
+@click.option(
+    "--config", "config_file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Extra TOML file merged on top of ~/.areal/inf/config.toml.",
+)
+@click.pass_context
+def inf(ctx: click.Context, config_file: Path | None) -> None:
+    from areal.experimental.cli.commands.inf.config import load_click_default_map
+
+    ctx.default_map = load_click_default_map(extra=config_file)
 
 
 # =============================================================================
@@ -146,6 +155,27 @@ def _resolve_provider_api_key(
 
 def _split_args(s: str) -> list[str]:
     return shlex.split(s) if s else []
+
+
+_ENGINE_ARGS_HELP = (
+    "Shell-style string forwarded verbatim to the sglang / vllm process. "
+    "Common sglang knobs: --mem-fraction-static 0.85, "
+    "--max-running-requests 256, --chunked-prefill-size 4096, "
+    "--disable-radix-cache, --enable-torch-compile. "
+    "See the sglang / vllm CLI docs for the full surface."
+)
+
+_PROXY_ARGS_HELP = (
+    "Shell-style string forwarded verbatim to the data-proxy process. "
+    "Available flags: "
+    "--request-timeout (default 120.0), "
+    "--set-reward-finish-timeout (default 0.0), "
+    "--tool-call-parser (default qwen), "
+    "--reasoning-parser (default qwen3), "
+    "--engine-max-tokens, "
+    "--chat-template-type {hf|concat} (default hf). "
+    "Example: --proxy-args '--tool-call-parser deepseek --reasoning-parser deepseek'."
+)
 
 
 # =============================================================================
@@ -352,9 +382,9 @@ def _wait_inf_health(addr: str, *, deadline: float, pid: int, label: str) -> Non
 @click.option("--tokenizer-path", default=None,
               help="Tokenizer path (defaults to --model-path).")
 @click.option("--engine-args", default="", show_default=False,
-              help="Extra shell-style args passed to sglang/vllm.")
+              help=_ENGINE_ARGS_HELP)
 @click.option("--proxy-args", default="", show_default=False,
-              help="Extra shell-style args passed to the data-proxy.")
+              help=_PROXY_ARGS_HELP)
 @click.option("--model-health-timeout", type=float, default=600.0,
               show_default=True,
               help="Seconds to wait for the model server to come up.")
@@ -711,8 +741,8 @@ def _do_stop(grace: float, force: bool) -> int:
               help="Internal backend spec, e.g. 'sglang:tp=2,dp=2'.")
 @click.option("--model-path", default=None)
 @click.option("--tokenizer-path", default=None)
-@click.option("--engine-args", default="")
-@click.option("--proxy-args", default="")
+@click.option("--engine-args", default="", help=_ENGINE_ARGS_HELP)
+@click.option("--proxy-args", default="", help=_PROXY_ARGS_HELP)
 @click.option("--model-health-timeout", type=float, default=600.0,
               show_default=True)
 @click.option("--log-level",
@@ -999,3 +1029,42 @@ def _do_collect(
             click.echo(json.dumps({"trajectory_id": tid, **interaction}))
 
     return 0 if len(collected) >= batch_size else 1
+
+
+# =============================================================================
+# inf logs
+# =============================================================================
+
+
+@inf.command(name="logs", help="Tail a log file under ~/.areal/inf/logs/.")
+@click.option(
+    "--component", default="gateway", show_default=True,
+    help="Log file basename (without .log): gateway, router, "
+         "or <model>-inf-<N> / <model>-data-proxy-<N>.",
+)
+@click.option("-f", "--follow", is_flag=True, help="Stream appended lines.")
+@click.option(
+    "-n", "--lines", type=int, default=200, show_default=True,
+    help="Number of recent lines to print initially.",
+)
+def _logs_cmd(component: str, follow: bool, lines: int) -> None:
+    raise SystemExit(_do_logs(component, follow, lines) or 0)
+
+
+def _do_logs(component: str, follow: bool, lines: int) -> int:
+    log_dir = logs_dir()
+    target = log_dir / f"{component}.log"
+    if not target.exists():
+        available = sorted(p.stem for p in log_dir.glob("*.log"))
+        if not available:
+            raise click.ClickException(f"no logs found under {log_dir}")
+        raise click.ClickException(
+            f"no log named {component!r} under {log_dir}; "
+            f"available: {', '.join(available)}"
+        )
+
+    cmd = ["tail", f"-n{lines}"]
+    if follow:
+        cmd.append("-F")
+    cmd.append(str(target))
+    os.execvp(cmd[0], cmd)

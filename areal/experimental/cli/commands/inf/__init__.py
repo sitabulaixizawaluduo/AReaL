@@ -912,43 +912,50 @@ def _do_reward(skey: str, reward: float, model: str | None) -> int:
     help="Start N sessions, wait for trajectories to be ready, export and dump them.",
 )
 @click.argument("model")
-@click.option("--batch-size", type=int, required=True, help="Number of sessions / trajectories to collect.")
-@click.option("--task-id", default="cli-collect", help="Logical task identifier passed to start_session.")
-@click.option("--sessions-out", "sessions_out", type=click.Path(path_type=Path), default=None,
-              help="Write the (session_id, session_api_key) list here so an external agent can pick it up.")
+@click.option("--batch-size", type=int, required=True, help="Number of trajectories to collect.")
 @click.option("--output", "-o", type=click.Path(path_type=Path), default=None,
-              help="Write collected trajectories as JSONL here.  Defaults to stdout.")
+              help="Write collected trajectories here. Defaults to stdout.")
 @click.option("--timeout", type=float, default=1800.0, show_default=True,
               help="Max seconds to wait for the batch.")
-@click.option("--poll-interval", type=float, default=2.0, show_default=True,
-              help="Seconds between /export_trajectories polls.")
-@click.option("--discount", type=float, default=1.0, show_default=True,
+@click.option("--turn-discount", type=float, default=1.0, show_default=True,
               help="Reward discount passed to export_trajectories.")
-@click.option("--style",
+@click.option("--export-style",
               type=click.Choice(["individual", "concat"]),
-              default="individual", show_default=True)
+              default="individual", show_default=True,
+              help="Export style for trajectories.")
+@click.option("--format",
+              type=click.Choice(["json", "jsonl"]),
+              default="jsonl", show_default=True,
+              help="Output format.")
+@click.option("--json", "json_progress", is_flag=True,
+              help="Emit structured progress events (not yet implemented).")
 def _collect_cmd(
-    model: str, batch_size: int, task_id: str,
-    sessions_out: Path | None, output: Path | None,
-    timeout: float, poll_interval: float,
-    discount: float, style: str,
+    model: str, batch_size: int,
+    output: Path | None, timeout: float,
+    turn_discount: float, export_style: str,
+    format: str, json_progress: bool,
 ) -> None:
+    if json_progress:
+        raise click.ClickException("--json progress mode not yet implemented")
     raise SystemExit(_do_collect(
-        model=model, batch_size=batch_size, task_id=task_id,
-        sessions_out=sessions_out, output=output,
-        timeout=timeout, poll_interval=poll_interval,
-        discount=discount, style=style,
+        model=model, batch_size=batch_size,
+        output=output, timeout=timeout,
+        turn_discount=turn_discount, export_style=export_style,
+        format=format,
     ) or 0)
 
 
 def _do_collect(
-    *, model: str, batch_size: int, task_id: str,
-    sessions_out: Path | None, output: Path | None,
-    timeout: float, poll_interval: float,
-    discount: float, style: str,
+    *, model: str, batch_size: int,
+    output: Path | None, timeout: float,
+    turn_discount: float, export_style: str,
+    format: str,
 ) -> int:
     s = _load_running_state()
     gateway = GatewayClient(s.gateway_url, s.admin_api_key)
+
+    task_id = "cli-collect"
+    poll_interval = 2.0
 
     logger.info("starting %d session(s) for model %r ...", batch_size, model)
     try:
@@ -965,14 +972,6 @@ def _do_collect(
             len(sids), batch_size,
         )
 
-    if sessions_out:
-        sessions_out.parent.mkdir(parents=True, exist_ok=True)
-        with open(sessions_out, "w") as f:
-            json.dump({"group_id": group_id, "sessions": sessions}, f, indent=2)
-        logger.info("wrote %d session(s) to %s", len(sessions), sessions_out)
-    else:
-        click.echo(json.dumps({"group_id": group_id, "sessions": sessions}, indent=2))
-
     logger.info(
         "polling /export_trajectories every %.1fs (timeout=%.0fs) ...",
         poll_interval, timeout,
@@ -983,7 +982,7 @@ def _do_collect(
         try:
             r = gateway.export_trajectories(
                 session_ids=sids, group_id=group_id,
-                remove_session=False, discount=discount, style=style,
+                remove_session=False, discount=turn_discount, style=export_style,
             )
         except GatewayHTTPError as e:
             raise click.ClickException(f"export_trajectories failed: {e}") from e
@@ -1002,7 +1001,7 @@ def _do_collect(
     try:
         r = gateway.export_trajectories(
             session_ids=sids, group_id=group_id,
-            remove_session=True, discount=discount, style=style,
+            remove_session=True, discount=turn_discount, style=export_style,
         )
         for tid, interaction in (r.get("traj") or {}).items():
             if tid not in collected:
@@ -1018,15 +1017,27 @@ def _do_collect(
     else:
         logger.info("collected %d trajectories", len(collected))
 
-    if output:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        with open(output, "w") as f:
-            for tid, interaction in collected.items():
-                f.write(json.dumps({"trajectory_id": tid, **interaction}) + "\n")
-        click.echo(f"wrote {len(collected)} trajectories to {output}")
+    if format == "json":
+        payload = json.dumps(
+            {tid: interaction for tid, interaction in collected.items()},
+            indent=2,
+        )
+        if output:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(payload + "\n")
+            click.echo(f"wrote {len(collected)} trajectories to {output}")
+        else:
+            click.echo(payload)
     else:
-        for tid, interaction in collected.items():
-            click.echo(json.dumps({"trajectory_id": tid, **interaction}))
+        if output:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            with open(output, "w") as f:
+                for tid, interaction in collected.items():
+                    f.write(json.dumps({"trajectory_id": tid, **interaction}) + "\n")
+            click.echo(f"wrote {len(collected)} trajectories to {output}")
+        else:
+            for tid, interaction in collected.items():
+                click.echo(json.dumps({"trajectory_id": tid, **interaction}))
 
     return 0 if len(collected) >= batch_size else 1
 

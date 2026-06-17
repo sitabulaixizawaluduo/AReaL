@@ -220,7 +220,8 @@ def _register_internal(
     gateway: GatewayClient,
     router: RouterClient,
     log_dir: Path,
-) -> tuple[list[int], list[str], list[str]]:
+    base_gpu_id: int = 0,
+) -> tuple[list[int], list[str], list[str], int, int]:
     engine, tp, dp, pp = _parse_backend_spec(backend)
     if pp > 1:
         raise click.ClickException(
@@ -230,6 +231,7 @@ def _register_internal(
     spawned: list[int] = []
     proxy_addrs: list[str] = []
     inf_addrs: list[str] = []
+    gpu_count = dp * tp
 
     try:
         for r in range(dp):
@@ -241,7 +243,7 @@ def _register_internal(
                     host="127.0.0.1",
                     port=inf_port,
                     tp=tp,
-                    base_gpu_id=r * tp,
+                    base_gpu_id=base_gpu_id + r * tp,
                     extra_args=engine_extra,
                     log_file=inf_log,
                 )
@@ -320,7 +322,7 @@ def _register_internal(
             kill_pids(spawned, grace_s=10.0)
         raise
 
-    return spawned, proxy_addrs, inf_addrs
+    return spawned, proxy_addrs, inf_addrs, base_gpu_id, gpu_count
 
 
 def _wait_inf_health(addr: str, *, deadline: float, pid: int, label: str) -> None:
@@ -354,7 +356,7 @@ def _wait_inf_health(addr: str, *, deadline: float, pid: int, label: str) -> Non
               help="Gateway port.")
 @click.option("--host", default="127.0.0.1", show_default=True,
               help="Gateway bind host.")
-@click.option("--admin-api-key", default="admin-api-key", show_default=True)
+@click.option("--admin-api-key", default="areal-admin-key", show_default=True)
 @click.option("--routing-strategy",
               type=click.Choice(["round_robin", "least_busy"]),
               default="round_robin", show_default=True)
@@ -482,7 +484,7 @@ def _do_run(opts: dict) -> int:
                 )
                 state.save()
             else:
-                pids, proxy_addrs, inf_addrs = _register_internal(
+                pids, proxy_addrs, inf_addrs, base_gpu, n_gpu = _register_internal(
                     model=opts["model"],
                     backend=opts["backend"],
                     model_path=opts["model_path"],
@@ -495,14 +497,18 @@ def _do_run(opts: dict) -> int:
                     gateway=gateway_client,
                     router=router_client,
                     log_dir=log_dir,
+                    base_gpu_id=state.next_gpu_id,
                 )
                 state.models[opts["model"]] = ModelEntry(
                     kind="internal",
                     backend=opts["backend"],
+                    base_gpu_id=base_gpu,
+                    gpu_count=n_gpu,
                     pids=pids,
                     proxy_addrs=proxy_addrs,
                     inference_server_addrs=inf_addrs,
                 )
+                state.next_gpu_id = base_gpu + n_gpu
                 state.save()
         except BaseException:
             kill_pids(
@@ -790,7 +796,7 @@ def _do_register(name: str, opts: dict) -> int:
         logger.info("registered external model %r", name)
         return 0
 
-    pids, proxy_addrs, inf_addrs = _register_internal(
+    pids, proxy_addrs, inf_addrs, base_gpu, n_gpu = _register_internal(
         model=name,
         backend=opts["backend"],
         model_path=opts["model_path"],
@@ -803,17 +809,22 @@ def _do_register(name: str, opts: dict) -> int:
         gateway=gateway,
         router=router,
         log_dir=logs_dir(),
+        base_gpu_id=s.next_gpu_id,
     )
     s.models[name] = ModelEntry(
         kind="internal",
         backend=opts["backend"],
+        base_gpu_id=base_gpu,
+        gpu_count=n_gpu,
         pids=pids,
         proxy_addrs=proxy_addrs,
         inference_server_addrs=inf_addrs,
     )
+    s.next_gpu_id = base_gpu + n_gpu
     s.save()
     logger.info(
-        "registered internal model %r (%d worker(s))", name, len(pids)
+        "registered internal model %r (%d worker(s), GPU %d-%d)",
+        name, len(pids), base_gpu, base_gpu + n_gpu - 1,
     )
     return 0
 
@@ -861,6 +872,8 @@ def _do_deregister(name: str, grace: float, force: bool) -> int:
         else:
             kill_pids(entry.pids, grace_s=grace)
 
+    if entry.gpu_count > 0 and entry.base_gpu_id + entry.gpu_count == s.next_gpu_id:
+        s.next_gpu_id = entry.base_gpu_id
     del s.models[name]
     s.save()
     logger.info("deregistered model %r", name)

@@ -89,7 +89,7 @@ def spawn_sglang(
 ) -> int:
     from areal.api.cli_args import SGLangConfig
 
-    cfg = SGLangConfig(model_path=model_path)
+    cfg = SGLangConfig(model_path=model_path, log_requests=True)
     cmd = list(SGLangConfig.build_cmd(
         sglang_config=cfg,
         tp_size=tp,

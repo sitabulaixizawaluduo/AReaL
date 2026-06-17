@@ -30,6 +30,8 @@ class ModelEntry:
     kind: str = "internal"
     backend: str = ""
     api_url: str = ""
+    base_gpu_id: int = 0
+    gpu_count: int = 0
     pids: list[int] = field(default_factory=list)
     proxy_addrs: list[str] = field(default_factory=list)
     inference_server_addrs: list[str] = field(default_factory=list)
@@ -43,6 +45,7 @@ class DaemonState:
     router_url: str
     admin_api_key: str
     started_at: float
+    next_gpu_id: int = 0
     models: dict[str, ModelEntry] = field(default_factory=dict)
 
     def save(self) -> None:

@@ -1,0 +1,233 @@
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import json
+import os
+import time
+import uuid
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+DEFAULT_SERVICE = "default"
+
+
+def areal_home() -> Path:
+    env = os.environ.get("AREAL_HOME")
+    root = Path(env).expanduser() if env else Path.home() / ".areal"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def agent_root() -> Path:
+    root = areal_home() / "agent"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def services_dir() -> Path:
+    path = agent_root() / "services"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def sessions_dir() -> Path:
+    path = agent_root() / "sessions"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def logs_root() -> Path:
+    path = agent_root() / "logs"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def service_logs_dir(service: str) -> Path:
+    path = logs_root() / service
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def service_state_path(service: str) -> Path:
+    return services_dir() / f"{service}.json"
+
+
+def session_state_path(service: str) -> Path:
+    return sessions_dir() / f"{service}.json"
+
+
+def current_service_path() -> Path:
+    return agent_root() / "current-service"
+
+
+def atomic_write_json(path: Path, data: Any, *, indent: int = 2) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w") as f:
+        f.write(json.dumps(data, indent=indent) + "\n")
+    os.replace(tmp, path)
+
+
+@dataclass
+class ProcessState:
+    component: str
+    pid: int
+    url: str
+    log_file: str
+
+
+@dataclass
+class PairState:
+    index: int
+    worker: ProcessState
+    data_proxy: ProcessState
+
+
+@dataclass
+class ServiceState:
+    service: str
+    launch_mode: str
+    agent: str
+    admin_api_key: str
+    gateway: ProcessState
+    router: ProcessState
+    pairs: list[PairState]
+    inf_addr: str = ""
+    inf_api_key: str = ""
+    inf_model: str = ""
+    session_timeout: float = 1800.0
+    health_poll_interval: float = 5.0
+    drain_timeout: float = 30.0
+    created_at: float = field(default_factory=time.time)
+
+    def save(self) -> None:
+        atomic_write_json(service_state_path(self.service), asdict(self))
+        current_service_path().write_text(self.service + "\n")
+
+    @classmethod
+    def load(cls, service: str) -> ServiceState:
+        with open(service_state_path(service)) as f:
+            raw = json.load(f)
+        raw["gateway"] = ProcessState(**raw["gateway"])
+        raw["router"] = ProcessState(**raw["router"])
+        raw["pairs"] = [
+            PairState(
+                index=pair["index"],
+                worker=ProcessState(**pair["worker"]),
+                data_proxy=ProcessState(**pair["data_proxy"]),
+            )
+            for pair in raw.get("pairs", [])
+        ]
+        return cls(**raw)
+
+    @classmethod
+    def remove(cls, service: str) -> None:
+        path = service_state_path(service)
+        if path.exists():
+            path.unlink()
+        clear_current_service(service)
+
+    def all_pids(self) -> list[int]:
+        pids = [self.gateway.pid, self.router.pid]
+        for pair in self.pairs:
+            pids.extend([pair.worker.pid, pair.data_proxy.pid])
+        return pids
+
+
+@dataclass
+class SessionState:
+    key: str
+    status: str = "active"
+    created_at: float = field(default_factory=time.time)
+    last_active: float = field(default_factory=time.time)
+    expires_at: float = 0.0
+    rl_session_id: str = ""
+    rl_session_api_key: str = ""
+    rl_negotiated: bool = False
+    last_reward: float | None = None
+    warning: str = ""
+
+    @classmethod
+    def create(cls, key: str, session_timeout: float) -> SessionState:
+        now = time.time()
+        return cls(
+            key=key,
+            created_at=now,
+            last_active=now,
+            expires_at=now + session_timeout,
+        )
+
+
+@dataclass
+class SessionsState:
+    service: str
+    current_session: str = ""
+    sessions: dict[str, SessionState] = field(default_factory=dict)
+
+    def save(self) -> None:
+        atomic_write_json(session_state_path(self.service), asdict(self))
+
+    @classmethod
+    def load(cls, service: str) -> SessionsState:
+        path = session_state_path(service)
+        if not path.exists():
+            return cls(service=service)
+        with open(path) as f:
+            raw = json.load(f)
+        sessions = {
+            key: SessionState(**value) for key, value in raw.get("sessions", {}).items()
+        }
+        return cls(
+            service=raw.get("service", service),
+            current_session=raw.get("current_session", ""),
+            sessions=sessions,
+        )
+
+    @classmethod
+    def remove(cls, service: str) -> None:
+        path = session_state_path(service)
+        if path.exists():
+            path.unlink()
+
+    def active_sessions(self) -> dict[str, SessionState]:
+        return {
+            key: session
+            for key, session in self.sessions.items()
+            if session.status == "active"
+        }
+
+    def require_active(self, key: str) -> SessionState:
+        session = self.sessions.get(key)
+        if session is None or session.status != "active":
+            raise ValueError(f"session {key!r} is not active")
+        return session
+
+
+def generate_session_key() -> str:
+    return f"session-{uuid.uuid4().hex[:8]}"
+
+
+def resolve_service_name(explicit: str | None = None) -> str:
+    if explicit:
+        return explicit
+    path = current_service_path()
+    if path.exists():
+        value = path.read_text().strip()
+        if value:
+            return value
+    services = list_service_names()
+    if len(services) == 1:
+        return services[0]
+    return DEFAULT_SERVICE
+
+
+def list_service_names() -> list[str]:
+    return sorted(path.stem for path in services_dir().glob("*.json"))
+
+
+def clear_current_service(service: str) -> None:
+    path = current_service_path()
+    if path.exists() and path.read_text().strip() == service:
+        path.unlink()

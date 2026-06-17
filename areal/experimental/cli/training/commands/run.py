@@ -3,18 +3,12 @@
 from __future__ import annotations
 
 import importlib
-import sys
 from pathlib import Path
 
 import click
 
 
-@click.group(help="Run AReaL training experiments.")
-def train() -> None:
-    pass
-
-
-@train.command(
+@click.command(
     name="run",
     help="Invoke a training driver with the given config and hydra overrides.",
     context_settings={"ignore_unknown_options": True},
@@ -33,11 +27,11 @@ def train() -> None:
     help="Driver entry point as 'module.path:func', e.g. examples.math.gsm8k_rl:main.",
 )
 @click.argument("overrides", nargs=-1, type=click.UNPROCESSED)
-def _run_cmd(config_path: Path, driver_spec: str, overrides: tuple[str, ...]) -> None:
-    raise SystemExit(_do_run(config_path, driver_spec, list(overrides)) or 0)
+def run_cmd(config_path: Path, driver_spec: str, overrides: tuple[str, ...]) -> None:
+    raise SystemExit(do_run(config_path, driver_spec, list(overrides)) or 0)
 
 
-def _do_run(config_path: Path, driver_spec: str, overrides: list[str]) -> int:
+def do_run(config_path: Path, driver_spec: str, overrides: list[str]) -> int:
     if ":" not in driver_spec:
         raise click.UsageError(
             f"--driver must be in 'module.path:func' form, got: {driver_spec!r}"
@@ -61,7 +55,3 @@ def _do_run(config_path: Path, driver_spec: str, overrides: list[str]) -> int:
     if isinstance(result, int):
         return result
     return 0
-
-
-if __name__ == "__main__":
-    train(prog_name="areal train")

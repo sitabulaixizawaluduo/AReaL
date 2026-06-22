@@ -2,36 +2,28 @@
 
 from __future__ import annotations
 
-import argparse
+import click
 
-from areal.experimental.cli.agent.commands import (
-    logs,
-    new_session,
-    ps,
-    run,
-    status,
-    stop,
-    switch_session,
-)
+from areal.experimental.cli.agent.commands.logs import logs_cmd
+from areal.experimental.cli.agent.commands.new_session import new_session_cmd
+from areal.experimental.cli.agent.commands.ps import ps_cmd
+from areal.experimental.cli.agent.commands.run import run_cmd
+from areal.experimental.cli.agent.commands.status import health_cmd, status_cmd
+from areal.experimental.cli.agent.commands.stop import destroy_cmd, stop_cmd
+from areal.experimental.cli.agent.commands.switch_session import switch_session_cmd
 
 
-def register_agent_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser(
-        "agent",
-        help="Manage agent services and sessions",
-        description="Manage agent services and sessions.",
-    )
-    agent_subparsers = parser.add_subparsers(dest="agent_command", metavar="<command>")
-    run.register(agent_subparsers)
-    stop.register(agent_subparsers)
-    status.register(agent_subparsers)
-    ps.register(agent_subparsers)
-    new_session.register(agent_subparsers)
-    switch_session.register(agent_subparsers)
-    logs.register(agent_subparsers)
+@click.group(help="Manage agent services and sessions.")
+def agent() -> None:
+    pass
 
-    def _missing(_: argparse.Namespace) -> int:
-        parser.print_help()
-        return 2
 
-    parser.set_defaults(handler=_missing)
+agent.add_command(run_cmd)
+agent.add_command(stop_cmd)
+agent.add_command(destroy_cmd)
+agent.add_command(status_cmd)
+agent.add_command(health_cmd)
+agent.add_command(ps_cmd)
+agent.add_command(new_session_cmd)
+agent.add_command(switch_session_cmd)
+agent.add_command(logs_cmd)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import argparse
+import click
 
 from areal.experimental.cli.agent.process import kill_pids
 from areal.experimental.cli.agent.state import (
@@ -13,29 +13,63 @@ from areal.experimental.cli.agent.state import (
 )
 
 
-def register(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser("stop", help="Stop an agent service")
-    parser.add_argument("--service", default=None)
-    parser.add_argument("--grace-period", type=float, default=10.0)
-    parser.add_argument("--keep-state", action="store_true")
-    parser.add_argument("--force", action="store_true")
-    parser.set_defaults(handler=handle)
+@click.command(name="stop", help="Stop an agent service.")
+@click.option("--service", default=None)
+@click.option("--grace-period", type=float, default=10.0, show_default=True)
+@click.option("--keep-state", is_flag=True)
+@click.option("--force", is_flag=True)
+def stop_cmd(
+    service: str | None,
+    grace_period: float,
+    keep_state: bool,
+    force: bool,
+) -> None:
+    raise SystemExit(
+        handle(
+            service=service,
+            grace_period=grace_period,
+            keep_state=keep_state,
+            force=force,
+        )
+        or 0
+    )
 
-    destroy = subparsers.add_parser("destroy", help="Alias for stop")
-    destroy.add_argument("--service", default=None)
-    destroy.add_argument("--grace-period", type=float, default=10.0)
-    destroy.add_argument("--keep-state", action="store_true")
-    destroy.add_argument("--force", action="store_true")
-    destroy.set_defaults(handler=handle)
+
+@click.command(name="destroy", help="Alias for stop.")
+@click.option("--service", default=None)
+@click.option("--grace-period", type=float, default=10.0, show_default=True)
+@click.option("--keep-state", is_flag=True)
+@click.option("--force", is_flag=True)
+def destroy_cmd(
+    service: str | None,
+    grace_period: float,
+    keep_state: bool,
+    force: bool,
+) -> None:
+    raise SystemExit(
+        handle(
+            service=service,
+            grace_period=grace_period,
+            keep_state=keep_state,
+            force=force,
+        )
+        or 0
+    )
 
 
-def handle(args: argparse.Namespace) -> int:
-    service = resolve_service_name(args.service)
+def handle(
+    *,
+    service: str | None,
+    grace_period: float,
+    keep_state: bool,
+    force: bool,
+) -> int:
+    service = resolve_service_name(service)
     return do_stop(
         service=service,
-        grace_period=args.grace_period,
-        keep_state=args.keep_state,
-        force=args.force,
+        grace_period=grace_period,
+        keep_state=keep_state,
+        force=force,
     )
 
 

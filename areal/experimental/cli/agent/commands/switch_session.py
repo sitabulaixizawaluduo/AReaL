@@ -2,25 +2,23 @@
 
 from __future__ import annotations
 
-import argparse
 import sys
+
+import click
 
 from areal.experimental.cli.agent.state import SessionsState, resolve_service_name
 
 
-def register(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser(
-        "switch_session",
-        help="Switch the current default agent session",
-    )
-    parser.add_argument("session_key")
-    parser.add_argument("--service", default=None)
-    parser.set_defaults(handler=handle)
+@click.command(name="switch_session", help="Switch the current default agent session.")
+@click.argument("session_key")
+@click.option("--service", default=None)
+def switch_session_cmd(session_key: str, service: str | None) -> None:
+    raise SystemExit(handle(session_key=session_key, service=service) or 0)
 
 
-def handle(args: argparse.Namespace) -> int:
-    service = resolve_service_name(args.service)
-    return do_switch_session(service=service, session_key=args.session_key)
+def handle(*, session_key: str, service: str | None) -> int:
+    service = resolve_service_name(service)
+    return do_switch_session(service=service, session_key=session_key)
 
 
 def do_switch_session(*, service: str, session_key: str) -> int:

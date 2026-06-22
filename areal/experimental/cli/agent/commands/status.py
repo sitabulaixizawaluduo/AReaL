@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import time
+
+import click
 
 from areal.experimental.cli.agent.http import (
     AgentCLIHTTPError,
@@ -22,29 +23,51 @@ from areal.experimental.cli.agent.state import (
 )
 
 
-def register(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser("status", help="Show agent service health")
-    parser.add_argument("--service", default=None)
-    parser.add_argument("--watch", action="store_true")
-    parser.add_argument("--interval", type=float, default=2.0)
-    parser.add_argument("--json", action="store_true", dest="as_json")
-    parser.set_defaults(handler=handle)
+@click.command(name="status", help="Show agent service health.")
+@click.option("--service", default=None)
+@click.option("--watch", is_flag=True)
+@click.option("--interval", type=float, default=2.0, show_default=True)
+@click.option("--json", "as_json", is_flag=True)
+def status_cmd(
+    service: str | None,
+    watch: bool,
+    interval: float,
+    as_json: bool,
+) -> None:
+    raise SystemExit(
+        handle(service=service, watch=watch, interval=interval, as_json=as_json) or 0
+    )
 
-    health = subparsers.add_parser("health", help="Alias for status")
-    health.add_argument("--service", default=None)
-    health.add_argument("--watch", action="store_true")
-    health.add_argument("--interval", type=float, default=2.0)
-    health.add_argument("--json", action="store_true", dest="as_json")
-    health.set_defaults(handler=handle)
+
+@click.command(name="health", help="Alias for status.")
+@click.option("--service", default=None)
+@click.option("--watch", is_flag=True)
+@click.option("--interval", type=float, default=2.0, show_default=True)
+@click.option("--json", "as_json", is_flag=True)
+def health_cmd(
+    service: str | None,
+    watch: bool,
+    interval: float,
+    as_json: bool,
+) -> None:
+    raise SystemExit(
+        handle(service=service, watch=watch, interval=interval, as_json=as_json) or 0
+    )
 
 
-def handle(args: argparse.Namespace) -> int:
-    service = resolve_service_name(args.service)
+def handle(
+    *,
+    service: str | None,
+    watch: bool,
+    interval: float,
+    as_json: bool,
+) -> int:
+    service = resolve_service_name(service)
     return do_status(
         service=service,
-        as_json=args.as_json,
-        watch=args.watch,
-        interval=args.interval,
+        as_json=as_json,
+        watch=watch,
+        interval=interval,
     )
 
 

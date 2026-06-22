@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import sys
+
+import click
 
 from areal.experimental.cli.agent.http import AgentCLIHTTPError, AgentCLIUnreachable
 from areal.experimental.cli.agent.session_ops import create_session
@@ -16,22 +17,41 @@ from areal.experimental.cli.agent.state import (
 )
 
 
-def register(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser("new_session", help="Start a new agent session")
-    parser.add_argument("session_key", nargs="?", default=None)
-    parser.add_argument("--service", default=None)
-    parser.add_argument("--no-switch", action="store_true")
-    parser.add_argument("--json", action="store_true", dest="as_json")
-    parser.set_defaults(handler=handle)
+@click.command(name="new_session", help="Start a new agent session.")
+@click.argument("session_key", required=False)
+@click.option("--service", default=None)
+@click.option("--no-switch", is_flag=True)
+@click.option("--json", "as_json", is_flag=True)
+def new_session_cmd(
+    session_key: str | None,
+    service: str | None,
+    no_switch: bool,
+    as_json: bool,
+) -> None:
+    raise SystemExit(
+        handle(
+            session_key=session_key,
+            service=service,
+            no_switch=no_switch,
+            as_json=as_json,
+        )
+        or 0
+    )
 
 
-def handle(args: argparse.Namespace) -> int:
-    service = resolve_service_name(args.service)
+def handle(
+    *,
+    session_key: str | None,
+    service: str | None,
+    no_switch: bool,
+    as_json: bool,
+) -> int:
+    service = resolve_service_name(service)
     return do_new_session(
         service=service,
-        session_key=args.session_key,
-        no_switch=args.no_switch,
-        as_json=args.as_json,
+        session_key=session_key,
+        no_switch=no_switch,
+        as_json=as_json,
     )
 
 

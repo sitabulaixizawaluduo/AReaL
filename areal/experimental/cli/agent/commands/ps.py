@@ -2,31 +2,32 @@
 
 from __future__ import annotations
 
-import argparse
 import json
+
+import click
 
 from areal.experimental.cli.agent.process import pid_alive
 from areal.experimental.cli.agent.state import ServiceState, list_service_names
 
 
-def register(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser("ps", help="List locally known agent services")
-    parser.add_argument("--json", action="store_true", dest="as_json")
-    parser.add_argument("--all", action="store_true", dest="include_all")
-    parser.set_defaults(handler=handle)
+@click.command(name="ps", help="List locally known agent services.")
+@click.option("--json", "as_json", is_flag=True)
+@click.option("--all", "include_all", is_flag=True)
+def ps_cmd(as_json: bool, include_all: bool) -> None:
+    raise SystemExit(handle(as_json=as_json, include_all=include_all) or 0)
 
 
-def handle(args: argparse.Namespace) -> int:
+def handle(*, as_json: bool, include_all: bool) -> int:
     rows = []
     for service in list_service_names():
         try:
             state = ServiceState.load(service)
         except Exception:
-            if args.include_all:
+            if include_all:
                 rows.append({"service": service, "status": "stale"})
             continue
         running = any(pid_alive(pid) for pid in state.all_pids())
-        if running or args.include_all:
+        if running or include_all:
             rows.append(
                 {
                     "service": service,
@@ -36,7 +37,7 @@ def handle(args: argparse.Namespace) -> int:
                 }
             )
 
-    if args.as_json:
+    if as_json:
         print(json.dumps(rows, indent=2))
         return 0
     if not rows:

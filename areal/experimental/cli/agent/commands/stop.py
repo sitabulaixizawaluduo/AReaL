@@ -11,6 +11,9 @@ from areal.experimental.cli.agent.state import (
     resolve_service_name,
     service_state_path,
 )
+from areal.utils import logging
+
+logger = logging.getLogger("AgentCLI")
 
 
 @click.command(name="stop", help="Stop an agent service.")
@@ -81,7 +84,7 @@ def do_stop(
     force: bool,
 ) -> int:
     if not service_state_path(service).exists():
-        print(f"service {service!r} is not running")
+        logger.info("service %r is not running", service)
         return 0
     try:
         state = ServiceState.load(service)
@@ -89,12 +92,12 @@ def do_stop(
         if not keep_state:
             ServiceState.remove(service)
             SessionsState.remove(service)
-        print(f"removed stale state for {service!r}")
+        logger.info("removed stale state for %r", service)
         return 0
 
     kill_pids(state.all_pids(), grace_s=0.0 if force else grace_period)
     if not keep_state:
         ServiceState.remove(service)
         SessionsState.remove(service)
-    print(f"service {service!r} stopped")
+    logger.info("service %r stopped", service)
     return 0

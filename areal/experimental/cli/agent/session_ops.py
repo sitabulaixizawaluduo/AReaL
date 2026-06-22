@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import sys
-
 from areal.experimental.cli.agent.http import (
     AgentCLIHTTPError,
     AgentCLIUnreachable,
@@ -16,6 +14,9 @@ from areal.experimental.cli.agent.state import (
     SessionState,
     generate_session_key,
 )
+from areal.utils import logging
+
+logger = logging.getLogger("AgentCLI")
 
 
 def create_session(
@@ -44,7 +45,7 @@ def create_session(
 
     warning = _negotiate_inference_session(service_state, session)
     if warning and warn:
-        print(f"Warning: {warning}", file=sys.stderr)
+        logger.warning("%s", warning)
     session.warning = warning
 
     sessions_state.sessions[key] = session
@@ -87,5 +88,4 @@ def _negotiate_inference_session(
 
     session.rl_session_id = session_id
     session.rl_session_api_key = session_api_key
-    session.rl_negotiated = True
     return ""

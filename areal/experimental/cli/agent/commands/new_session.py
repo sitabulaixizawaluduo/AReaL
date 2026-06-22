@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sys
 
 import click
 
@@ -15,6 +14,9 @@ from areal.experimental.cli.agent.state import (
     resolve_service_name,
     service_state_path,
 )
+from areal.utils import logging
+
+logger = logging.getLogger("AgentCLI")
 
 
 @click.command(name="new_session", help="Start a new agent session.")
@@ -63,7 +65,7 @@ def do_new_session(
     as_json: bool,
 ) -> int:
     if not service_state_path(service).exists():
-        print(f"error: service {service!r} is not running", file=sys.stderr)
+        logger.error("service %r is not running", service)
         return 1
     try:
         service_state = ServiceState.load(service)
@@ -75,21 +77,20 @@ def do_new_session(
             switch=not no_switch,
         )
     except (AgentCLIHTTPError, AgentCLIUnreachable, ValueError) as exc:
-        print(f"error: failed to create session: {exc}", file=sys.stderr)
+        logger.error("failed to create session: %s", exc)
         return 1
 
     payload = {
         "service": service,
         "session_key": session.key,
         "current": session.key == SessionsState.load(service).current_session,
-        "rl_negotiated": session.rl_negotiated,
     }
     if as_json:
-        print(json.dumps(payload, indent=2))
+        logger.info("%s", json.dumps(payload, indent=2))
     else:
-        print(
-            f"session={session.key} "
-            f"current={'yes' if payload['current'] else 'no'} "
-            f"rl={'yes' if session.rl_negotiated else 'no'}"
+        logger.info(
+            "session=%s current=%s",
+            session.key,
+            "yes" if payload["current"] else "no",
         )
     return 0

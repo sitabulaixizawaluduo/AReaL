@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from areal.experimental.cli.agent import http as http_mod
 from areal.experimental.cli.agent import session_ops
 from areal.experimental.cli.agent.config import (
@@ -63,6 +65,9 @@ def test_sessions_state_tracks_current_session(tmp_path, monkeypatch):
     assert loaded.current_session == "s1"
     assert loaded.require_active("s1").key == "s1"
     assert "s1" in loaded.active_sessions()
+    with open(tmp_path / "agent" / "sessions" / "svc.json") as f:
+        saved = json.load(f)
+    assert "rl_negotiated" not in saved["sessions"]["s1"]
 
 
 def test_config_merges_user_and_extra(tmp_path, monkeypatch):
@@ -162,6 +167,37 @@ def test_create_session_negotiates_rl_without_model(tmp_path, monkeypatch):
 
     assert routed == ["agent-session"]
     assert started == ["agent-svc-agent-session"]
-    assert session.rl_negotiated
     assert session.rl_session_id == "sid-1"
     assert session.rl_session_api_key == "sess-key"
+
+
+def test_sessions_state_loads_legacy_rl_negotiated(tmp_path, monkeypatch):
+    monkeypatch.setenv("AREAL_HOME", str(tmp_path))
+    path = tmp_path / "agent" / "sessions"
+    path.mkdir(parents=True)
+    (path / "svc.json").write_text(
+        json.dumps(
+            {
+                "service": "svc",
+                "current_session": "s1",
+                "sessions": {
+                    "s1": {
+                        "key": "s1",
+                        "status": "active",
+                        "created_at": 1.0,
+                        "last_active": 1.0,
+                        "expires_at": 2.0,
+                        "rl_session_id": "sid",
+                        "rl_session_api_key": "key",
+                        "rl_negotiated": True,
+                    }
+                },
+            }
+        )
+    )
+
+    loaded = SessionsState.load("svc")
+
+    session = loaded.require_active("s1")
+    assert session.rl_session_id == "sid"
+    assert session.rl_session_api_key == "key"

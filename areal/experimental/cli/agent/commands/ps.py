@@ -8,6 +8,9 @@ import click
 
 from areal.experimental.cli.agent.process import pid_alive
 from areal.experimental.cli.agent.state import ServiceState, list_service_names
+from areal.utils import logging
+
+logger = logging.getLogger("AgentCLI")
 
 
 @click.command(name="ps", help="List locally known agent services.")
@@ -38,10 +41,10 @@ def handle(*, as_json: bool, include_all: bool) -> int:
             )
 
     if as_json:
-        print(json.dumps(rows, indent=2))
+        logger.info("%s", json.dumps(rows, indent=2))
         return 0
     if not rows:
-        print("no agent services")
+        logger.info("no agent services")
         return 0
     cols = ("SERVICE", "STATUS", "GATEWAY", "AGENT")
     table = [
@@ -55,7 +58,7 @@ def handle(*, as_json: bool, include_all: bool) -> int:
     ]
     widths = [max(len(str(row[i])) for row in (cols, *table)) for i in range(4)]
     fmt = "  ".join(f"{{:<{width}}}" for width in widths)
-    print(fmt.format(*cols))
+    logger.info("%s", fmt.format(*cols))
     for row in table:
-        print(fmt.format(*row))
+        logger.info("%s", fmt.format(*row))
     return 0

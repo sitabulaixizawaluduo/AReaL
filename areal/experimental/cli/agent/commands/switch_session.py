@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import sys
-
 import click
 
 from areal.experimental.cli.agent.state import SessionsState, resolve_service_name
+from areal.utils import logging
+
+logger = logging.getLogger("AgentCLI")
 
 
 @click.command(name="switch_session", help="Switch the current default agent session.")
@@ -26,9 +27,9 @@ def do_switch_session(*, service: str, session_key: str) -> int:
     try:
         sessions_state.require_active(session_key)
     except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        logger.error("%s", exc)
         return 1
     sessions_state.current_session = session_key
     sessions_state.save()
-    print(f"current session: {session_key}")
+    logger.info("current session: %s", session_key)
     return 0

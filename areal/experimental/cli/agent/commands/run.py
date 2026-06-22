@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import click
@@ -26,6 +25,9 @@ from areal.experimental.cli.agent.state import (
     SessionsState,
     service_state_path,
 )
+from areal.utils import logging
+
+logger = logging.getLogger("AgentCLI")
 
 
 @click.command(name="run", help="Launch an agent service.")
@@ -80,7 +82,7 @@ def do_run(
     service = resolve_default_service(loaded_config, service)
     agent = agent or cfg_get(loaded_config, "run", "agent", "")
     if not agent:
-        print("error: --agent is required", file=sys.stderr)
+        logger.error("--agent is required")
         return 2
 
     admin_api_key = resolve_admin_api_key(loaded_config, admin_api_key)
@@ -106,17 +108,17 @@ def do_run(
     existing = _load_existing(service)
     if existing is not None and any(pid_alive(pid) for pid in existing.all_pids()):
         if not force:
-            print(
-                f"error: service {service!r} already has live processes; "
+            logger.error(
+                "service %r already has live processes; "
                 "run `areal agent stop` first or use --force",
-                file=sys.stderr,
+                service,
             )
             return 1
         kill_pids(existing.all_pids(), grace_s=5.0)
     elif service_state_path(service).exists() and not force:
-        print(
-            f"error: stale state exists for {service!r}; use `areal agent run --force`",
-            file=sys.stderr,
+        logger.error(
+            "stale state exists for %r; use `areal agent run --force`",
+            service,
         )
         return 1
 
@@ -148,11 +150,11 @@ def do_run(
     except (AgentCLIHTTPError, AgentCLIUnreachable, RuntimeError, ValueError) as exc:
         if launched is not None:
             kill_pids(launched.all_pids(), grace_s=5.0)
-        print(f"error: failed to launch agent service: {exc}", file=sys.stderr)
+        logger.error("failed to launch agent service: %s", exc)
         return 1
 
-    print(f"service={service} gateway={launched.gateway.url}")
-    print(f"session={session.key} rl={'yes' if session.rl_negotiated else 'no'}")
+    logger.info("service=%s gateway=%s", service, launched.gateway.url)
+    logger.info("session=%s", session.key)
     if interactive:
         return run_shell(
             launched,

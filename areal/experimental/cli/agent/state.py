@@ -145,7 +145,6 @@ class SessionState:
     expires_at: float = 0.0
     rl_session_id: str = ""
     rl_session_api_key: str = ""
-    rl_negotiated: bool = False
     last_reward: float | None = None
     warning: str = ""
 
@@ -177,7 +176,8 @@ class SessionsState:
         with open(path) as f:
             raw = json.load(f)
         sessions = {
-            key: SessionState(**value) for key, value in raw.get("sessions", {}).items()
+            key: _load_session_state(value)
+            for key, value in raw.get("sessions", {}).items()
         }
         return cls(
             service=raw.get("service", service),
@@ -207,6 +207,12 @@ class SessionsState:
 
 def generate_session_key() -> str:
     return f"session-{uuid.uuid4().hex[:8]}"
+
+
+def _load_session_state(value: dict[str, Any]) -> SessionState:
+    data = dict(value)
+    data.pop("rl_negotiated", None)
+    return SessionState(**data)
 
 
 def resolve_service_name(explicit: str | None = None) -> str:

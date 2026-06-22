@@ -7,6 +7,9 @@ import os
 import click
 
 from areal.experimental.cli.agent.state import resolve_service_name, service_logs_dir
+from areal.utils import logging
+
+logger = logging.getLogger("AgentCLI")
 
 
 @click.command(name="logs", help="Show agent service logs.")
@@ -38,9 +41,9 @@ def handle(
     if not target.exists():
         available = sorted(path.stem for path in log_dir.glob("*.log"))
         if not available:
-            print(f"no logs found under {log_dir}")
+            logger.error("no logs found under %s", log_dir)
             return 1
-        print(f"no log named {component!r}; available: {', '.join(available)}")
+        logger.error("no log named %r; available: %s", component, ", ".join(available))
         return 1
 
     cmd = ["tail", f"-n{lines}"]

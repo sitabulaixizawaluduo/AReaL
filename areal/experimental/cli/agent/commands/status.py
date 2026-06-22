@@ -21,6 +21,9 @@ from areal.experimental.cli.agent.state import (
     resolve_service_name,
     service_state_path,
 )
+from areal.utils import logging
+
+logger = logging.getLogger("AgentCLI")
 
 
 @click.command(name="status", help="Show agent service health.")
@@ -75,7 +78,7 @@ def do_status(*, service: str, as_json: bool, watch: bool, interval: float) -> i
     while True:
         snapshot = _snapshot(service)
         if as_json:
-            print(json.dumps(snapshot, indent=2))
+            logger.info("%s", json.dumps(snapshot, indent=2))
         else:
             _print_table(snapshot)
         if not watch:
@@ -139,7 +142,6 @@ def _snapshot(service: str) -> dict:
             "key": session.key,
             "status": session.status,
             "current": session.key == sessions_state.current_session,
-            "rl_negotiated": session.rl_negotiated,
         }
         for session in sessions_state.sessions.values()
     ]
@@ -179,7 +181,7 @@ def _component_health(service: str, component: str, url: str, pid: int, fn) -> d
 def _print_table(snapshot: dict) -> None:
     components = snapshot.get("components") or []
     if not components:
-        print(f"service {snapshot['service']!r} is not running")
+        logger.info("service %r is not running", snapshot["service"])
         return
     rows = [
         (
@@ -194,6 +196,6 @@ def _print_table(snapshot: dict) -> None:
     cols = ("SERVICE", "COMPONENT", "STATUS", "ADDR", "DETAILS")
     widths = [max(len(str(row[i])) for row in (cols, *rows)) for i in range(len(cols))]
     fmt = "  ".join(f"{{:<{width}}}" for width in widths)
-    print(fmt.format(*cols))
+    logger.info("%s", fmt.format(*cols))
     for row in rows:
-        print(fmt.format(*row))
+        logger.info("%s", fmt.format(*row))

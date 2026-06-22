@@ -19,10 +19,8 @@ from areal.experimental.cli.agent.http import AgentCLIHTTPError, AgentCLIUnreach
 from areal.experimental.cli.agent.interactive import run_shell
 from areal.experimental.cli.agent.launcher import launch_agent_stack
 from areal.experimental.cli.agent.process import kill_pids, pid_alive
-from areal.experimental.cli.agent.session_ops import create_session
 from areal.experimental.cli.agent.state import (
     ServiceState,
-    SessionsState,
     service_state_path,
 )
 from areal.utils import logging
@@ -52,7 +50,6 @@ logger = logging.getLogger("AgentCLI")
 @click.option("--interactive", "-i", is_flag=True)
 @click.option("--stop-on-exit", is_flag=True)
 @click.option("--history-file", type=click.Path(path_type=Path), default=None)
-@click.option("--session-key", default=None)
 def run_cmd(**opts) -> None:
     raise SystemExit(do_run(**opts) or 0)
 
@@ -76,7 +73,6 @@ def do_run(
     interactive: bool,
     stop_on_exit: bool,
     history_file: Path | None,
-    session_key: str | None,
 ) -> int:
     loaded_config = load_config(config)
     service = resolve_default_service(loaded_config, service)
@@ -140,13 +136,6 @@ def do_run(
             interactive=interactive,
         )
         launched.save()
-        sessions = SessionsState(service=service)
-        session = create_session(
-            launched,
-            sessions,
-            session_key=session_key,
-            switch=True,
-        )
     except (AgentCLIHTTPError, AgentCLIUnreachable, RuntimeError, ValueError) as exc:
         if launched is not None:
             kill_pids(launched.all_pids(), grace_s=5.0)
@@ -154,7 +143,6 @@ def do_run(
         return 1
 
     logger.info("service=%s gateway=%s", service, launched.gateway.url)
-    logger.info("session=%s", session.key)
     if interactive:
         return run_shell(
             launched,

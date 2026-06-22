@@ -23,6 +23,13 @@ def test_agent_switch_session_accepts_session_argument():
     assert "SESSION_KEY" in result.output
 
 
+def test_agent_run_does_not_accept_initial_session_key():
+    result = CliRunner().invoke(cli, ["agent", "run", "--help"])
+
+    assert result.exit_code == 0
+    assert "--session-key" not in result.output
+
+
 def test_agent_parser_does_not_register_chat_or_reward():
     runner = CliRunner()
 

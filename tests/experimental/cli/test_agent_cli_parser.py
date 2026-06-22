@@ -2,24 +2,34 @@
 
 from __future__ import annotations
 
-import pytest
+from click.testing import CliRunner
 
-from areal.experimental.cli.cli import build_parser
+from areal.experimental.cli.cli import cli
 
 
-def test_agent_help_parser_contains_expected_commands():
-    parser = build_parser()
+def test_agent_help_contains_expected_commands():
+    result = CliRunner().invoke(cli, ["agent", "--help"])
 
-    args = parser.parse_args(["agent", "switch_session", "abc"])
+    assert result.exit_code == 0
+    assert "run" in result.output
+    assert "switch_session" in result.output
+    assert "new_session" in result.output
 
-    assert args.agent_command == "switch_session"
-    assert args.session_key == "abc"
+
+def test_agent_switch_session_accepts_session_argument():
+    result = CliRunner().invoke(cli, ["agent", "switch_session", "--help"])
+
+    assert result.exit_code == 0
+    assert "SESSION_KEY" in result.output
 
 
 def test_agent_parser_does_not_register_chat_or_reward():
-    parser = build_parser()
+    runner = CliRunner()
 
-    with pytest.raises(SystemExit):
-        parser.parse_args(["agent", "chat"])
-    with pytest.raises(SystemExit):
-        parser.parse_args(["agent", "reward", "1.0"])
+    chat = runner.invoke(cli, ["agent", "chat"])
+    reward = runner.invoke(cli, ["agent", "reward", "1.0"])
+
+    assert chat.exit_code != 0
+    assert reward.exit_code != 0
+    assert "No such command" in chat.output
+    assert "No such command" in reward.output

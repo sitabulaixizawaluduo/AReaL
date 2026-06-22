@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import argparse
 import sys
 from pathlib import Path
+
+import click
 
 from areal.experimental.cli.agent.config import (
     cfg_get,
@@ -27,63 +28,84 @@ from areal.experimental.cli.agent.state import (
 )
 
 
-def register(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser("run", help="Launch an agent service")
-    parser.add_argument("--agent", default=None, help="Agent import path")
-    parser.add_argument("--service", default=None, help="Service instance name")
-    parser.add_argument("--num-pairs", type=int, default=None)
-    parser.add_argument("--admin-api-key", default=None)
-    parser.add_argument("--setup-timeout", type=float, default=None)
-    parser.add_argument("--health-poll-interval", type=float, default=None)
-    parser.add_argument("--drain-timeout", type=float, default=None)
-    parser.add_argument("--session-timeout", type=float, default=None)
-    parser.add_argument(
-        "--log-level",
-        choices=["debug", "info", "warning", "error"],
-        default=None,
-    )
-    parser.add_argument("--config", type=Path, default=None)
-    parser.add_argument("--force", action="store_true")
-    parser.add_argument("--inf-addr", default=None)
-    parser.add_argument("--inf-api-key", default=None)
-    parser.add_argument("--inf-model", default=None)
-    parser.add_argument("--interactive", "-i", action="store_true")
-    parser.add_argument("--stop-on-exit", action="store_true")
-    parser.add_argument("--history-file", type=Path, default=None)
-    parser.add_argument("--session-key", default=None)
-    parser.set_defaults(handler=handle)
+@click.command(name="run", help="Launch an agent service.")
+@click.option("--agent", default=None, help="Agent import path.")
+@click.option("--service", default=None, help="Service instance name.")
+@click.option("--num-pairs", type=int, default=None)
+@click.option("--admin-api-key", default=None)
+@click.option("--setup-timeout", type=float, default=None)
+@click.option("--health-poll-interval", type=float, default=None)
+@click.option("--drain-timeout", type=float, default=None)
+@click.option("--session-timeout", type=float, default=None)
+@click.option(
+    "--log-level",
+    type=click.Choice(["debug", "info", "warning", "error"]),
+    default=None,
+)
+@click.option("--config", type=click.Path(path_type=Path), default=None)
+@click.option("--force", is_flag=True)
+@click.option("--inf-addr", default=None)
+@click.option("--inf-api-key", default=None)
+@click.option("--inf-model", default=None)
+@click.option("--interactive", "-i", is_flag=True)
+@click.option("--stop-on-exit", is_flag=True)
+@click.option("--history-file", type=click.Path(path_type=Path), default=None)
+@click.option("--session-key", default=None)
+def run_cmd(**opts) -> None:
+    raise SystemExit(do_run(**opts) or 0)
 
 
-def handle(args: argparse.Namespace) -> int:
-    config = load_config(args.config)
-    service = resolve_default_service(config, args.service)
-    agent = args.agent or cfg_get(config, "run", "agent", "")
+def do_run(
+    *,
+    agent: str | None,
+    service: str | None,
+    num_pairs: int | None,
+    admin_api_key: str | None,
+    setup_timeout: float | None,
+    health_poll_interval: float | None,
+    drain_timeout: float | None,
+    session_timeout: float | None,
+    log_level: str | None,
+    config: Path | None,
+    force: bool,
+    inf_addr: str | None,
+    inf_api_key: str | None,
+    inf_model: str | None,
+    interactive: bool,
+    stop_on_exit: bool,
+    history_file: Path | None,
+    session_key: str | None,
+) -> int:
+    loaded_config = load_config(config)
+    service = resolve_default_service(loaded_config, service)
+    agent = agent or cfg_get(loaded_config, "run", "agent", "")
     if not agent:
         print("error: --agent is required", file=sys.stderr)
         return 2
 
-    admin_api_key = resolve_admin_api_key(config, args.admin_api_key)
-    num_pairs = int(args.num_pairs or cfg_get(config, "run", "num_pairs", 1))
+    admin_api_key = resolve_admin_api_key(loaded_config, admin_api_key)
+    num_pairs = int(num_pairs or cfg_get(loaded_config, "run", "num_pairs", 1))
     setup_timeout = float(
-        args.setup_timeout or cfg_get(config, "run", "setup_timeout", 120.0)
+        setup_timeout or cfg_get(loaded_config, "run", "setup_timeout", 120.0)
     )
     health_poll_interval = float(
-        args.health_poll_interval or cfg_get(config, "run", "health_poll_interval", 5.0)
+        health_poll_interval
+        or cfg_get(loaded_config, "run", "health_poll_interval", 5.0)
     )
     drain_timeout = float(
-        args.drain_timeout or cfg_get(config, "run", "drain_timeout", 30.0)
+        drain_timeout or cfg_get(loaded_config, "run", "drain_timeout", 30.0)
     )
     session_timeout = float(
-        args.session_timeout or cfg_get(config, "run", "session_timeout", 1800.0)
+        session_timeout or cfg_get(loaded_config, "run", "session_timeout", 1800.0)
     )
-    log_level = args.log_level or cfg_get(config, "default", "log_level", "info")
-    inf_addr = resolve_inf_addr(config, args.inf_addr)
-    inf_api_key = resolve_inf_api_key(config, args.inf_api_key)
-    inf_model = resolve_inf_model(config, args.inf_model)
+    log_level = log_level or cfg_get(loaded_config, "default", "log_level", "info")
+    inf_addr = resolve_inf_addr(loaded_config, inf_addr)
+    inf_api_key = resolve_inf_api_key(loaded_config, inf_api_key)
+    inf_model = resolve_inf_model(loaded_config, inf_model)
 
     existing = _load_existing(service)
     if existing is not None and any(pid_alive(pid) for pid in existing.all_pids()):
-        if not args.force:
+        if not force:
             print(
                 f"error: service {service!r} already has live processes; "
                 "run `areal agent stop` first or use --force",
@@ -91,7 +113,7 @@ def handle(args: argparse.Namespace) -> int:
             )
             return 1
         kill_pids(existing.all_pids(), grace_s=5.0)
-    elif service_state_path(service).exists() and not args.force:
+    elif service_state_path(service).exists() and not force:
         print(
             f"error: stale state exists for {service!r}; use `areal agent run --force`",
             file=sys.stderr,
@@ -113,14 +135,14 @@ def handle(args: argparse.Namespace) -> int:
             inf_addr=inf_addr,
             inf_api_key=inf_api_key,
             inf_model=inf_model,
-            interactive=args.interactive,
+            interactive=interactive,
         )
         launched.save()
         sessions = SessionsState(service=service)
         session = create_session(
             launched,
             sessions,
-            session_key=args.session_key,
+            session_key=session_key,
             switch=True,
         )
     except (AgentCLIHTTPError, AgentCLIUnreachable, RuntimeError, ValueError) as exc:
@@ -131,11 +153,11 @@ def handle(args: argparse.Namespace) -> int:
 
     print(f"service={service} gateway={launched.gateway.url}")
     print(f"session={session.key} rl={'yes' if session.rl_negotiated else 'no'}")
-    if args.interactive:
+    if interactive:
         return run_shell(
             launched,
-            stop_on_exit=args.stop_on_exit,
-            history_file=args.history_file,
+            stop_on_exit=stop_on_exit,
+            history_file=history_file,
         )
     return 0
 

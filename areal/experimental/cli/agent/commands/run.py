@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import click
 
-from areal.experimental.cli.agent.client import AgentHTTPError, AgentUnreachable
-from areal.experimental.cli.agent.common import logger
 from areal.experimental.cli.agent.launcher import launch_agent_stack
-from areal.experimental.cli.agent.process import kill_pids, pid_alive
-from areal.experimental.cli.agent.state import (
-    DEFAULT_SERVICE,
-    ServiceState,
-    service_state_path,
-)
+from areal.experimental.cli.agent.lifecycle import agent_lifecycle
+from areal.experimental.cli.agent.state import ServiceState
+from areal.experimental.cli.client import ServiceHTTPError, ServiceUnreachable
+from areal.experimental.cli.process import kill_pids
+from areal.experimental.cli.state import DEFAULT_SERVICE
+from areal.experimental.cli.utils import register_cli_logger
+
+logger = register_cli_logger("AgentCli")
 
 
 @click.command(name="run", help="Launch an agent service.")
@@ -57,19 +57,10 @@ def do_run(
     if not agent:
         raise click.UsageError("--agent is required")
 
-    existing = _load_existing(service)
-    if existing is not None and any(pid_alive(pid) for pid in existing.all_pids()):
-        if not force:
-            raise click.ClickException(
-                f"service {service!r} already has live processes; "
-                f"run `areal agent stop` first or use --force"
-            )
-        kill_pids(existing.all_pids(), grace_s=5.0)
-    elif service_state_path(service).exists() and not force:
-        raise click.ClickException(
-            f"stale state exists for {service!r}; "
-            f"use `areal agent run --service {service} --force`"
-        )
+    if force:
+        agent_lifecycle.force_replace_slot(service, grace_s=5.0)
+    else:
+        agent_lifecycle.refuse_if_running(service)
 
     launched: ServiceState | None = None
     try:
@@ -88,19 +79,13 @@ def do_run(
             inf_model=inf_model,
         )
         launched.save()
-    except (AgentHTTPError, AgentUnreachable, RuntimeError, ValueError) as exc:
+    except (ServiceHTTPError, ServiceUnreachable, RuntimeError, ValueError) as exc:
         if launched is not None:
-            kill_pids(launched.all_pids(), grace_s=5.0)
+            kill_pids(
+                [pid for _, handle in launched.components() if (pid := handle.pid) > 0],
+                grace_s=5.0,
+            )
         raise click.ClickException(f"failed to launch agent service: {exc}") from exc
 
     logger.info("service=%s gateway=%s", service, launched.gateway.url)
     return 0
-
-
-def _load_existing(service: str) -> ServiceState | None:
-    if not service_state_path(service).exists():
-        return None
-    try:
-        return ServiceState.load(service)
-    except Exception:
-        return None

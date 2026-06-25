@@ -2,24 +2,15 @@
 
 from __future__ import annotations
 
-import json
 import time
 
 import click
 
-from areal.experimental.cli.agent.client import (
-    AgentHTTPError,
-    AgentUnreachable,
-    DataProxyClient,
-    GatewayClient,
-    RouterClient,
-)
-from areal.experimental.cli.agent.process import pid_alive
-from areal.experimental.cli.agent.state import (
-    ServiceState,
-    resolve_service_name,
-    service_state_path,
-)
+from areal.experimental.cli.agent.lifecycle import agent_lifecycle
+from areal.experimental.cli.process import pid_alive
+from areal.experimental.cli.state import SupportsComponentProbe
+from areal.experimental.cli.status import ColumnSpec, StatusReporter
+from areal.experimental.cli.utils import json_or_table
 
 
 @click.command(name="status", help="Show agent service health.")
@@ -38,111 +29,91 @@ def status_cmd(
 def do_status(
     *, service: str | None, watch: bool, interval: float, as_json: bool
 ) -> int:
-    name = resolve_service_name(service)
+    name = agent_lifecycle.resolve_service_name(service)
     while True:
-        snapshot = _snapshot(name)
-        if as_json:
-            click.echo(json.dumps(snapshot, indent=2))
-        else:
-            _print_table(snapshot)
+        _emit_once(name, as_json=as_json)
         if not watch:
             return 0
         time.sleep(interval)
 
 
-def _snapshot(service: str) -> dict:
-    if not service_state_path(service).exists():
-        return {"service": service, "running": False, "components": []}
+def _emit_once(service: str, *, as_json: bool) -> None:
+    path = agent_lifecycle.state_path(service)
+    if not path.exists():
+        payload = {"service": service, "running": False, "components": []}
+        json_or_table(
+            payload,
+            as_json=as_json,
+            table_renderer=lambda p: click.echo(
+                f"service {p['service']!r} is not running"
+            ),
+        )
+        return
     try:
-        state = ServiceState.load(service)
+        state = agent_lifecycle.load_state(service)
     except Exception as exc:
-        return {
+        payload = {
             "service": service,
             "running": False,
             "error": f"failed to read state: {exc}",
             "components": [],
         }
-
-    components = [
-        _component_health(
-            service,
-            "gateway",
-            state.gateway.url,
-            state.gateway.pid,
-            lambda: GatewayClient(state.gateway.url, state.admin_api_key).health(),
-        ),
-        _component_health(
-            service,
-            "router",
-            state.router.url,
-            state.router.pid,
-            lambda: RouterClient(state.router.url, state.admin_api_key).health(),
-        ),
-    ]
-    for pair in state.pairs:
-        components.append(
-            _component_health(
-                service,
-                pair.worker.component,
-                pair.worker.url,
-                pair.worker.pid,
-                lambda url=pair.worker.url: DataProxyClient(url).health(),
-            )
+        json_or_table(
+            payload,
+            as_json=as_json,
+            table_renderer=lambda p: click.echo(
+                f"service {p['service']!r}: {p['error']}"
+            ),
         )
-        components.append(
-            _component_health(
-                service,
-                pair.data_proxy.component,
-                pair.data_proxy.url,
-                pair.data_proxy.pid,
-                lambda url=pair.data_proxy.url: DataProxyClient(url).health(),
-            )
-        )
-
-    return {
-        "service": service,
-        "running": any(c["pid_alive"] for c in components),
-        "gateway_url": state.gateway.url,
-        "router_url": state.router.url,
-        "components": components,
-    }
-
-
-def _component_health(service: str, component: str, url: str, pid: int, fn) -> dict:
-    http_status = "down"
-    detail = ""
-    try:
-        data = fn()
-        http_status = "ok"
-        detail = json.dumps(data, sort_keys=True)
-    except AgentHTTPError as exc:
-        http_status = f"http-{exc.status}"
-        detail = exc.body
-    except AgentUnreachable as exc:
-        detail = str(exc)
-    return {
-        "service": service,
-        "component": component,
-        "status": http_status,
-        "addr": url,
-        "pid": pid,
-        "pid_alive": pid_alive(pid),
-        "details": detail,
-    }
-
-
-def _print_table(snapshot: dict) -> None:
-    components = snapshot.get("components") or []
-    if not components:
-        click.echo(f"service {snapshot['service']!r} is not running")
         return
-    rows = [
-        (row["service"], row["component"], row["status"], row["addr"], row["details"])
-        for row in components
+
+    components = list(state.components())
+    reporter = StatusReporter(components, _columns(service))
+    alive = reporter.probe_all()
+
+    if as_json:
+        payload = {
+            "service": service,
+            "running": pid_alive(state.gateway.pid),
+            "gateway_url": state.gateway.url,
+            "router_url": state.router.url,
+            "components": reporter.json_snapshot(alive),
+        }
+        click.echo(_json_indent(payload))
+        return
+    reporter.print_table(
+        reporter.render_rows(alive),
+        header_line=f"service: {service}  gateway: {state.gateway.url}",
+    )
+
+
+def _columns(service: str) -> list[ColumnSpec]:
+    def _service(label: str, _: SupportsComponentProbe, __: bool) -> str:
+        del label
+        return service
+
+    def _component(label: str, _: SupportsComponentProbe, __: bool) -> str:
+        return label
+
+    def _status(_: str, __: SupportsComponentProbe, alive: bool) -> str:
+        return "ok" if alive else "down"
+
+    def _addr(_: str, handle: SupportsComponentProbe, __: bool) -> str:
+        return handle.addr or "-"
+
+    def _pid(_: str, handle: SupportsComponentProbe, __: bool) -> str:
+        return str(handle.pid) if handle.pid > 0 else "-"
+
+    return [
+        ColumnSpec("SERVICE", _service),
+        ColumnSpec("COMPONENT", _component),
+        ColumnSpec("STATUS", _status),
+        ColumnSpec("ADDR", _addr),
+        ColumnSpec("PID", _pid),
     ]
-    cols = ("SERVICE", "COMPONENT", "STATUS", "ADDR", "DETAILS")
-    widths = [max(len(str(r[i])) for r in (cols, *rows)) for i in range(len(cols))]
-    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
-    click.echo(fmt.format(*cols))
-    for row in rows:
-        click.echo(fmt.format(*row))
+
+
+def _json_indent(payload: dict) -> str:
+    import json
+
+    return json.dumps(payload, indent=2, default=str)

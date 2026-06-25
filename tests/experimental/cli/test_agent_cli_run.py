@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from areal.experimental.cli.agent.commands import run
 from areal.experimental.cli.agent.state import (
+    AGENT_NAMESPACE,
     PairState,
     ProcessState,
     ServiceState,
-    service_state_path,
 )
+from areal.experimental.cli.state import service_state_path
 
 
 def test_run_persists_service_state(tmp_path, monkeypatch):
@@ -77,4 +78,4 @@ def test_run_persists_service_state(tmp_path, monkeypatch):
     )
 
     assert rc == 0
-    assert service_state_path("svc").exists()
+    assert service_state_path(AGENT_NAMESPACE, "svc").exists()

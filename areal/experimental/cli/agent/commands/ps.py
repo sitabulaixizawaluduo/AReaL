@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import json
-
 import click
 
-from areal.experimental.cli.agent.process import pid_alive
-from areal.experimental.cli.agent.state import ServiceState, list_service_names
+from areal.experimental.cli.agent.lifecycle import agent_lifecycle
+from areal.experimental.cli.process import pid_alive
+from areal.experimental.cli.utils import json_or_table
 
 
 @click.command(name="ps", help="List locally known agent services.")
@@ -18,15 +17,15 @@ def ps_cmd(as_json: bool, include_all: bool) -> None:
 
 
 def do_ps(*, as_json: bool, include_all: bool) -> int:
-    rows = []
-    for service in list_service_names():
+    rows: list[dict] = []
+    for service in agent_lifecycle.list_services():
         try:
-            state = ServiceState.load(service)
+            state = agent_lifecycle.load_state(service)
         except Exception:
             if include_all:
                 rows.append({"service": service, "status": "stale"})
             continue
-        running = any(pid_alive(pid) for pid in state.all_pids())
+        running = pid_alive(state.gateway.pid)
         if running or include_all:
             rows.append(
                 {
@@ -37,12 +36,14 @@ def do_ps(*, as_json: bool, include_all: bool) -> int:
                 }
             )
 
-    if as_json:
-        click.echo(json.dumps(rows, indent=2))
-        return 0
+    json_or_table(rows, as_json=as_json, table_renderer=_print_table)
+    return 0
+
+
+def _print_table(rows: list[dict]) -> None:
     if not rows:
         click.echo("no agent services")
-        return 0
+        return
     cols = ("SERVICE", "STATUS", "GATEWAY", "AGENT")
     table = [
         (
@@ -58,4 +59,3 @@ def do_ps(*, as_json: bool, include_all: bool) -> int:
     click.echo(fmt.format(*cols))
     for row in table:
         click.echo(fmt.format(*row))
-    return 0

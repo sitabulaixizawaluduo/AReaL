@@ -6,14 +6,16 @@ import sys
 from pathlib import Path
 
 from areal.experimental.cli.agent.client import RouterClient
-from areal.experimental.cli.agent.common import wait_http_health
-from areal.experimental.cli.agent.process import pick_free_port, spawn_process
 from areal.experimental.cli.agent.state import (
+    AGENT_NAMESPACE,
     PairState,
     ProcessState,
     ServiceState,
-    service_logs_dir,
 )
+from areal.experimental.cli.process import spawn_process
+from areal.experimental.cli.state import logs_dir
+from areal.experimental.cli.utils import wait_http_health
+from areal.utils.network import find_free_ports
 
 
 def launch_agent_stack(
@@ -31,9 +33,15 @@ def launch_agent_stack(
     inf_api_key: str,
     inf_model: str,
 ) -> ServiceState:
-    log_dir = service_logs_dir(service)
+    log_dir = logs_dir(AGENT_NAMESPACE, service)
 
-    router_port = pick_free_port()
+    # Reserve every port we need up front from the non-ephemeral pool to
+    # avoid TOCTOU collisions between successive bind(0) calls.
+    ports = find_free_ports(2 + 2 * num_pairs)
+    router_port = ports[0]
+    gateway_port = ports[1]
+    pair_ports = ports[2:]
+
     router_log = log_dir / "router.log"
     router_pid = _spawn_router(
         host="127.0.0.1",
@@ -51,6 +59,8 @@ def launch_agent_stack(
         pair = _spawn_pair(
             index=idx,
             agent=agent,
+            worker_port=pair_ports[2 * idx],
+            proxy_port=pair_ports[2 * idx + 1],
             session_timeout=session_timeout,
             log_level=log_level,
             log_dir=log_dir,
@@ -59,7 +69,6 @@ def launch_agent_stack(
         router.register_proxy(pair.data_proxy.url)
         pairs.append(pair)
 
-    gateway_port = pick_free_port()
     gateway_log = log_dir / "gateway.log"
     gateway_pid = _spawn_gateway(
         host="127.0.0.1",
@@ -160,12 +169,13 @@ def _spawn_pair(
     *,
     index: int,
     agent: str,
+    worker_port: int,
+    proxy_port: int,
     session_timeout: float,
     log_level: str,
     log_dir: Path,
     setup_timeout: float,
 ) -> PairState:
-    worker_port = pick_free_port()
     worker_log = log_dir / f"worker-{index}.log"
     worker_pid = spawn_process(
         [
@@ -188,7 +198,6 @@ def _spawn_pair(
         worker_url, pid=worker_pid, timeout=setup_timeout, label=f"worker-{index}"
     )
 
-    proxy_port = pick_free_port()
     proxy_log = log_dir / f"proxy-{index}.log"
     proxy_pid = spawn_process(
         [

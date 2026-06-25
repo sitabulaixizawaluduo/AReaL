@@ -4,12 +4,9 @@ from __future__ import annotations
 
 import click
 
-from areal.experimental.cli.agent.process import kill_pids
-from areal.experimental.cli.agent.state import (
-    ServiceState,
-    resolve_service_name,
-    service_state_path,
-)
+from areal.experimental.cli.agent.lifecycle import agent_lifecycle
+from areal.experimental.cli.agent.state import ServiceState
+from areal.experimental.cli.process import kill_pids
 
 
 @click.command(name="stop", help="Stop an agent service.")
@@ -38,19 +35,22 @@ def do_stop(
     keep_state: bool,
     force: bool,
 ) -> int:
-    name = resolve_service_name(service)
-    if not service_state_path(name).exists():
+    name = agent_lifecycle.resolve_service_name(service)
+    path = agent_lifecycle.state_path(name)
+    if not path.exists():
         click.echo(f"service {name!r} is not running")
         return 0
+
     try:
-        state = ServiceState.load(name)
+        state = agent_lifecycle.load_state(name)
     except Exception:
         if not keep_state:
             ServiceState.remove(name)
         click.echo(f"removed stale state for {name!r}")
         return 0
 
-    kill_pids(state.all_pids(), grace_s=0.0 if force else grace_period)
+    pids = [pid for _, h in state.components() if (pid := h.pid) > 0]
+    kill_pids(pids, grace_s=0.0 if force else grace_period)
     if not keep_state:
         ServiceState.remove(name)
     click.echo(f"service {name!r} stopped")

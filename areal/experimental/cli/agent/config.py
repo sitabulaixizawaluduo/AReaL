@@ -4,24 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from areal.experimental.cli.agent.state import agent_root
+from areal.experimental.cli.agent.state import AGENT_NAMESPACE
+from areal.experimental.cli.config import BindingMap, ConfigLoader
 
 # (section, key) -> (verb_or_verbs, click_option_name).
-# Anything not listed is silently ignored.
-_BINDINGS: dict[tuple[str, str], tuple[str | tuple[str, ...], str]] = {
-    (
-        "default",
-        "service",
-    ): (
-        (
-            "run",
-            "stop",
-            "status",
-            "ps",
-            "logs",
-        ),
-        "service",
-    ),
+# Anything not listed in the agent's TOML is silently ignored.
+AGENT_BINDINGS: BindingMap = {
+    ("default", "service"): (("run", "stop", "status", "ps", "logs"), "service"),
     ("default", "admin_api_key"): ("run", "admin_api_key"),
     ("default", "log_level"): ("run", "log_level"),
     ("run", "agent"): ("run", "agent"),
@@ -36,51 +25,8 @@ _BINDINGS: dict[tuple[str, str], tuple[str | tuple[str, ...], str]] = {
 }
 
 
-def config_path() -> Path:
-    return agent_root() / "config.toml"
-
-
-def _read_toml(path: Path) -> dict:
-    try:
-        import tomllib
-    except ImportError:
-        return {}
-    if not path.exists():
-        return {}
-    try:
-        with open(path, "rb") as f:
-            return tomllib.load(f)
-    except Exception:
-        return {}
-
-
-def _flatten(toml: dict, parent: str = "") -> dict[tuple[str, str], object]:
-    out: dict[tuple[str, str], object] = {}
-    for k, v in toml.items():
-        if isinstance(v, dict):
-            sub_parent = f"{parent}.{k}" if parent else k
-            for (sec, key), val in _flatten(v, sub_parent).items():
-                out[(sec, key)] = val
-        else:
-            out[(parent, k)] = v
-    return out
+agent_config_loader = ConfigLoader(namespace=AGENT_NAMESPACE, bindings=AGENT_BINDINGS)
 
 
 def load_click_default_map(extra: Path | None = None) -> dict:
-    merged: dict[tuple[str, str], object] = {}
-    for path in (config_path(), extra):
-        if path is None:
-            continue
-        merged.update(_flatten(_read_toml(path)))
-
-    default_map: dict[str, dict] = {}
-    for (section, key), value in merged.items():
-        binding = _BINDINGS.get((section, key))
-        if binding is None:
-            continue
-        verbs, opt = binding
-        if isinstance(verbs, str):
-            verbs = (verbs,)
-        for verb in verbs:
-            default_map.setdefault(verb, {})[opt] = value
-    return default_map
+    return agent_config_loader.load_click_default_map(extra=extra)

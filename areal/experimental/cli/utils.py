@@ -30,7 +30,6 @@ import click
 from areal.experimental.cli.process import pid_alive
 from areal.utils.logging import LOGGER_COLORS_EXACT, getLogger
 
-
 # ---------------------------------------------------------------------------
 # File locking
 # ---------------------------------------------------------------------------

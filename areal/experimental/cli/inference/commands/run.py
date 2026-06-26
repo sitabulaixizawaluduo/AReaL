@@ -24,7 +24,7 @@ from areal.experimental.cli.inference.state import (
     ModelState,
     RuntimeState,
     ServiceState,
-    locked_model_state,
+    store,
 )
 from areal.experimental.cli.process import kill_pids
 from areal.experimental.cli.state import logs_dir
@@ -60,7 +60,12 @@ from areal.experimental.cli.watcher import ForegroundWatcher
 )
 @click.option("-d", "--detach", is_flag=True, help="Fork the daemon and exit.")
 @click.option("--model", default=None, help="Register this model at startup.")
-@click.option("--backend", default=None, help="Backend spec, e.g. 'sglang:tp=2,dp=2'.")
+@click.option(
+    "--backend",
+    default=None,
+    help="Backend spec; same grammar as InferenceEngineConfig.backend, "
+    "e.g. 'sglang:d4', 'vllm:d2t4'.",
+)
 @click.option("--model-path", default=None)
 @click.option("--tokenizer-path", default=None)
 @click.option("--engine-args", default="", show_default=False, help=ENGINE_ARGS_HELP)
@@ -157,7 +162,7 @@ def do_run(opts: dict) -> int:
         started_at=time.time(),
     )
     model_state = ModelState(service=service)
-    with locked_model_state(service):
+    with store.lock_model_state(service):
         service_state.save()
         model_state.save()
 

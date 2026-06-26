@@ -48,7 +48,7 @@ def test_terminate_runtime_state_kills_in_order(monkeypatch):
         service="svc",
         models={
             "m": ModelEntry(
-                backend="sglang:tp=1,dp=1",
+                backend="sglang:d1",
                 replicas=[_replica(worker_pid=10, proxy_pid=20)],
             )
         },
@@ -72,10 +72,7 @@ def test_terminate_runtime_state_kills_in_order(monkeypatch):
 def test_prepare_service_slot_force_recovers_raw_pids(tmp_path, monkeypatch):
     from areal.experimental.cli.inference import lifecycle as inf_lifecycle_mod
     from areal.experimental.cli.inference.lifecycle import inf_lifecycle
-    from areal.experimental.cli.inference.state import (
-        INF_NAMESPACE,
-        models_state_path,
-    )
+    from areal.experimental.cli.inference.state import INF_NAMESPACE, store
     from areal.experimental.cli.state import service_state_path
 
     monkeypatch.setenv("AREAL_HOME", str(tmp_path))
@@ -102,13 +99,13 @@ def test_prepare_service_slot_force_recovers_raw_pids(tmp_path, monkeypatch):
             }
         )
     )
-    models_state_path("svc").write_text(
+    store.models_state_path("svc").write_text(
         json.dumps(
             {
                 "service": "svc",
                 "models": {
                     "m": {
-                        "backend": "sglang:tp=1,dp=1",
+                        "backend": "sglang:d1",
                         "replicas": [
                             {
                                 "data_proxy": {
@@ -141,7 +138,7 @@ def test_prepare_service_slot_force_recovers_raw_pids(tmp_path, monkeypatch):
 
     assert calls == [([100, 101, 300, 200], 5.0)]
     assert not service_state_path(INF_NAMESPACE, "svc").exists()
-    assert not models_state_path("svc").exists()
+    assert not store.models_state_path("svc").exists()
 
 
 def test_foreground_cleanup_uses_latest_model_state(tmp_path, monkeypatch):
@@ -152,7 +149,7 @@ def test_foreground_cleanup_uses_latest_model_state(tmp_path, monkeypatch):
     service_state = _service_state(gateway_pid=30, router_pid=40)
     latest = ModelState(service="svc")
     latest.models["later"] = ModelEntry(
-        backend="sglang:tp=1,dp=1",
+        backend="sglang:d1",
         replicas=[_replica(worker_pid=10, proxy_pid=20)],
     )
     latest.save()

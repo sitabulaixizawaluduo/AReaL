@@ -13,8 +13,7 @@ from areal.experimental.cli.inference.state import (
     ModelEntry,
     ModelState,
     ServiceState,
-    models_state_path,
-    recover_pids_from_raw_state,
+    store,
 )
 from areal.experimental.cli.main import cli
 from areal.experimental.cli.state import (
@@ -53,7 +52,7 @@ def _save_service(service: str, *, gateway_pid: int | None = None) -> None:
 
 
 def _placeholder_model() -> ModelEntry:
-    return ModelEntry(backend="sglang:tp=1,dp=1", replicas=[])
+    return ModelEntry(backend="sglang:d1", replicas=[])
 
 
 def test_service_and_model_state_are_per_service(tmp_path, monkeypatch):
@@ -64,7 +63,7 @@ def test_service_and_model_state_are_per_service(tmp_path, monkeypatch):
     model_state.save()
 
     assert _service_path("svc-a").exists()
-    assert models_state_path("svc-a").exists()
+    assert store.models_state_path("svc-a").exists()
     assert _current_path().read_text().strip() == "svc-a"
 
     loaded_service = ServiceState.load("svc-a")
@@ -139,13 +138,13 @@ def test_recover_pids_from_raw_state_walks_handles(tmp_path, monkeypatch):
             }
         )
     )
-    models_state_path("svc").write_text(
+    store.models_state_path("svc").write_text(
         json.dumps(
             {
                 "service": "svc",
                 "models": {
                     "m": {
-                        "backend": "sglang:tp=1,dp=1",
+                        "backend": "sglang:d1",
                         "replicas": [
                             {
                                 "data_proxy": {
@@ -168,4 +167,4 @@ def test_recover_pids_from_raw_state_walks_handles(tmp_path, monkeypatch):
         )
     )
 
-    assert recover_pids_from_raw_state("svc") == [100, 101, 300, 200]
+    assert store.recover_pids_from_raw_state("svc") == [100, 101, 300, 200]

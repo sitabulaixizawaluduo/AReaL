@@ -15,6 +15,7 @@ from pathlib import Path
 
 import click
 
+from areal.api.alloc_mode import ModelAllocation
 from areal.experimental.cli.client import ServiceHTTPError, ServiceUnreachable
 from areal.experimental.cli.inference.client import GatewayClient, RouterClient
 from areal.experimental.cli.inference.launcher import (
@@ -55,41 +56,28 @@ PROXY_ARGS_HELP = (
 
 
 def parse_backend_spec(spec: str) -> tuple[str, int, int, int]:
-    if ":" not in spec:
-        engine, rest = spec, ""
-    else:
-        engine, rest = spec.split(":", 1)
-    engine = engine.strip().lower()
-    if engine not in ("sglang", "vllm"):
+    """Parse a backend spec into ``(engine, tp, dp, pp)``.
+
+    Delegates to ``ModelAllocation.from_str`` so the CLI accepts the same
+    grammar as ``InferenceEngineConfig.backend`` in YAML configs —
+    ``"sglang:d4"``, ``"vllm:d2t4"``, etc. The CLI restricts the engine
+    set to the two inference backends it can spawn locally.
+    """
+
+    try:
+        alloc = ModelAllocation.from_str(spec)
+    except Exception as exc:
+        raise click.BadParameter(f"invalid --backend spec {spec!r}: {exc}") from exc
+    if alloc.backend not in ("sglang", "vllm"):
         raise click.BadParameter(
-            f"backend must be one of: sglang, vllm; got {engine!r}"
+            f"backend must be one of: sglang, vllm; got {alloc.backend!r}"
         )
-    tp = dp = pp = 1
-    if rest:
-        for pair in rest.split(","):
-            pair = pair.strip()
-            if not pair:
-                continue
-            if "=" not in pair:
-                raise click.BadParameter(
-                    f"backend spec part {pair!r}: expected key=value"
-                )
-            key, value = pair.split("=", 1)
-            try:
-                value_int = int(value)
-            except ValueError as exc:
-                raise click.BadParameter(
-                    f"backend spec value for {key!r} must be int, got {value!r}"
-                ) from exc
-            if key == "tp":
-                tp = value_int
-            elif key == "dp":
-                dp = value_int
-            elif key == "pp":
-                pp = value_int
-            else:
-                raise click.BadParameter(f"unknown backend key: {key!r}")
-    return engine, tp, dp, pp
+    return (
+        alloc.backend,
+        alloc.parallel.tensor_parallel_size,
+        alloc.parallel.data_parallel_size,
+        alloc.parallel.pipeline_parallel_size,
+    )
 
 
 def split_args(value: str) -> list[str]:

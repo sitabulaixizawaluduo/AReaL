@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from areal.experimental.cli.state import config_path
+from areal.experimental.cli.state import NamespacedStateStore
 
 # (section, key) → (verb_name_or_tuple, click_option_name)
 BindingMap = dict[tuple[str, str], tuple[str | tuple[str, ...], str]]
@@ -40,9 +40,10 @@ class ConfigLoader:
             self.bindings = bindings
         if not self.namespace:
             raise ValueError("ConfigLoader requires a namespace")
+        self.store = NamespacedStateStore(self.namespace)
 
     def default_config_path(self) -> Path:
-        return config_path(self.namespace)
+        return self.store.config_path()
 
     def load_click_default_map(self, extra: Path | None = None) -> dict:
         """Return a ``click`` ``default_map`` built by merging the

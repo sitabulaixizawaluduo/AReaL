@@ -21,7 +21,6 @@ from pathlib import Path
 import click
 
 from areal.experimental.cli.lifecycle import ServiceLifecycle
-from areal.experimental.cli.state import logs_dir
 
 
 class LogsCommand:
@@ -79,7 +78,7 @@ class LogsCommand:
         component name alias / translation layer (e.g. accepting
         ``qwen/0/worker`` as shorthand for ``qwen-worker-0``)."""
 
-        return logs_dir(self.lifecycle.namespace, service) / f"{component}.log"
+        return self.lifecycle.store.logs_dir(service) / f"{component}.log"
 
     def _exec_tail(self, target: Path, *, lines: int, follow: bool) -> None:
         cmd = ["tail", f"-n{lines}"]

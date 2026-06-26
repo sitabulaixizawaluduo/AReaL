@@ -2,15 +2,20 @@
 
 """On-disk state primitives shared across service-style CLIs.
 
-Two layers live here:
+Three layers live here:
 
-1. **Utility functions** — ``areal_home``, ``atomic_write_json``, and the
-   namespace-aware path helpers (``services_dir``, ``logs_dir``, etc.).
-   Every subcommand CLI reads its on-disk state from
-   ``$AREAL_HOME/<namespace>/...``; passing the namespace explicitly lets
-   the same helpers serve every CLI from one place.
+1. **Global helpers** — ``areal_home`` (the user's CLI root) and
+   ``atomic_write_json`` (a generic write primitive). Both are
+   stateless; no namespace involvement.
 
-2. **Contract types** — ``SupportsComponentProbe`` (Protocol) and
+2. **NamespacedStateStore** — every subcommand CLI binds a namespace
+   (``inf``, ``agent``, ``train``, …) and lives under
+   ``$AREAL_HOME/<namespace>/``. The store class collects the path
+   resolution / pointer file / orphan-recovery operations so callers
+   construct one instance per namespace and use methods on it rather
+   than threading the namespace string through every call site.
+
+3. **Contract types** — ``SupportsComponentProbe`` (Protocol) and
    ``ServiceStateBase`` (ABC). Subcommand CLIs implement their own
    ServiceState dataclass that satisfies the protocol / base class, and
    in return get to plug into scaffold's ``ServiceLifecycle`` /
@@ -31,7 +36,7 @@ DEFAULT_SERVICE = "default"
 
 
 # ---------------------------------------------------------------------------
-# Utility functions
+# Global helpers
 # ---------------------------------------------------------------------------
 
 
@@ -80,143 +85,143 @@ def atomic_write_json(path: Path, data: Any, *, indent: int = 2) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Namespace-aware path helpers
+# Namespace-bound state store
 # ---------------------------------------------------------------------------
 
 
-def namespace_root(namespace: str) -> Path:
-    d = areal_home() / namespace
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+class NamespacedStateStore:
+    """All ``$AREAL_HOME/<namespace>/...`` path resolution + pointer
+    file management for one subcommand CLI.
 
-
-def services_dir(namespace: str) -> Path:
-    d = namespace_root(namespace) / "services"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def logs_root(namespace: str) -> Path:
-    d = namespace_root(namespace) / "logs"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def logs_dir(namespace: str, service: str) -> Path:
-    d = logs_root(namespace) / service
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def service_state_path(namespace: str, service: str) -> Path:
-    return services_dir(namespace) / f"{service}.json"
-
-
-def service_lock_path(namespace: str, service: str) -> Path:
-    return services_dir(namespace) / f"{service}.lock"
-
-
-def current_service_path(namespace: str) -> Path:
-    return namespace_root(namespace) / "current-service"
-
-
-def config_path(namespace: str) -> Path:
-    return namespace_root(namespace) / "config.toml"
-
-
-def list_service_names(namespace: str) -> list[str]:
-    return sorted(p.stem for p in services_dir(namespace).glob("*.json"))
-
-
-def set_current_service(namespace: str, service: str) -> None:
-    current_service_path(namespace).write_text(service + "\n")
-
-
-def clear_current_service(namespace: str, service: str) -> None:
-    path = current_service_path(namespace)
-    if path.exists() and path.read_text().strip() == service:
-        path.unlink()
-
-
-def resolve_service_name(
-    namespace: str,
-    explicit: str | None = None,
-    *,
-    fallback: str = DEFAULT_SERVICE,
-) -> str:
-    """Resolve the active service name for a CLI call.
-
-    Order: ``--service`` flag > current-service pointer file > the single
-    running service (if exactly one) > ``fallback``.
+    Construct one per CLI (e.g. ``store = NamespacedStateStore("inf")``)
+    and use the methods on it. Paths are re-resolved on every call so
+    tests that override the home directory via ``AREAL_HOME`` work
+    without rebuilding the store.
     """
 
-    if explicit:
-        return explicit
-    pointer = current_service_path(namespace)
-    if pointer.exists():
-        value = pointer.read_text().strip()
-        if value:
-            return value
-    running = list_service_names(namespace)
-    if len(running) == 1:
-        return running[0]
-    return fallback
+    def __init__(self, namespace: str) -> None:
+        if not namespace:
+            raise ValueError("NamespacedStateStore requires a non-empty namespace")
+        self.namespace = namespace
 
+    # --- directory roots -------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Best-effort orphan PID recovery
-# ---------------------------------------------------------------------------
+    def root(self) -> Path:
+        d = areal_home() / self.namespace
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
+    def services_dir(self) -> Path:
+        d = self.root() / "services"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
-def recover_pids_from_raw_state(namespace: str, service: str) -> list[int]:
-    """Walk the on-disk state files for ``service`` and pull any
-    ``pid`` / ``pids`` numbers.
+    def logs_root(self) -> Path:
+        d = self.root() / "logs"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
-    Used by ``run --force`` to clean up children when the dataclass
-    parse fails (state file from an older / corrupted schema).
-    """
+    def logs_dir(self, service: str) -> Path:
+        d = self.logs_root() / service
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
-    pids: list[int] = []
-    pid_keys = {"pid", "pids"}
+    # --- file paths ------------------------------------------------------
 
-    def add(value) -> None:
-        if isinstance(value, int) and value > 0:
-            pids.append(value)
-        elif isinstance(value, list):
-            for item in value:
-                add(item)
+    def service_state_path(self, service: str) -> Path:
+        return self.services_dir() / f"{service}.json"
 
-    def walk(value) -> None:
-        if isinstance(value, dict):
-            for key, item in value.items():
-                if key in pid_keys:
+    def service_lock_path(self, service: str) -> Path:
+        return self.services_dir() / f"{service}.lock"
+
+    def current_service_path(self) -> Path:
+        return self.root() / "current-service"
+
+    def config_path(self) -> Path:
+        return self.root() / "config.toml"
+
+    # --- pointer file ----------------------------------------------------
+
+    def list_service_names(self) -> list[str]:
+        return sorted(p.stem for p in self.services_dir().glob("*.json"))
+
+    def set_current_service(self, service: str) -> None:
+        self.current_service_path().write_text(service + "\n")
+
+    def clear_current_service(self, service: str) -> None:
+        path = self.current_service_path()
+        if path.exists() and path.read_text().strip() == service:
+            path.unlink()
+
+    def resolve_service_name(
+        self,
+        explicit: str | None = None,
+        *,
+        fallback: str = DEFAULT_SERVICE,
+    ) -> str:
+        """Resolve the active service name for a CLI call.
+
+        Order: ``--service`` flag > current-service pointer file > the
+        single running service (if exactly one) > ``fallback``.
+        """
+
+        if explicit:
+            return explicit
+        pointer = self.current_service_path()
+        if pointer.exists():
+            value = pointer.read_text().strip()
+            if value:
+                return value
+        running = self.list_service_names()
+        if len(running) == 1:
+            return running[0]
+        return fallback
+
+    # --- best-effort orphan PID recovery ---------------------------------
+
+    def recover_pids_from_raw_state(self, service: str) -> list[int]:
+        """Walk the service-state file for ``service`` and pull any
+        ``pid`` / ``pids`` numbers.
+
+        Used by ``run --force`` to clean up children when the dataclass
+        parse fails (state file from an older / corrupted schema).
+        Subclasses with extra state files (e.g. inf's
+        ``models/<svc>.json``) override to walk the additional files.
+        """
+
+        pids: list[int] = []
+        pid_keys = {"pid", "pids"}
+
+        def add(value) -> None:
+            if isinstance(value, int) and value > 0:
+                pids.append(value)
+            elif isinstance(value, list):
+                for item in value:
                     add(item)
-                else:
+
+        def walk(value) -> None:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key in pid_keys:
+                        add(item)
+                    else:
+                        walk(item)
+            elif isinstance(value, list):
+                for item in value:
                     walk(item)
-        elif isinstance(value, list):
-            for item in value:
-                walk(item)
 
-    candidate_files = [
-        service_state_path(namespace, service),
-        # Subcommand CLIs may also keep secondary state files (e.g. inf's
-        # models/<svc>.json). Walking namespace_root/* once would catch
-        # them, but we keep this targeted to the service-state file to
-        # avoid surprising file enumeration.
-    ]
-    for path in candidate_files:
-        if not path.exists():
-            continue
-        with open(path) as f:
-            walk(json.load(f))
+        path = self.service_state_path(service)
+        if path.exists():
+            with open(path) as f:
+                walk(json.load(f))
 
-    seen: set[int] = set()
-    unique: list[int] = []
-    for pid in pids:
-        if pid not in seen:
-            seen.add(pid)
-            unique.append(pid)
-    return unique
+        seen: set[int] = set()
+        unique: list[int] = []
+        for pid in pids:
+            if pid not in seen:
+                seen.add(pid)
+                unique.append(pid)
+        return unique
 
 
 # ---------------------------------------------------------------------------

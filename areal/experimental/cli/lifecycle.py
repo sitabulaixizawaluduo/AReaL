@@ -19,14 +19,7 @@ from pathlib import Path
 import click
 
 from areal.experimental.cli.process import kill_pids
-from areal.experimental.cli.state import (
-    DEFAULT_SERVICE,
-    clear_current_service,
-    list_service_names,
-    recover_pids_from_raw_state,
-    resolve_service_name,
-    service_state_path,
-)
+from areal.experimental.cli.state import DEFAULT_SERVICE, NamespacedStateStore
 
 
 class ServiceLifecycle:
@@ -52,6 +45,7 @@ class ServiceLifecycle:
             raise ValueError("ServiceLifecycle requires a namespace")
         if not self.stop_command:
             raise ValueError("ServiceLifecycle requires a stop_command")
+        self.store = NamespacedStateStore(self.namespace)
 
     # ------------------------------------------------------------------
     # Hooks subclasses may override
@@ -64,15 +58,13 @@ class ServiceLifecycle:
         return state.gateway_alive()
 
     def state_path(self, service: str) -> Path:
-        return service_state_path(self.namespace, service)
+        return self.store.service_state_path(service)
 
     def resolve_service_name(self, explicit: str | None) -> str:
-        return resolve_service_name(
-            self.namespace, explicit, fallback=self.default_service
-        )
+        return self.store.resolve_service_name(explicit, fallback=self.default_service)
 
     def list_services(self) -> list[str]:
-        return list_service_names(self.namespace)
+        return self.store.list_service_names()
 
     def load_state(self, service: str):
         return self.state_class.load(service)
@@ -140,13 +132,13 @@ class ServiceLifecycle:
             pids = self._collect_pids(state)
         except Exception:
             try:
-                pids = recover_pids_from_raw_state(self.namespace, service)
+                pids = self.store.recover_pids_from_raw_state(service)
             except Exception:
                 pids = []
         if pids:
             kill_pids(pids, grace_s=grace_s)
         path.unlink(missing_ok=True)
-        clear_current_service(self.namespace, service)
+        self.store.clear_current_service(service)
 
     def _collect_pids(self, state) -> list[int]:
         """Default implementation pulls ``.pid`` off every component

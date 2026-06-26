@@ -167,5 +167,3 @@ def test_inference_reward_parses_session_api_key_option(monkeypatch):
         "model": "m",
         "service": "svc",
     }
-
-

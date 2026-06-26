@@ -12,14 +12,19 @@ from areal.experimental.cli.inference.common import (
     register_model,
 )
 from areal.experimental.cli.inference.lifecycle import inf_lifecycle
-from areal.experimental.cli.inference.state import INF_NAMESPACE, locked_model_state
+from areal.experimental.cli.inference.state import INF_NAMESPACE, store
 from areal.experimental.cli.state import logs_dir
 
 
 @click.command(name="register", help="Register a model against a running service.")
 @click.option("--model-name", required=True, help="Model name to register.")
 @click.option("--service", default=None, help="Target service instance.")
-@click.option("--backend", default=None, help="Backend spec.")
+@click.option(
+    "--backend",
+    default=None,
+    help="Backend spec; same grammar as InferenceEngineConfig.backend, "
+    "e.g. 'sglang:d4', 'vllm:d2t4'.",
+)
 @click.option("--model-path", default=None)
 @click.option("--tokenizer-path", default=None)
 @click.option("--engine-args", default="", help=ENGINE_ARGS_HELP)
@@ -37,7 +42,7 @@ def register_cmd(model_name: str, service: str | None, **opts) -> None:
 
 def do_register(model_name: str, opts: dict, *, service: str | None = None) -> int:
     service_name = inf_lifecycle.resolve_service_name(service)
-    with locked_model_state(service_name):
+    with store.lock_model_state(service_name):
         state = inf_lifecycle.load_running_state(service_name)
         if model_name in state.models:
             raise click.ClickException(

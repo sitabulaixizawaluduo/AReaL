@@ -17,7 +17,6 @@ def test_inference_commands_expose_service_flag():
         "register",
         "deregister",
         "models",
-        "collect",
         "reward",
         "logs",
     ):
@@ -41,14 +40,11 @@ def test_inference_model_name_options_are_exposed():
 
     register = runner.invoke(cli, ["inf", "register", "--help"])
     deregister = runner.invoke(cli, ["inf", "deregister", "--help"])
-    collect = runner.invoke(cli, ["inf", "collect", "--help"])
 
     assert register.exit_code == 0
     assert "--model-name" in register.output
     assert deregister.exit_code == 0
     assert "--model-name" in deregister.output
-    assert collect.exit_code == 0
-    assert "--model-name" in collect.output
 
 
 def test_inference_reward_session_api_key_option_is_exposed():
@@ -84,7 +80,7 @@ def test_inference_register_parses_model_name_option(monkeypatch):
             "--model-name",
             "m",
             "--backend",
-            "sglang:tp=1,dp=1",
+            "sglang:d1",
             "--model-path",
             "/models/m",
         ],
@@ -93,7 +89,7 @@ def test_inference_register_parses_model_name_option(monkeypatch):
     assert result.exit_code == 0
     assert captured["model_name"] == "m"
     assert captured["service"] == "svc"
-    assert captured["opts"]["backend"] == "sglang:tp=1,dp=1"
+    assert captured["opts"]["backend"] == "sglang:d1"
     assert captured["opts"]["model_path"] == "/models/m"
 
 
@@ -173,33 +169,3 @@ def test_inference_reward_parses_session_api_key_option(monkeypatch):
     }
 
 
-def test_inference_collect_parses_model_name_option(monkeypatch):
-    from areal.experimental.cli.inference.commands import collect
-
-    captured = {}
-
-    def fake_collect(**kwargs):
-        captured.update(kwargs)
-        return 0
-
-    monkeypatch.setattr(collect, "do_collect", fake_collect)
-    runner = CliRunner()
-
-    result = runner.invoke(
-        cli,
-        [
-            "inf",
-            "collect",
-            "--service",
-            "svc",
-            "--model-name",
-            "m",
-            "--batch-size",
-            "2",
-        ],
-    )
-
-    assert result.exit_code == 0
-    assert captured["model"] == "m"
-    assert captured["service"] == "svc"
-    assert captured["batch_size"] == 2

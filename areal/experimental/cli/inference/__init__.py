@@ -7,7 +7,6 @@ from pathlib import Path
 import click
 
 from areal.experimental.cli.commands.logs import LogsCommand
-from areal.experimental.cli.inference.commands.collect import collect_cmd
 from areal.experimental.cli.inference.commands.deregister import deregister_cmd
 from areal.experimental.cli.inference.commands.models import models_cmd
 from areal.experimental.cli.inference.commands.ps import ps_cmd
@@ -40,6 +39,5 @@ inf.add_command(ps_cmd)
 inf.add_command(register_cmd)
 inf.add_command(deregister_cmd)
 inf.add_command(models_cmd)
-inf.add_command(collect_cmd)
 inf.add_command(reward_cmd)
 inf.add_command(LogsCommand(lifecycle=inf_lifecycle).build())

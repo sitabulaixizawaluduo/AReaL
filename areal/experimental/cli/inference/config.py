@@ -9,7 +9,6 @@ to verbs:
   [launch]               run-time gateway / router / strategy / timeouts
   [scheduler]            scheduler backend selection (applied to run only)
   [register.internal]    register / inline-register defaults
-  [collect]              collect verb defaults
 
 Precedence (highest first):
   1. explicit CLI flag
@@ -39,7 +38,6 @@ INF_BINDINGS: BindingMap = {
             "register",
             "deregister",
             "models",
-            "collect",
             "reward",
             "logs",
         ),
@@ -59,13 +57,6 @@ INF_BINDINGS: BindingMap = {
     ("register.internal", "model_health_timeout"): ("register", "model_health_timeout"),
     ("register.internal", "engine_args"): ("register", "engine_args"),
     ("register.internal", "proxy_args"): ("register", "proxy_args"),
-    # [collect]
-    ("collect", "batch_size"): ("collect", "batch_size"),
-    ("collect", "timeout"): ("collect", "timeout"),
-    ("collect", "poll_interval"): ("collect", "poll_interval"),
-    ("collect", "turn_discount"): ("collect", "turn_discount"),
-    ("collect", "export_style"): ("collect", "export_style"),
-    ("collect", "format"): ("collect", "format"),
 }
 
 

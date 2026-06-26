@@ -2,7 +2,7 @@
 
 `areal inf` launches and manages an AReaL inference service on the local machine. It
 starts the gateway/router, registers models, inspects service state, manages logs, and
-provides the session / reward / collect flow used for RL data collection.
+exposes the per-session reward write needed by RL training.
 
 ## Basic concepts
 
@@ -63,7 +63,7 @@ areal inf models --service default
 areal inf register \
   --service default \
   --model-name qwen-local \
-  --backend sglang:tp=1,dp=1 \
+  --backend sglang:d1 \
   --model-path Qwen/Qwen2.5-7B-Instruct \
   --tokenizer-path Qwen/Qwen2.5-7B-Instruct \
   --engine-args "--mem-fraction-static 0.8" \
@@ -84,7 +84,7 @@ areal inf run \
   --port 8080 \
   --admin-api-key areal-admin-key \
   --model qwen-local \
-  --backend sglang:tp=1,dp=1 \
+  --backend sglang:d1 \
   --model-path Qwen/Qwen2.5-7B-Instruct \
   --engine-args "--mem-fraction-static 0.8" \
   --proxy-args "--request-timeout 120 --chat-template-type hf" \
@@ -113,8 +113,8 @@ For plain inference there is no need to call `/rl/start_session`.
 
 ## RL session flow
 
-To record trajectories, an RL session must be created first. `collect` does this
-automatically; for manual debugging the gateway can be called directly:
+To record trajectories, an RL session must be created first by calling the gateway
+directly:
 
 ```bash
 curl -sS http://127.0.0.1:8080/rl/start_session \
@@ -158,29 +158,6 @@ areal inf reward 1.0 \
 ```
 
 A trajectory usually only enters the ready/export flow after a reward has been set.
-
-## Collecting trajectories
-
-`collect` launches a batch of sessions, polls for ready trajectories, and writes the
-exported results to a file:
-
-```bash
-areal inf collect \
-  --service default \
-  --model-name qwen-local \
-  --batch-size 8 \
-  --output trajectories.jsonl \
-  --format jsonl \
-  --timeout 1800 \
-  --poll-interval 2
-```
-
-`--batch-size` corresponds to the session/group size created in one collection. For
-group-based algorithms such as GRPO, it usually represents how many sessions are
-collected per group.
-
-`--turn-discount` is the reward discount applied when exporting multi-turn trajectories;
-the default is `1.0`.
 
 ## Logs and cleanup
 
@@ -244,16 +221,8 @@ routing_strategy = "round_robin"
 type = "local"
 
 [register.internal]
-backend = "sglang:tp=1,dp=1"
+backend = "sglang:d1"
 model_health_timeout = 600
 engine_args = "--mem-fraction-static 0.8"
 proxy_args = "--request-timeout 120 --chat-template-type hf"
-
-[collect]
-batch_size = 8
-timeout = 1800
-poll_interval = 2
-turn_discount = 1.0
-export_style = "individual"
-format = "jsonl"
 ```

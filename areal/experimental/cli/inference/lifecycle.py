@@ -7,7 +7,7 @@ from areal.experimental.cli.inference.state import (
     ModelState,
     RuntimeState,
     ServiceState,
-    recover_pids_from_raw_state,
+    store,
 )
 from areal.experimental.cli.lifecycle import ServiceLifecycle
 from areal.experimental.cli.process import kill_pids
@@ -31,7 +31,7 @@ class InferenceLifecycle(ServiceLifecycle):
             pids = self._collect_pids(state)
         except Exception:
             try:
-                pids = recover_pids_from_raw_state(service)
+                pids = store.recover_pids_from_raw_state(service)
             except Exception:
                 pids = []
         if pids:

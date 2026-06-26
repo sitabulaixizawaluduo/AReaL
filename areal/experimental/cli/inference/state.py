@@ -24,40 +24,120 @@ from areal.experimental.cli.utils import file_lock
 
 INF_NAMESPACE = "inf"
 
+
+class InferenceStateStore:
+    """Owns the on-disk layout of the inference CLI's two state files.
+
+    The inference service splits its state across two files per service —
+    the service-state (gateway / router handles) and the model-state
+    (model registry, locked for register / deregister). All file-system
+    plumbing lives on this class so subcommands and lifecycle code don't
+    sprinkle path helpers across the module.
+
+    A single module-level instance, ``store``, is created at import time
+    and used by the dataclasses below; tests that isolate state via
+    ``AREAL_HOME`` work because the store re-resolves paths through
+    ``namespace_root`` on every call.
+    """
+
+    def __init__(self, namespace: str = INF_NAMESPACE) -> None:
+        self.namespace = namespace
+
+    # --- path resolution -------------------------------------------------
+
+    def models_dir(self) -> Path:
+        """``$AREAL_HOME/<namespace>/models`` — created lazily."""
+
+        d = namespace_root(self.namespace) / "models"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def models_state_path(self, service: str) -> Path:
+        return self.models_dir() / f"{service}.json"
+
+    def models_lock_path(self, service: str) -> Path:
+        return self.models_dir() / f"{service}.lock"
+
+    def service_state_path(self, service: str) -> Path:
+        return service_state_path(self.namespace, service)
+
+    # --- locking ---------------------------------------------------------
+
+    @contextmanager
+    def lock_model_state(self, service: str) -> Iterator[None]:
+        """Per-service flock on the model-registry file. Held across
+        register / deregister so concurrent CLI calls cannot race the
+        JSON read-modify-write."""
+
+        with file_lock(self.models_lock_path(service)):
+            yield
+
+    # --- best-effort recovery -------------------------------------------
+
+    def recover_pids_from_raw_state(self, service: str) -> list[int]:
+        """Best-effort PID extraction from possibly-malformed state files.
+
+        Walks BOTH service-state and model-state JSON for ``pid`` /
+        ``pids`` keys so ``run --force`` can still clean up children when
+        the dataclass parse fails. Inference owns its own walker because
+        the model-state file is invisible to scaffold's default helper.
+        """
+
+        pids: list[int] = []
+        pid_keys = {"pid", "pids"}
+
+        def add(value) -> None:
+            if isinstance(value, int) and value > 0:
+                pids.append(value)
+            elif isinstance(value, list):
+                for item in value:
+                    add(item)
+
+        def walk(value) -> None:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key in pid_keys:
+                        add(item)
+                    else:
+                        walk(item)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item)
+
+        for path in (self.service_state_path(service), self.models_state_path(service)):
+            if not path.exists():
+                continue
+            with open(path) as f:
+                walk(json.load(f))
+
+        seen: set[int] = set()
+        unique: list[int] = []
+        for pid in pids:
+            if pid not in seen:
+                seen.add(pid)
+                unique.append(pid)
+        return unique
+
+
+# Module-level singleton — every dataclass / verb routes path resolution
+# through this. Tests use ``AREAL_HOME`` to isolate; the store re-resolves
+# on every call so the env override takes effect without rebuilding.
+store = InferenceStateStore()
+
+
 # ``DEFAULT_SERVICE`` is re-exported above so existing subcommand imports
 # (`from ...inference.state import DEFAULT_SERVICE`) keep working.
 __all__ = [
     "DEFAULT_SERVICE",
     "INF_NAMESPACE",
+    "InferenceStateStore",
     "ModelEntry",
     "ModelReplica",
     "ModelState",
     "RuntimeState",
     "ServiceState",
-    "locked_model_state",
-    "models_dir",
-    "models_lock_path",
-    "models_state_path",
-    "recover_pids_from_raw_state",
+    "store",
 ]
-
-
-def models_dir() -> Path:
-    """``$AREAL_HOME/inf/models`` — separate file per service holds the
-    model registry, so we can lock and rewrite it independently of the
-    service state file."""
-
-    d = namespace_root(INF_NAMESPACE) / "models"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def models_state_path(service: str) -> Path:
-    return models_dir() / f"{service}.json"
-
-
-def models_lock_path(service: str) -> Path:
-    return models_dir() / f"{service}.lock"
 
 
 def _handle_from_dict(raw: dict) -> TaskHandle:
@@ -131,12 +211,12 @@ class ServiceState:
         return self.router_handle.addr
 
     def save(self) -> None:
-        atomic_write_json(service_state_path(INF_NAMESPACE, self.service), asdict(self))
-        set_current_service(INF_NAMESPACE, self.service)
+        atomic_write_json(store.service_state_path(self.service), asdict(self))
+        set_current_service(store.namespace, self.service)
 
     @classmethod
     def load(cls, service: str) -> ServiceState:
-        p = service_state_path(INF_NAMESPACE, service)
+        p = store.service_state_path(service)
         if not p.exists():
             raise FileNotFoundError(f"No service state at {p}")
         with open(p) as f:
@@ -153,10 +233,10 @@ class ServiceState:
 
     @classmethod
     def remove(cls, service: str) -> None:
-        p = service_state_path(INF_NAMESPACE, service)
+        p = store.service_state_path(service)
         if p.exists():
             p.unlink()
-        clear_current_service(INF_NAMESPACE, service)
+        clear_current_service(store.namespace, service)
 
 
 @dataclass
@@ -165,11 +245,11 @@ class ModelState:
     models: dict[str, ModelEntry] = field(default_factory=dict)
 
     def save(self) -> None:
-        atomic_write_json(models_state_path(self.service), asdict(self))
+        atomic_write_json(store.models_state_path(self.service), asdict(self))
 
     @classmethod
     def load(cls, service: str) -> ModelState:
-        p = models_state_path(service)
+        p = store.models_state_path(service)
         if not p.exists():
             return cls(service=service)
         with open(p) as f:
@@ -182,7 +262,7 @@ class ModelState:
 
     @classmethod
     def remove(cls, service: str) -> None:
-        p = models_state_path(service)
+        p = store.models_state_path(service)
         if p.exists():
             p.unlink()
 
@@ -280,59 +360,3 @@ class RuntimeState(ServiceStateBase):
             for i, replica in enumerate(entry.replicas):
                 yield f"data_proxy[{name}/{i}]", replica.data_proxy
                 yield f"worker[{name}/{i}]", replica.worker
-
-
-@contextmanager
-def locked_model_state(service: str) -> Iterator[None]:
-    """Per-service flock on the model-registry file. Held across
-    register / deregister so concurrent CLI calls cannot race the
-    JSON read-modify-write."""
-
-    with file_lock(models_lock_path(service)):
-        yield
-
-
-def recover_pids_from_raw_state(service: str) -> list[int]:
-    """Best-effort PID extraction from possibly-malformed state files —
-    walks BOTH service-state and model-state JSON for ``pid`` / ``pids``
-    keys so ``run --force`` cleans up children when the dataclass parse
-    fails. Inference owns its own walker because it has the second
-    (model-state) file scaffold's default helper doesn't know about."""
-
-    pids: list[int] = []
-    pid_keys = {"pid", "pids"}
-
-    def add(value) -> None:
-        if isinstance(value, int) and value > 0:
-            pids.append(value)
-        elif isinstance(value, list):
-            for item in value:
-                add(item)
-
-    def walk(value) -> None:
-        if isinstance(value, dict):
-            for key, item in value.items():
-                if key in pid_keys:
-                    add(item)
-                else:
-                    walk(item)
-        elif isinstance(value, list):
-            for item in value:
-                walk(item)
-
-    for path in (
-        service_state_path(INF_NAMESPACE, service),
-        models_state_path(service),
-    ):
-        if not path.exists():
-            continue
-        with open(path) as f:
-            walk(json.load(f))
-
-    seen: set[int] = set()
-    unique: list[int] = []
-    for pid in pids:
-        if pid not in seen:
-            seen.add(pid)
-            unique.append(pid)
-    return unique

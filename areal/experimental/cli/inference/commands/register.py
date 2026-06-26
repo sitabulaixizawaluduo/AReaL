@@ -12,8 +12,7 @@ from areal.experimental.cli.inference.common import (
     register_model,
 )
 from areal.experimental.cli.inference.lifecycle import inf_lifecycle
-from areal.experimental.cli.inference.state import INF_NAMESPACE, store
-from areal.experimental.cli.state import logs_dir
+from areal.experimental.cli.inference.state import store
 
 
 @click.command(name="register", help="Register a model against a running service.")
@@ -54,7 +53,7 @@ def do_register(model_name: str, opts: dict, *, service: str | None = None) -> i
             opts=opts,
             gateway=GatewayClient(state.gateway_url, state.admin_api_key),
             router=RouterClient(state.router_url, state.admin_api_key),
-            log_dir=logs_dir(INF_NAMESPACE, state.service),
+            log_dir=store.logs_dir(state.service),
             admin_api_key=state.admin_api_key,
             scheduler_backend=state.backend,
             occupied_gpus=state.model_state.occupied_gpus(),

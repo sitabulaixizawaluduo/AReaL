@@ -20,14 +20,12 @@ from areal.experimental.cli.inference.lifecycle import inf_lifecycle
 from areal.experimental.cli.inference.scheduler import TaskHandle
 from areal.experimental.cli.inference.state import (
     DEFAULT_SERVICE,
-    INF_NAMESPACE,
     ModelState,
     RuntimeState,
     ServiceState,
     store,
 )
 from areal.experimental.cli.process import kill_pids
-from areal.experimental.cli.state import logs_dir
 from areal.experimental.cli.utils import wait_client_health
 from areal.experimental.cli.watcher import ForegroundWatcher
 
@@ -105,7 +103,7 @@ def do_run(opts: dict) -> int:
     elif opts["backend"]:
         raise click.UsageError("model registration flags require --model.")
 
-    log_dir = logs_dir(INF_NAMESPACE, service)
+    log_dir = store.logs_dir(service)
     logger.info("starting inference service %r (logs: %s)", service, log_dir)
 
     router_pid, router_port = spawn_router(

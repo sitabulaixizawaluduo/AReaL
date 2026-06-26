@@ -12,43 +12,36 @@ from areal.experimental.cli.inference.scheduler import TaskHandle
 from areal.experimental.cli.process import pid_alive
 from areal.experimental.cli.state import (
     DEFAULT_SERVICE,
+    NamespacedStateStore,
     ServiceStateBase,
     SupportsComponentProbe,
     atomic_write_json,
-    clear_current_service,
-    namespace_root,
-    service_state_path,
-    set_current_service,
 )
 from areal.experimental.cli.utils import file_lock
 
 INF_NAMESPACE = "inf"
 
 
-class InferenceStateStore:
-    """Owns the on-disk layout of the inference CLI's two state files.
+class InferenceStateStore(NamespacedStateStore):
+    """Inference-specific extension of the scaffold ``NamespacedStateStore``.
 
     The inference service splits its state across two files per service —
-    the service-state (gateway / router handles) and the model-state
-    (model registry, locked for register / deregister). All file-system
-    plumbing lives on this class so subcommands and lifecycle code don't
-    sprinkle path helpers across the module.
-
-    A single module-level instance, ``store``, is created at import time
-    and used by the dataclasses below; tests that isolate state via
-    ``AREAL_HOME`` work because the store re-resolves paths through
-    ``namespace_root`` on every call.
+    the service-state (gateway / router handles, inherited from
+    scaffold) and the model-state (model registry, locked for
+    register / deregister). This class adds the model-state file paths
+    + lock + overrides ``recover_pids_from_raw_state`` to walk both
+    files when ``run --force`` falls back to raw-JSON PID recovery.
     """
 
     def __init__(self, namespace: str = INF_NAMESPACE) -> None:
-        self.namespace = namespace
+        super().__init__(namespace)
 
-    # --- path resolution -------------------------------------------------
+    # --- model-state file layout ----------------------------------------
 
     def models_dir(self) -> Path:
         """``$AREAL_HOME/<namespace>/models`` — created lazily."""
 
-        d = namespace_root(self.namespace) / "models"
+        d = self.root() / "models"
         d.mkdir(parents=True, exist_ok=True)
         return d
 
@@ -58,10 +51,7 @@ class InferenceStateStore:
     def models_lock_path(self, service: str) -> Path:
         return self.models_dir() / f"{service}.lock"
 
-    def service_state_path(self, service: str) -> Path:
-        return service_state_path(self.namespace, service)
-
-    # --- locking ---------------------------------------------------------
+    # --- locking --------------------------------------------------------
 
     @contextmanager
     def lock_model_state(self, service: str) -> Iterator[None]:
@@ -72,16 +62,12 @@ class InferenceStateStore:
         with file_lock(self.models_lock_path(service)):
             yield
 
-    # --- best-effort recovery -------------------------------------------
+    # --- best-effort recovery (override) --------------------------------
 
     def recover_pids_from_raw_state(self, service: str) -> list[int]:
-        """Best-effort PID extraction from possibly-malformed state files.
-
-        Walks BOTH service-state and model-state JSON for ``pid`` /
-        ``pids`` keys so ``run --force`` can still clean up children when
-        the dataclass parse fails. Inference owns its own walker because
-        the model-state file is invisible to scaffold's default helper.
-        """
+        """Walk BOTH service-state and model-state JSON for ``pid`` /
+        ``pids`` keys. Inference overrides scaffold's single-file walker
+        because the second (model-state) file is invisible to it."""
 
         pids: list[int] = []
         pid_keys = {"pid", "pids"}
@@ -212,7 +198,7 @@ class ServiceState:
 
     def save(self) -> None:
         atomic_write_json(store.service_state_path(self.service), asdict(self))
-        set_current_service(store.namespace, self.service)
+        store.set_current_service(self.service)
 
     @classmethod
     def load(cls, service: str) -> ServiceState:
@@ -236,7 +222,7 @@ class ServiceState:
         p = store.service_state_path(service)
         if p.exists():
             p.unlink()
-        clear_current_service(store.namespace, service)
+        store.clear_current_service(service)
 
 
 @dataclass

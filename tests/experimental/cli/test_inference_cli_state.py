@@ -9,30 +9,24 @@ from click.testing import CliRunner
 
 from areal.experimental.cli.inference.scheduler import TaskHandle
 from areal.experimental.cli.inference.state import (
-    INF_NAMESPACE,
     ModelEntry,
     ModelState,
     ServiceState,
     store,
 )
 from areal.experimental.cli.main import cli
-from areal.experimental.cli.state import (
-    current_service_path,
-    resolve_service_name,
-    service_state_path,
-)
 
 
 def _service_path(service: str):
-    return service_state_path(INF_NAMESPACE, service)
+    return store.service_state_path(service)
 
 
 def _current_path():
-    return current_service_path(INF_NAMESPACE)
+    return store.current_service_path()
 
 
 def _resolve(name: str | None) -> str:
-    return resolve_service_name(INF_NAMESPACE, name)
+    return store.resolve_service_name(name)
 
 
 def _save_service(service: str, *, gateway_pid: int | None = None) -> None:

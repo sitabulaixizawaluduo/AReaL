@@ -11,7 +11,6 @@ from areal.v2.cli.inference.commands.deregister import deregister_cmd
 from areal.v2.cli.inference.commands.models import models_cmd
 from areal.v2.cli.inference.commands.ps import ps_cmd
 from areal.v2.cli.inference.commands.register import register_cmd
-from areal.v2.cli.inference.commands.reward import reward_cmd
 from areal.v2.cli.inference.commands.run import run_cmd
 from areal.v2.cli.inference.commands.status import status_cmd
 from areal.v2.cli.inference.commands.stop import stop_cmd
@@ -39,5 +38,4 @@ inf.add_command(ps_cmd)
 inf.add_command(register_cmd)
 inf.add_command(deregister_cmd)
 inf.add_command(models_cmd)
-inf.add_command(reward_cmd)
 inf.add_command(LogsCommand(lifecycle=inf_lifecycle).build())

@@ -24,29 +24,6 @@ class GatewayClient(BaseHTTPClient):
     def register_model(self, payload: dict, *, timeout: float = 30.0) -> dict[str, Any]:
         return self._post("/register_model", payload=payload, timeout=timeout)
 
-    def set_reward(
-        self,
-        *,
-        session_api_key: str,
-        reward: float,
-        model: str | None = None,
-        timeout: float = 10.0,
-    ) -> dict[str, Any]:
-        payload: dict = {"reward": reward}
-        if model:
-            payload["model"] = model
-        # Per-session bearer token, not the gateway admin key — bypass the
-        # base client's auth and pass session_api_key explicitly.
-        from areal.v2.cli.client import request_json
-
-        return request_json(
-            f"{self.base}/rl/set_reward",
-            method="POST",
-            payload=payload,
-            bearer=session_api_key,
-            timeout=timeout,
-        )
-
 
 class RouterClient(BaseHTTPClient):
     def register_worker(self, addr: str, *, timeout: float = 10.0) -> dict[str, Any]:

@@ -38,7 +38,6 @@ INF_BINDINGS: BindingMap = {
             "register",
             "deregister",
             "models",
-            "reward",
             "logs",
         ),
         "service",

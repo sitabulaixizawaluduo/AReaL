@@ -1,8 +1,7 @@
 # AReaL Inference Service CLI
 
 `areal inf` launches and manages an AReaL inference service on the local machine. It
-starts the gateway/router, registers models, inspects service state, manages logs, and
-exposes the per-session reward write needed by RL training.
+starts the gateway/router, registers models, inspects service state, and manages logs.
 
 ## Basic concepts
 
@@ -108,56 +107,6 @@ curl -sS http://127.0.0.1:8080/v1/chat/completions \
     "max_tokens": 128
   }'
 ```
-
-For plain inference there is no need to call `/rl/start_session`.
-
-## RL session flow
-
-To record trajectories, an RL session must be created first by calling the gateway
-directly:
-
-```bash
-curl -sS http://127.0.0.1:8080/rl/start_session \
-  -H "Authorization: Bearer areal-admin-key" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen-local",
-    "task_id": "debug",
-    "group_size": 1
-  }'
-```
-
-The response contains a `session_api_key`. Subsequent conversation turns must
-authenticate with this session key so the data-proxy can attribute requests, responses,
-and rewards to the same session/trajectory.
-
-```bash
-SESSION_API_KEY=...
-
-curl -sS http://127.0.0.1:8080/v1/chat/completions \
-  -H "Authorization: Bearer $SESSION_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen-local",
-    "messages": [
-      {"role": "user", "content": "Solve: 1 + 1 = ?"}
-    ],
-    "max_tokens": 64
-  }'
-```
-
-## Setting reward
-
-After a session conversation completes, the CLI can write the reward:
-
-```bash
-areal inf reward 1.0 \
-  --service default \
-  --session-api-key "$SESSION_API_KEY" \
-  --model qwen-local
-```
-
-A trajectory usually only enters the ready/export flow after a reward has been set.
 
 ## Logs and cleanup
 

@@ -5,13 +5,13 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from areal.utils.network import find_free_ports
 from areal.v2.cli.inference.scheduler import (
     TaskAllocation,
     TaskResources,
     TaskSpec,
 )
 from areal.v2.cli.process import spawn_process
-from areal.utils.network import find_free_ports
 
 # Gateway and router are service-level singletons spawned directly via
 # spawn_process — not submitted to a Scheduler — so their lifecycle is

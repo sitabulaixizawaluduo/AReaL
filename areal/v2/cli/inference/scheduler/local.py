@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 
+from areal.utils.logging import getLogger
+from areal.utils.network import find_free_ports
 from areal.v2.cli.inference.scheduler.base import (
     Scheduler,
     SchedulerError,
@@ -12,8 +14,6 @@ from areal.v2.cli.inference.scheduler.base import (
     TaskSpec,
 )
 from areal.v2.cli.process import spawn_process
-from areal.utils.logging import getLogger
-from areal.utils.network import find_free_ports
 
 logger = getLogger("InfLocalScheduler")
 

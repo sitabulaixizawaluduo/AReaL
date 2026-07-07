@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any
@@ -51,6 +52,33 @@ from areal.v2.inference_service.sglang.bridge import SGLangBridgeBackend
 from areal.v2.inference_service.vllm.bridge import VLLMBridgeBackend
 
 logger = logging.getLogger("InferenceDataProxy")
+
+
+def _get_or_load_processor(app_state: Any, tokenizer_path: str) -> Any | None:
+    """Lazy-load an ``AutoProcessor`` for VLM multi-modal augmentation.
+
+    Attempted once per process; failure caches ``None`` so text-only checkpoints
+    don't retry on every trajectory export. Returns the processor or ``None``.
+    """
+    if app_state.processor_attempted:
+        return app_state.processor
+    if not tokenizer_path:
+        app_state.processor_attempted = True
+        return None
+    with app_state.processor_lock:
+        if app_state.processor_attempted:
+            return app_state.processor
+        try:
+            from transformers import AutoProcessor
+
+            app_state.processor = AutoProcessor.from_pretrained(tokenizer_path)
+        except Exception:
+            logger.info(
+                "No AutoProcessor for %s; assuming text-only model", tokenizer_path
+            )
+            app_state.processor = None
+        app_state.processor_attempted = True
+        return app_state.processor
 
 
 # =============================================================================
@@ -345,6 +373,14 @@ def create_app(config: DataProxyConfig) -> FastAPI:
             app.state.tokenizer = tok
             app.state.inf_bridge = inf_bridge
             app.state.areal_client = areal_client
+
+        # Lazy-loaded HF ``AutoProcessor`` for VLM multi-modal augmentation of
+        # exported trajectories. ``None`` after the load attempt means the
+        # checkpoint has no processor (pure text model) — export then produces a
+        # text-only tensor dict, unchanged from before this hook was added.
+        app.state.processor = None
+        app.state.processor_attempted = False
+        app.state.processor_lock = threading.Lock()
 
         ready_task = asyncio.create_task(_ready_trajectory_loop(app))
         try:
@@ -741,7 +777,10 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 continue
 
         if all(v.has_tensor_data for v in merged.values()):
-            traj = concat_padded_tensors([v.to_tensor_dict() for v in merged.values()])
+            processor = _get_or_load_processor(app.state, config.tokenizer_path)
+            traj = concat_padded_tensors(
+                [v.to_tensor_dict(processor=processor) for v in merged.values()]
+            )
             traj = RTensor.remotize(traj, node_addr=config.serving_addr)
         else:
             traj = concat_string_interactions(merged)

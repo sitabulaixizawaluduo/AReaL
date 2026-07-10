@@ -64,41 +64,77 @@ def _image_pad_token_id(tokenizer) -> int | None:
     return None
 
 
-def _attach_multi_modal_fields(
-    result: dict[str, Any],
+def _expand_image_pad_tokens(
+    input_tokens: list[int],
+    image_grid_thw: Any,
+    merge_size: int,
+    image_pad_id: int,
+) -> list[int]:
+    """Replace each single ``<|image_pad|>`` with N copies of the same token.
+
+    Why: the gateway tokenises messages via ``tokenizer.apply_chat_template``,
+    which emits one ``<|image_pad|>`` per image slot in the prompt. The
+    inference server (SGLang / vLLM) then expands that placeholder to
+    ``N = T*H*W / merge_size**2`` real image tokens before running the model,
+    but ``ModelResponse.input_tokens`` is set from ``req.input_ids`` — i.e.
+    the *unexpanded* sequence. When the training-side model forward consumes
+    that unexpanded sequence together with our per-image ``pixel_values``, HF's
+    ``get_placeholder_mask`` finds fewer image tokens than image features and
+    raises ``Image features and image tokens do not match``. Expanding here
+    keeps the training-side view of the prompt aligned with what the model
+    actually needs.
+    """
+    per_image_counts = [
+        int(row.prod().item()) // (merge_size * merge_size) for row in image_grid_thw
+    ]
+    result: list[int] = []
+    image_idx = 0
+    for token in input_tokens:
+        tid = int(token)
+        if tid == image_pad_id and image_idx < len(per_image_counts):
+            result.extend([image_pad_id] * per_image_counts[image_idx])
+            image_idx += 1
+        else:
+            result.append(tid)
+    return result
+
+
+def _compute_vision_augmentation(
     messages: list[dict],
     resp: ModelResponse,
     processor: Any,
-) -> None:
-    """Populate ``multi_modal_input`` and ``mm_token_type_ids`` in-place.
+) -> tuple[list[int], list[dict[str, Any]], list[int] | None] | None:
+    """Extract images and derive expanded ``input_tokens`` + multi-modal tensors.
 
-    Extracts PIL images from OpenAI-format ``messages``, feeds them through the
-    processor's image branch to get ``pixel_values`` (+ ``image_grid_thw`` when
-    the model reports patch grids), and derives ``mm_token_type_ids`` from
-    ``resp.input_tokens`` by flagging image-placeholder positions. No-op when
-    the interaction carries no images.
-
-    Called from :meth:`InteractionWithTokenLogpReward.to_tensor_dict` so the
-    training-side batch has the multi-modal payload the VLM forward path
-    (``extract_vision_from_multi_modal``, ``get_rope_index``) requires.
+    Returns ``(expanded_input_tokens, multi_modal_input, mm_type_ids_input)``
+    where ``mm_type_ids_input`` covers only the prompt segment; the caller
+    concatenates ``[0] * output_len`` after it. Returns ``None`` when the
+    interaction has no images (text-only path unchanged).
     """
     images = _extract_images_from_messages(messages)
     if not images:
-        return
+        return None
 
     processed = processor.image_processor(images=images, return_tensors="pt")
     mm_dict: dict[str, Any] = {"pixel_values": processed["pixel_values"]}
-    if "image_grid_thw" in processed:
-        mm_dict["image_grid_thw"] = processed["image_grid_thw"]
-    result["multi_modal_input"] = [mm_dict]
+    image_grid_thw = processed.get("image_grid_thw")
+    if image_grid_thw is not None:
+        mm_dict["image_grid_thw"] = image_grid_thw
+    multi_modal_input = [mm_dict]
 
     image_pad_id = _image_pad_token_id(processor.tokenizer)
-    if image_pad_id is None:
-        return
-    mm_type = [1 if int(t) == image_pad_id else 0 for t in resp.input_tokens] + [
-        0
-    ] * resp.output_len
-    result["mm_token_type_ids"] = torch.tensor(mm_type, dtype=torch.long).unsqueeze(0)
+    merge_size = int(getattr(processor.image_processor, "merge_size", 2))
+
+    if image_grid_thw is None or image_pad_id is None:
+        # Not enough info to expand — keep the unexpanded prompt; the model
+        # will likely error, but at least the failure mode is clear.
+        return list(resp.input_tokens), multi_modal_input, None
+
+    expanded_input = _expand_image_pad_tokens(
+        list(resp.input_tokens), image_grid_thw, merge_size, image_pad_id
+    )
+    mm_type_ids_input = [1 if int(t) == image_pad_id else 0 for t in expanded_input]
+    return expanded_input, multi_modal_input, mm_type_ids_input
 
 
 class ApiType(str, Enum):
@@ -230,7 +266,24 @@ class InteractionWithTokenLogpReward:
             return self._cache
         resp = self.model_response
         assert resp is not None, "Model response is not set."
-        self.seq_tokens = seq = resp.input_tokens + resp.output_tokens
+
+        # For VLM: expand single ``<|image_pad|>`` placeholders in resp.input_tokens
+        # into per-patch tokens so the training-side model forward sees a prompt
+        # of the same length as the multi-modal features it will inject.
+        vision_aug = (
+            _compute_vision_augmentation(self.messages, resp, processor)
+            if processor is not None
+            else None
+        )
+        if vision_aug is not None:
+            expanded_input, multi_modal_input, mm_type_ids_input = vision_aug
+        else:
+            expanded_input = list(resp.input_tokens)
+            multi_modal_input = None
+            mm_type_ids_input = None
+        input_len = len(expanded_input)
+        self.seq_tokens = seq = expanded_input + list(resp.output_tokens)
+
         if self.chat_template_type == "concat" and self.parent is not None:
             parent_res = self.parent.to_tensor_dict(processor=processor)
             parent_logprobs = parent_res["logprobs"].squeeze(0).tolist()
@@ -238,20 +291,20 @@ class InteractionWithTokenLogpReward:
             parent_versions = parent_res["versions"].squeeze(0).tolist()
             parent_len = len(parent_logprobs)
             assert parent_len == len(parent_loss_mask) == len(parent_versions)
-            if resp.input_len > parent_len:
+            if input_len > parent_len:
                 logprobs = (
                     parent_logprobs
-                    + [0.0] * (resp.input_len - parent_len)
+                    + [0.0] * (input_len - parent_len)
                     + resp.output_logprobs
                 )
                 loss_mask = (
                     parent_loss_mask
-                    + [0] * (resp.input_len - parent_len)
+                    + [0] * (input_len - parent_len)
                     + [1] * resp.output_len
                 )
                 versions = (
                     parent_versions
-                    + [-1] * (resp.input_len - parent_len)
+                    + [-1] * (input_len - parent_len)
                     + resp.output_versions
                 )
             else:
@@ -259,23 +312,22 @@ class InteractionWithTokenLogpReward:
                 api_type = self.api_type
                 input_name = self.input_name_for_logging
                 logger.warning(
-                    f"The input length of the child {api_type} ({resp.input_len}) is less than or "
+                    f"The input length of the child {api_type} ({input_len}) is less than or "
                     f"equal to the length of the parent {api_type} {parent_len}. "
-                    f"This should not happen if the {input_name}s are constructed properly. "
-                    f"Ignoring the parent {api_type} by masking them out. \n"
+                    f"This should not happen if the {input_name}s are constructed properly. \n"
                     f"Parent input token ids: {self.parent.model_response.input_tokens}\n"
                     f"Parent output token ids: {self.parent.model_response.output_tokens}\n"
                     f"Child input token ids: {resp.input_tokens}\n"
                     f"Parent input {input_name}: {self.parent_data}\n"
                     f"Child input {input_name}: {self.current_data}",
                 )
-                logprobs = [0.0] * resp.input_len + resp.output_logprobs
-                loss_mask = [0] * resp.input_len + [1] * resp.output_len
-                versions = [-1] * resp.input_len + resp.output_versions
+                logprobs = [0.0] * input_len + resp.output_logprobs
+                loss_mask = [0] * input_len + [1] * resp.output_len
+                versions = [-1] * input_len + resp.output_versions
         else:
-            logprobs = [0.0] * resp.input_len + resp.output_logprobs
-            loss_mask = [0] * resp.input_len + [1] * resp.output_len
-            versions = [-1] * resp.input_len + resp.output_versions
+            logprobs = [0.0] * input_len + resp.output_logprobs
+            loss_mask = [0] * input_len + [1] * resp.output_len
+            versions = [-1] * input_len + resp.output_versions
         reward = self.reward if self.reward is not None else 0.0
         result = dict(
             # unsqueeze to add an additional batch dimension
@@ -287,8 +339,13 @@ class InteractionWithTokenLogpReward:
             # reward
             rewards=torch.tensor([float(reward)]),
         )
-        if processor is not None:
-            _attach_multi_modal_fields(result, self.messages, resp, processor)
+        if multi_modal_input is not None:
+            result["multi_modal_input"] = multi_modal_input
+            if mm_type_ids_input is not None:
+                mm_type = mm_type_ids_input + [0] * resp.output_len
+                result["mm_token_type_ids"] = torch.tensor(
+                    mm_type, dtype=torch.long
+                ).unsqueeze(0)
         self._cache = result
         return result
 

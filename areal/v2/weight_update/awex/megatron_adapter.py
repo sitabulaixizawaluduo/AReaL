@@ -85,16 +85,22 @@ def _apply_qwen3_5_vl_fixups(
 ) -> tuple[str, torch.Tensor]:
     """Align bridge output to SGLang memory names/dtypes for Qwen3.5-VL.
 
-    Four independent normalizations, applied in this order:
+    Five independent normalizations, applied in this order:
 
     1. Strip ``model.language_model.`` → ``model.`` (SGLang omits this level;
        ``qwen3_5.py`` mounts the language backbone directly under ``model``).
     2. Strip ``model.visual.`` → ``visual.`` (SGLang has no top-level
        ``model.`` prefix on the visual tower).
-    3. Rename visual ``.attn.qkv.`` → ``.attn.qkv_proj.``. Both sides keep
+    3. Strip ``.self_attn.`` mid-level from ``model.layers.N.self_attn.<p>``
+       → ``model.layers.N.<p>``. Unlike most HF-family SGLang models,
+       ``Qwen3_5AttentionDecoderLayer`` (``qwen3_5.py:721``) hangs
+       ``qkv_proj`` / ``o_proj`` / ``q_norm`` / ``k_norm`` directly on the
+       decoder layer with no ``self_attn`` submodule wrapper. Linear-attn
+       layers still use a ``linear_attn`` submodule, so leave those alone.
+    4. Rename visual ``.attn.qkv.`` → ``.attn.qkv_proj.``. Both sides keep
        QKV fused for the visual tower (no GQA, Q=K=V), so this is a pure
        rename — no ``chunk(3)`` split needed, unlike Qwen2/2.5-VL.
-    4. Cast ``.linear_attn.A_log`` to fp32. SGLang stores this SSM state
+    5. Cast ``.linear_attn.A_log`` to fp32. SGLang stores this SSM state
        param as fp32 for numerical stability of the ``exp(A * dt)``
        recurrence; mcore currently stores it as bf16 (should be fixed
        upstream — see megatron/mcore Qwen3-Next impl), so the transport
@@ -107,6 +113,9 @@ def _apply_qwen3_5_vl_fixups(
         hf_name = "model." + hf_name[len("model.language_model.") :]
     elif hf_name.startswith("model.visual."):
         hf_name = hf_name[len("model.") :]  # → "visual...."
+
+    if hf_name.startswith("model.layers.") and ".self_attn." in hf_name:
+        hf_name = hf_name.replace(".self_attn.", ".", 1)
 
     m = _QWEN3_5_VL_VISUAL_QKV_RE.match(hf_name)
     if m is not None:

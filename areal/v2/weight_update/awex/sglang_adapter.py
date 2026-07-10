@@ -182,8 +182,22 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             ]
         if "qkv_proj" in name:
             cfg = self._get_model().config
-            num_heads = cfg.num_attention_heads
-            num_kv_heads = getattr(cfg, "num_key_value_heads", num_heads)
+            # Qwen3.5-VL visual tower stores fused qkv_proj that MUST NOT be
+            # split here: the training side sends the fused
+            # ``visual.blocks.N.attn.qkv_proj.{weight,bias}`` name-for-name
+            # (see megatron_adapter._apply_qwen3_5_vl_fixups). If we split
+            # into q/k/v_proj views using the LM's num_heads / num_kv_heads
+            # ratio, both the slice sizes AND the names would diverge from
+            # what the sender emits, and the transfer plan would raise on
+            # key mismatch. Pass through for Qwen3.5-VL visual layers only.
+            if (
+                getattr(cfg, "model_type", "") in ("qwen3_5", "qwen3_5_moe")
+                and name.startswith("visual.")
+            ):
+                return [(name, tensor)]
+            text_cfg = getattr(cfg, "text_config", cfg)
+            num_heads = getattr(text_cfg, "num_attention_heads", None) or cfg.num_attention_heads
+            num_kv_heads = getattr(text_cfg, "num_key_value_heads", num_heads)
             total_head_units = num_heads + 2 * num_kv_heads
             dim0 = tensor.shape[0]
             q_size = dim0 * num_heads // total_head_units

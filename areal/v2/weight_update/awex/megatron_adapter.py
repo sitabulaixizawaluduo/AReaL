@@ -345,10 +345,98 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
     def _iter_hf_params(self):
         """Yield (hf_name, tensor) for every parameter on this rank.
 
-        Uses get_named_parameters + all_gather_param + convert_to_hf to produce
-        HF-style per-expert names (e.g. experts.0.gate_proj.weight). The SGLang
-        adapter's _unfuse_params converts SGLang's fused w13/w2 format to the
-        same per-expert names, so both sides match for the transfer plan.
+        Two backends:
+
+        * ``_iter_hf_params_via_registry`` (default): mcore → HF via AReaL's
+          ``convert_to_hf`` registry. Fast and self-contained, but the
+          registry has no ``qwen3_5`` entry — Qwen3.5-VL falls through
+          substring matching to ``convert_qwen2_to_hf`` and crashes on
+          visual tower / linear-attn params.
+        * ``_iter_hf_params_via_bridge``: delegate to
+          ``megatron-bridge.export_hf_weights``. Bridge already knows
+          Qwen3.5-VL, so this is the only viable path there. Gated on the
+          same conditions as ``MegatronEngine._update_weights_via_bridge``:
+          bridge_cls == 'megatron-bridge', use_bridge_for_update_weights
+          opt-in, no FP8, no LoRA, bridge instance available. For Qwen3.5-VL
+          this becomes effectively required — a clear error is raised when
+          the required conditions aren't met.
+
+        Both backends pass through ``_apply_awex_name_fixups`` so the HF
+        names/dtypes match what SGLang's non-disk weight loaders expect
+        (visual QKV split for Qwen2/2.5-VL, prefix/qkv/A_log fixups for
+        Qwen3.5-VL).
+        """
+        model_name = self._engine.hf_config.model_type
+        needs_bridge = self._engine.is_vision_model and is_qwen3_5_vl_model(
+            model_name
+        )
+        if self._should_use_bridge():
+            source = self._iter_hf_params_via_bridge()
+        elif needs_bridge:
+            raise RuntimeError(
+                f"Model type {model_name!r} requires megatron-bridge for awex "
+                "weight update (no entry in _CONVERSION_FN_REGISTRY, and the "
+                "substring fallback lands on convert_qwen2_to_hf which does "
+                "not know the visual tower or linear-attn params). Set "
+                "megatron.bridge_type='megatron-bridge' and "
+                "megatron.use_bridge_for_update_weights=True in your training "
+                "config."
+            )
+        else:
+            source = self._iter_hf_params_via_registry()
+        yield from self._apply_awex_name_fixups(source)
+
+    def _should_use_bridge(self) -> bool:
+        """Mirror ``MegatronEngine._update_weights_from_distributed``'s
+        bridge dispatch. Bridge is only viable when all of: bridge_cls is
+        megatron-bridge, opt-in flag is on, no FP8/LoRA (bridge doesn't
+        cover those yet), and a bridge instance exists.
+        """
+        engine = self._engine
+        if getattr(engine, "bridge_cls", None) != "megatron-bridge":
+            return False
+        mcore_config = getattr(engine, "mcore_config", None)
+        if mcore_config is None:
+            return False
+        if not getattr(mcore_config, "use_bridge_for_update_weights", False):
+            return False
+        if getattr(engine, "quantization_config", None):
+            return False
+        if getattr(engine.config, "use_lora", False):
+            return False
+        if getattr(engine, "bridge", None) is None:
+            return False
+        return True
+
+    def _iter_hf_params_via_bridge(self):
+        """Stream (hf_name, hf_tensor) from megatron-bridge.export_hf_weights.
+
+        The bridge handles TP/EP/PP gather and HF layout transformation
+        internally, so no ``all_gather_param`` / ``convert_to_hf`` is
+        needed here. MoE expert weights come out inline (single pass, no
+        second expert loop).
+
+        Note: with PP>1 each rank sees only its own stage's params, and
+        the awex training-side metadata contract has each rank report its
+        own shards — matches how ``_iter_hf_params_via_registry`` behaves
+        under PP.
+        """
+        tie_word_embeddings = getattr(
+            self._engine.hf_config, "tie_word_embeddings", False
+        )
+        for hf_name, hf_tensor in self._engine.bridge.export_hf_weights(
+            self._engine.model,
+            cpu=False,
+            show_progress=False,
+        ):
+            if tie_word_embeddings and hf_name == "lm_head.weight":
+                continue
+            yield hf_name, hf_tensor.detach().contiguous()
+
+    def _iter_hf_params_via_registry(self):
+        """mcore → HF via ``convert_to_hf`` registry. Fast path for models
+        that have a registry entry; Qwen3.5-VL doesn't and must go through
+        bridge.
         """
         from areal.engine.megatron_utils.megatron import (
             all_gather_param,
@@ -360,10 +448,6 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         model_name = self._engine.hf_config.model_type
         tie_word_embeddings = getattr(
             self._engine.hf_config, "tie_word_embeddings", False
-        )
-        split_visual_qkv = self._engine.is_vision_model and is_qwen_vl_model(model_name)
-        apply_qwen3_5_vl_fixups = (
-            self._engine.is_vision_model and is_qwen3_5_vl_model(model_name)
         )
 
         for mcore_name, param in get_named_parameters(
@@ -387,20 +471,36 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             ):
                 if tie_word_embeddings and hf_name == "lm_head.weight":
                     continue
-                tensor = tensor.detach()
-                if apply_qwen3_5_vl_fixups:
-                    hf_name, tensor = _apply_qwen3_5_vl_fixups(hf_name, tensor)
-                    yield hf_name, tensor
-                    continue
-                split = (
-                    _split_qwen_vl_visual_qkv(hf_name, tensor)
-                    if split_visual_qkv
-                    else None
-                )
-                if split is None:
-                    yield hf_name, tensor
-                else:
-                    yield from split
+                yield hf_name, tensor.detach()
+
+    def _apply_awex_name_fixups(self, source):
+        """Adapt bridge/registry output to what SGLang stores in memory.
+
+        - Qwen3.5-VL: prefix strip, visual qkv rename, A_log fp32 cast.
+        - Qwen2/2.5-VL: chunk-3 split of fused visual qkv into q/k/v_proj.
+        - Other models: pass-through.
+        """
+        model_name = self._engine.hf_config.model_type
+        split_visual_qkv = self._engine.is_vision_model and is_qwen_vl_model(
+            model_name
+        )
+        apply_qwen3_5_vl_fixups = (
+            self._engine.is_vision_model and is_qwen3_5_vl_model(model_name)
+        )
+        for hf_name, tensor in source:
+            if apply_qwen3_5_vl_fixups:
+                hf_name, tensor = _apply_qwen3_5_vl_fixups(hf_name, tensor)
+                yield hf_name, tensor
+                continue
+            split = (
+                _split_qwen_vl_visual_qkv(hf_name, tensor)
+                if split_visual_qkv
+                else None
+            )
+            if split is None:
+                yield hf_name, tensor
+            else:
+                yield from split
 
     # ── Colocated weight transfer methods ─────────────────────────────────
 

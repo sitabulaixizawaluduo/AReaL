@@ -190,10 +190,14 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             # ratio, both the slice sizes AND the names would diverge from
             # what the sender emits, and the transfer plan would raise on
             # key mismatch. Pass through for Qwen3.5-VL visual layers only.
-            if (
-                getattr(cfg, "model_type", "") in ("qwen3_5", "qwen3_5_moe")
-                and name.startswith("visual.")
-            ):
+            #
+            # ``Qwen3_5VLBase`` (qwen3_vl.py:1113) rebinds
+            # ``self.config = config.text_config`` for the Qwen3.5 family,
+            # so we see model_type = "qwen3_5_text" here (not the top-level
+            # "qwen3_5"). Match the whole family via startswith.
+            if str(getattr(cfg, "model_type", "")).startswith(
+                "qwen3_5"
+            ) and name.startswith("visual."):
                 return [(name, tensor)]
             text_cfg = getattr(cfg, "text_config", cfg)
             num_heads = getattr(text_cfg, "num_attention_heads", None) or cfg.num_attention_heads

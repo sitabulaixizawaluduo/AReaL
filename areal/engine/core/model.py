@@ -45,6 +45,19 @@ def is_qwen_vl_model(model_type: str) -> bool:
     return is_qwen2_vl_model(model_type) or is_qwen3_vl_model(model_type)
 
 
+def is_qwen3_5_vl_model(model_type: str) -> bool:
+    """True for the Qwen3.5-VL family (dense and MoE), i.e. hybrid attention
+    text tower + visual tower.
+
+    Distinguished from ``is_qwen_vl_model`` because Qwen3.5-VL uses a
+    different visual-tower naming convention (``model.visual.*`` in HF
+    export vs ``visual.*`` in SGLang) and different LM prefix
+    (``model.language_model.*`` vs ``model.*``). Awex fixups gate on this
+    to avoid touching Qwen2/2.5-VL flows.
+    """
+    return model_type in ("qwen3_5", "qwen3_5_moe")
+
+
 def lang_config(hf_config):
     """Return the language-model side of a (possibly nested) HF config.
 

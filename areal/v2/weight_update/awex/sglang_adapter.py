@@ -136,7 +136,50 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         for efficiency.  For MoE models, SGLang also fuses all routed experts
         into ``experts.w13_weight`` (gate+up) and ``experts.w2_weight`` (down).
         The training side keeps per-expert HF names, so we unfuse here to match.
+
+        Qwen3.5-VL / Qwen3-Next linear-attention layers additionally fuse
+        ``(Q, K, V, Z)`` into ``in_proj_qkvz`` and ``(β, α)`` into
+        ``in_proj_ba`` — see ``qwen3_5.py::packed_modules_mapping``. Bridge
+        emits the un-packed HF names (``in_proj_qkv``, ``in_proj_z``,
+        ``in_proj_b``, ``in_proj_a``), so we expose zero-copy views under
+        those names.
         """
+        if "in_proj_qkvz" in name:
+            # SGLang fuses [Q_all | K_all | V_all | Z_all] into
+            # MergedColumnParallelLinear(output_sizes=[key_dim, key_dim,
+            # value_dim, value_dim]). Bridge splits (qkv) from (z), where
+            # qkv_size = 2*key_dim + value_dim and z_size = value_dim.
+            cfg = self._get_model().config
+            text_cfg = getattr(cfg, "text_config", cfg)
+            value_dim = int(text_cfg.linear_num_value_heads) * int(
+                text_cfg.linear_value_head_dim
+            )
+            dim0 = tensor.shape[0]
+            qkv_size = dim0 - value_dim
+            z_size = value_dim
+            return [
+                (
+                    name.replace("in_proj_qkvz", "in_proj_qkv"),
+                    tensor.narrow(0, 0, qkv_size),
+                ),
+                (
+                    name.replace("in_proj_qkvz", "in_proj_z"),
+                    tensor.narrow(0, qkv_size, z_size),
+                ),
+            ]
+        if "in_proj_ba" in name:
+            # Fused [β | α], each of size num_v_heads. Half-and-half split.
+            half = tensor.shape[0] // 2
+            return [
+                (
+                    name.replace("in_proj_ba", "in_proj_b"),
+                    tensor.narrow(0, 0, half),
+                ),
+                (
+                    name.replace("in_proj_ba", "in_proj_a"),
+                    tensor.narrow(0, half, half),
+                ),
+            ]
         if "qkv_proj" in name:
             cfg = self._get_model().config
             num_heads = cfg.num_attention_heads

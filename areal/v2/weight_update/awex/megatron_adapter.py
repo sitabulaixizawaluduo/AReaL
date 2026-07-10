@@ -25,7 +25,7 @@ from awex.util.tensor_util import (
     group_tensors_by_shape_and_dtype,
 )
 
-from areal.engine.core.model import is_qwen_vl_model
+from areal.engine.core.model import is_qwen3_5_vl_model, is_qwen_vl_model
 from areal.utils import logging
 from areal.v2.weight_update.awex import (
     awex_wu_use_group,
@@ -73,6 +73,49 @@ def _split_qwen_vl_visual_qkv(
         (f"{prefix}k_proj{suffix}", k),
         (f"{prefix}v_proj{suffix}", v),
     ]
+
+
+_QWEN3_5_VL_VISUAL_QKV_RE = re.compile(
+    r"^(visual\.blocks\.\d+\.attn\.)qkv(\.(?:weight|bias))$"
+)
+
+
+def _apply_qwen3_5_vl_fixups(
+    hf_name: str, tensor: torch.Tensor
+) -> tuple[str, torch.Tensor]:
+    """Align bridge output to SGLang memory names/dtypes for Qwen3.5-VL.
+
+    Four independent normalizations, applied in this order:
+
+    1. Strip ``model.language_model.`` → ``model.`` (SGLang omits this level;
+       ``qwen3_5.py`` mounts the language backbone directly under ``model``).
+    2. Strip ``model.visual.`` → ``visual.`` (SGLang has no top-level
+       ``model.`` prefix on the visual tower).
+    3. Rename visual ``.attn.qkv.`` → ``.attn.qkv_proj.``. Both sides keep
+       QKV fused for the visual tower (no GQA, Q=K=V), so this is a pure
+       rename — no ``chunk(3)`` split needed, unlike Qwen2/2.5-VL.
+    4. Cast ``.linear_attn.A_log`` to fp32. SGLang stores this SSM state
+       param as fp32 for numerical stability of the ``exp(A * dt)``
+       recurrence; mcore currently stores it as bf16 (should be fixed
+       upstream — see megatron/mcore Qwen3-Next impl), so the transport
+       dtype must be upcast to match the receiver buffer. This does NOT
+       recover precision lost from bf16 training; it only aligns bytes.
+
+    ``dt_bias`` is bf16 on both sides — no cast needed.
+    """
+    if hf_name.startswith("model.language_model."):
+        hf_name = "model." + hf_name[len("model.language_model.") :]
+    elif hf_name.startswith("model.visual."):
+        hf_name = hf_name[len("model.") :]  # → "visual...."
+
+    m = _QWEN3_5_VL_VISUAL_QKV_RE.match(hf_name)
+    if m is not None:
+        hf_name = f"{m.group(1)}qkv_proj{m.group(2)}"
+
+    if hf_name.endswith(".linear_attn.A_log"):
+        tensor = tensor.float()
+
+    return hf_name, tensor
 
 
 class AwexMegatronAdapter(AwexTrainingAdapter):
@@ -319,6 +362,9 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             self._engine.hf_config, "tie_word_embeddings", False
         )
         split_visual_qkv = self._engine.is_vision_model and is_qwen_vl_model(model_name)
+        apply_qwen3_5_vl_fixups = (
+            self._engine.is_vision_model and is_qwen3_5_vl_model(model_name)
+        )
 
         for mcore_name, param in get_named_parameters(
             self._engine.model, num_moe_experts
@@ -342,6 +388,10 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
                 if tie_word_embeddings and hf_name == "lm_head.weight":
                     continue
                 tensor = tensor.detach()
+                if apply_qwen3_5_vl_fixups:
+                    hf_name, tensor = _apply_qwen3_5_vl_fixups(hf_name, tensor)
+                    yield hf_name, tensor
+                    continue
                 split = (
                     _split_qwen_vl_visual_qkv(hf_name, tensor)
                     if split_visual_qkv

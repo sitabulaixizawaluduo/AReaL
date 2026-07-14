@@ -1214,8 +1214,20 @@ class MegatronEngine(TrainEngine):
             outputs.append(result)
             return None
 
+        # CP output handling differs by layout:
+        # - Packed THD: gather CP-local LOGITS inside forward so downstream
+        #   split_with_sizes sees full sequences (legacy behavior).
+        # - Padded BSHD: NEVER gather logits — with large vocabularies the
+        #   [B, S, V] all-gather allocates tens of GiB and OOMs. Instead run
+        #   the CP-local path: compute logprobs on the local [B*S/cp, V] grid
+        #   and reassemble the 1D result in _compute_forward_result
+        #   (O(S) communication instead of O(S*V)).
+        gather_cp_output = not (self.use_padded_seq or self.is_vision_model)
         self.forward_backward_batch(
-            mb_list, process_output, forward_only=True, gather_cp_output=True
+            mb_list,
+            process_output,
+            forward_only=True,
+            gather_cp_output=gather_cp_output,
         )
 
         # Step 4: Aggregate, reorder, and broadcast outputs
@@ -2544,7 +2556,17 @@ class MegatronEngine(TrainEngine):
                     else None,
                 )
                 return logprobs
-            labels = torch.roll(inputs["input_ids"], shifts=-1, dims=-1)
+            # CP-local path (padded BSHD under CP): logits arrive as the
+            # flattened local [B*S/cp, V] grid with matching zigzag labels.
+            # Compute logprobs locally, then reassemble the 1D result — never
+            # all-gather full-vocab logits (O(S*V) memory blows up on large
+            # vocabularies).
+            cp_local_labels = inputs.get("_cp_local_labels")
+            cp_padded_cu_seqlens = inputs.get("_cp_padded_cu_seqlens")
+            if cp_local_labels is not None:
+                labels = cp_local_labels
+            else:
+                labels = torch.roll(inputs["input_ids"], shifts=-1, dims=-1)
             logprobs = gather_logprobs(
                 output,
                 labels,
@@ -2553,8 +2575,26 @@ class MegatronEngine(TrainEngine):
                 if mpu.get_tensor_model_parallel_world_size() > 1
                 else None,
             )
+            if cp_padded_cu_seqlens is not None:
+                reassemble_fn = (
+                    reassemble_cp_bshd_logprobs
+                    if inputs.get("_cp_bshd")
+                    else reassemble_cp_packed_logprobs
+                )
+                logprobs = reassemble_fn(logprobs, cp_padded_cu_seqlens)
+                logprobs = unpad_logits(
+                    logprobs,
+                    inputs.get("_cp_padding_length", 0),
+                    cp_padded_cu_seqlens,
+                    inputs.get("_cp_old_cu_seqlens"),
+                )
             return logprobs
         else:
+            if inputs.get("_cp_local_labels") is not None:
+                raise NotImplementedError(
+                    "Critic value computation under the CP-local padded path "
+                    "is not supported yet."
+                )
             values = output.squeeze(-1)
             return values
 

@@ -10,7 +10,6 @@ from megatron.core.packed_seq_params import PackedSeqParams
 
 from areal.engine.megatron_utils.bshd_cp import (
     gather_cp_padded_output,
-    split_padded_seqs_for_context_parallel,
 )
 from areal.engine.megatron_utils.bshd_cp import (
     reassemble_cp_padded_logprobs as _reassemble_cp_padded_logprobs,
@@ -375,35 +374,21 @@ def packed_context_parallel_forward(
             input_ids = input_ids_2d
             padded_repack_info = (cu_seqlens, seq_lens, max_seqlen)
 
-            # Context parallelism on the padded BSHD path: zigzag-split each
-            # row into 2*cp chunks (rank r keeps chunks r and 2*cp-1-r) and
-            # run the model on the [B, S/cp] local view. position_ids must be
-            # built on the full sequence BEFORE the split — the model only
-            # sees its local chunk and would otherwise compute wrong RoPE
-            # positions. attention_mask is dropped under CP (TE's CP attention
-            # takes no dense mask); padding is a per-row suffix, so with
-            # causal attention the outputs at valid positions are unaffected
-            # and padding positions are discarded during repack.
+            # Context parallelism on the padded BSHD path: the megatron-bridge
+            # Qwen3.5/Qwen3-VL model handles the CP split ITSELF. It expects
+            # the FULL [B, S] input: it computes mRoPE positions and fuses
+            # vision embeddings on the full sequence, then zigzag-splits the
+            # combined embeddings before the decoder (split_data_cp_rank in
+            # megatron/bridge/models/qwen_vl/modelling_qwen3_vl — rank r keeps
+            # chunks r and 2*cp-1-r, the same layout as our helpers). Do NOT
+            # pre-split input_ids here: the model would split a second time.
+            # The last PP stage returns CP-LOCAL logits [B, S/cp, V] in that
+            # zigzag layout, which the output handling below reassembles.
+            # attention_mask is dropped under CP; padding is a per-row suffix,
+            # so causal attention keeps valid positions exact and padding
+            # outputs are discarded during repack/reassembly.
             cp_size_padded = mpu.get_context_parallel_world_size()
             if cp_size_padded > 1:
-                if has_vision_inputs:
-                    raise NotImplementedError(
-                        "Context parallel (CP > 1) with vision inputs is not "
-                        "supported yet on the padded BSHD path. Only text-only "
-                        "micro-batches may run with CP for this model."
-                    )
-                cp_rank_padded = mpu.get_context_parallel_rank()
-                position_ids = (
-                    torch.arange(max_seqlen, device=input_ids.device)
-                    .unsqueeze(0)
-                    .expand(batch_size, -1)
-                )
-                input_ids = split_padded_seqs_for_context_parallel(
-                    input_ids, cp_size_padded, cp_rank_padded
-                )
-                position_ids = split_padded_seqs_for_context_parallel(
-                    position_ids, cp_size_padded, cp_rank_padded
-                )
                 attention_mask = None
                 cp_padded_split = True
 
@@ -432,12 +417,11 @@ def packed_context_parallel_forward(
                 vlm_kwargs[key] = input_[key]
 
     # For BSHD text-only, drop the packed-form position_ids (a 1D tensor of
-    # length total_len) — they don't match the 2D [B, S] input. Let mcore
-    # compute the default torch.arange positions per row; padding positions
-    # are masked out by attention_mask. Under CP the split above already
-    # replaced position_ids with the zigzag-split full-sequence positions,
-    # which MUST be kept — the model cannot reconstruct them locally.
-    if dense_mask_text_forward and not cp_padded_split:
+    # length total_len) — they don't match the 2D [B, S] input. The model
+    # computes positions itself on the full [B, S] input (get_rope_index for
+    # the bridge Qwen3.5/VL models); under CP its internal split keeps them
+    # aligned with the local chunks.
+    if dense_mask_text_forward:
         position_ids = None
 
     try:

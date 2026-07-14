@@ -371,11 +371,11 @@ class MegatronEngine(TrainEngine):
                     self.parallel_strategy.context_parallel_size > 1
                     and not self.use_padded_seq
                 ):
-                    # Non-BSHD VLMs (qwen2/3-vl) compute mRoPE inside the
-                    # model from the full [B, S] view, which a CP split would
-                    # break. BSHD models (Qwen3.5) may initialize with CP:
-                    # text-only micro-batches run via the BSHD CP split;
-                    # vision micro-batches are rejected at forward time.
+                    # Non-BSHD VLMs (qwen2/3-vl via mbridge) have no CP wiring
+                    # in their model definitions. BSHD models (Qwen3.5 via
+                    # megatron-bridge >= 0.5.0) may run with CP: the bridge
+                    # model itself computes mRoPE, fuses vision embeddings on
+                    # the full sequence, and zigzag-splits before the decoder.
                     raise NotImplementedError(
                         "Context parallel (CP > 1) is not supported with VLM models. "
                         f"Got context_parallel_size={self.parallel_strategy.context_parallel_size} "
@@ -583,6 +583,14 @@ class MegatronEngine(TrainEngine):
                 f"{self.hf_config.model_type!r} requires megatron-core>=0.18.0 "
                 "(GDN context parallel support), which first ships GDN CP "
                 "and the gated-attention gate fix."
+            )
+        if pkg_version.is_version_less("megatron-bridge", "0.5.0"):
+            raise NotImplementedError(
+                f"Context parallel (CP > 1) for model_type="
+                f"{self.hf_config.model_type!r} requires megatron-bridge>=0.5.0: "
+                "its Qwen3.5 model definitions carry the in-model CP wiring "
+                "(mRoPE on the full sequence, vision fusion, zigzag split "
+                "before the decoder)."
             )
         if self.bridge_cls != "megatron-bridge":
             raise NotImplementedError(

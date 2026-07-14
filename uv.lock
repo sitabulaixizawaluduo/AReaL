@@ -22,9 +22,11 @@ supported-markers = [
 overrides = [
     { name = "causal-conv1d", marker = "sys_platform == 'never'" },
     { name = "flash-attn-4", specifier = ">=4.0.0b4" },
+    { name = "flashinfer-cubin", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==0.6.7.post3" },
+    { name = "flashinfer-python", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==0.6.7.post3" },
     { name = "hydra-core", specifier = "==1.4.0.dev1" },
     { name = "mamba-ssm", marker = "sys_platform == 'never'" },
-    { name = "megatron-core", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==0.17.0" },
+    { name = "megatron-core", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==0.18.0" },
     { name = "nv-grouped-gemm", marker = "sys_platform == 'never'" },
     { name = "nvidia-cudnn-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==9.16.0.29" },
     { name = "nvidia-resiliency-ext", marker = "sys_platform == 'never'" },
@@ -510,8 +512,8 @@ requires-dist = [
     { name = "mathruler", specifier = "==0.1.0" },
     { name = "matplotlib" },
     { name = "mbridge", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", git = "https://github.com/ISEEKYAN/mbridge.git?rev=310e8fb" },
-    { name = "megatron-bridge", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", specifier = "==0.4.0" },
-    { name = "megatron-core", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", specifier = "==0.17.0" },
+    { name = "megatron-bridge", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", specifier = "==0.5.0" },
+    { name = "megatron-core", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", specifier = "==0.18.0" },
     { name = "mistral-common", specifier = ">=1.11.1" },
     { name = "msgspec" },
     { name = "networkx", specifier = "==3.3" },
@@ -2318,28 +2320,6 @@ wheels = [
 ]
 
 [[package]]
-name = "imageio"
-version = "2.37.3"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "numpy", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "pillow", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/b1/84/93bcd1300216ea50811cee96873b84a1bebf8d0489ffaf7f2a3756bab866/imageio-2.37.3.tar.gz", hash = "sha256:bbb37efbfc4c400fcd534b367b91fcd66d5da639aaa138034431a1c5e0a41451", size = 389673, upload-time = "2026-03-09T11:31:12.573Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/49/fa/391e437a34e55095173dca5f24070d89cbc233ff85bf1c29c93248c6588d/imageio-2.37.3-py3-none-any.whl", hash = "sha256:46f5bb8522cd421c0f5ae104d8268f569d856b29eb1a13b92829d1970f32c9f0", size = 317646, upload-time = "2026-03-09T11:31:10.771Z" },
-]
-
-[[package]]
-name = "imageio-ffmpeg"
-version = "0.6.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/44/bd/c3343c721f2a1b0c9fc71c1aebf1966a3b7f08c2eea8ed5437a2865611d6/imageio_ffmpeg-0.6.0.tar.gz", hash = "sha256:e2556bed8e005564a9f925bb7afa4002d82770d6b08825078b7697ab88ba1755", size = 25210, upload-time = "2025-01-16T21:34:32.747Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/a0/2d/43c8522a2038e9d0e7dbdf3a61195ecc31ca576fb1527a528c877e87d973/imageio_ffmpeg-0.6.0-py3-none-manylinux2014_x86_64.whl", hash = "sha256:c7e46fcec401dd990405049d2e2f475e2b397779df2519b544b8aab515195282", size = 29498237, upload-time = "2025-01-16T21:34:13.726Z" },
-]
-
-[[package]]
 name = "imagesize"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3268,7 +3248,7 @@ wheels = [
 
 [[package]]
 name = "megatron-bridge"
-version = "0.4.0"
+version = "0.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -3277,10 +3257,11 @@ dependencies = [
     { name = "diffusers", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "einops", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "flash-linear-attention", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "flashinfer-cubin", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "flashinfer-python", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "hydra-core", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "imageio", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "imageio-ffmpeg", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "megatron-core", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "mistral-common", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "mlflow", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "omegaconf", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "open-clip-torch", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -3298,24 +3279,24 @@ dependencies = [
     { name = "typing-extensions", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "wandb", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3e/b8/e61ddbd01c0de7a9370257b6de017e7099589c9b7ff54f89c9ef162ebcf4/megatron_bridge-0.4.0.tar.gz", hash = "sha256:a66f5c6ac7fe62c4b19cc4ede90d1b9105e74d553541d96e0b60fca08626ddef", size = 811253, upload-time = "2026-04-16T22:46:09.991Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/75/b4/b21d86db0a29e7cfca8223c6d840d4a0c1229c2860b7c9edfc370623bf65/megatron_bridge-0.5.0.tar.gz", hash = "sha256:0b4c7dd16126e8fff988896ea5e5a4630382fdb7643174a7d0d6fca4a0a35581", size = 1185902, upload-time = "2026-06-22T23:22:53.749Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/85/60/545e61452dc81f6ae09952295609a3ad33fc7359deda679eca614f1a2252/megatron_bridge-0.4.0-py3-none-any.whl", hash = "sha256:c1b198506d2901c75229a54a83698ccc6d139efe950c9086530fa450ebb2d28f", size = 1117907, upload-time = "2026-04-16T22:46:08.518Z" },
+    { url = "https://files.pythonhosted.org/packages/58/5f/6d5439af02a77f6b3e3b6271c98ebe1d0ab99a398fcdd91d7e01da32b64e/megatron_bridge-0.5.0-py3-none-any.whl", hash = "sha256:f8b4fcce2dbe5162f1056a72f429eb6f1b9ea94b9d6380db6b8b4a3c9168a9c9", size = 1611086, upload-time = "2026-06-22T23:22:52.029Z" },
 ]
 
 [[package]]
 name = "megatron-core"
-version = "0.17.0"
+version = "0.18.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "packaging", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "torch", version = "2.9.1+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/bc/89/f690c7d282200d6e36078f4bfbb9e6862102105c062fbf9b518c5b72df38/megatron_core-0.17.0.tar.gz", hash = "sha256:ff66c206ed164bc602ff00310388605fac41f284262176e17246a9e94163b205", size = 1385595, upload-time = "2026-04-16T20:22:32.079Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4e/5f/31dbdff0e758598050fbee8bacad0f034447817db34b6399100acd5d3929/megatron_core-0.18.0.tar.gz", hash = "sha256:8feff0cd371e5ef26dc36636a23e197983ddddf10b43847871697b89be8cd6ea", size = 1602287, upload-time = "2026-06-23T00:15:45.679Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/75/32/b4b48af9008d842732461f34373c67b6611ff7e709672eaab07e26e3a6d2/megatron_core-0.17.0-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:fce43a871881fd8ff0b33a68d4c1653447e2d878eaeb9f91004f2238fe814f15", size = 1723570, upload-time = "2026-04-16T20:22:25.831Z" },
-    { url = "https://files.pythonhosted.org/packages/4e/ad/1c15b4078ad9fc99ba347e112bdf5082d182473f729d906e0c99b8a1f5fb/megatron_core-0.17.0-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:0cbacf043603f9dc2735310e1b1dcd5c076c02caab13849c2d2fe6a99cbea4f6", size = 1725087, upload-time = "2026-04-16T20:22:27.517Z" },
+    { url = "https://files.pythonhosted.org/packages/46/83/b5deadc8cf7d62e6f89d0d191e51c0d1fc9c4aff95d68c4c27392edf44dc/megatron_core-0.18.0-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:429eddb2c6ce003099cf7d2130081eeba29fdcc5292654fec7fffa0f2894d559", size = 1965609, upload-time = "2026-06-23T00:15:40.219Z" },
+    { url = "https://files.pythonhosted.org/packages/f1/15/44d3ed47df82ba40be75965d26cee8230ab7ab54f9cbfa39b668544c75eb/megatron_core-0.18.0-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:beb6f7b1462a82723cef31773dae60f54a2f7bc809e5e050cf9f59c344b5a373", size = 1967128, upload-time = "2026-06-23T00:15:41.937Z" },
 ]
 
 [[package]]

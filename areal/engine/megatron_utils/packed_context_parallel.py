@@ -8,7 +8,24 @@ import torch.distributed.nn.functional as dist_F
 from megatron.core import parallel_state as mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 
+from areal.engine.megatron_utils.bshd_cp import (
+    gather_cp_padded_output,
+    split_padded_seqs_for_context_parallel,
+)
+from areal.engine.megatron_utils.bshd_cp import (
+    reassemble_cp_padded_logprobs as _reassemble_cp_padded_logprobs,
+)
 from areal.utils.data import is_multi_modal_key
+
+
+def reassemble_cp_bshd_logprobs(
+    local: torch.Tensor,
+    padded_cu_seqlens: torch.Tensor,
+) -> torch.Tensor:
+    """mpu-wired wrapper: reassemble CP-local BSHD per-token stats to packed order."""
+    return _reassemble_cp_padded_logprobs(
+        local, padded_cu_seqlens, mpu.get_context_parallel_group()
+    )
 
 
 def preprocess_packed_seqs_context_parallel(
@@ -319,6 +336,10 @@ def packed_context_parallel_forward(
     # Track shape metadata so the output can be repacked back to packed
     # [total_len, ...] form on the last PP stage.
     padded_repack_info = None
+    # Set when the padded BSHD input was zigzag-split for context parallelism;
+    # downstream position_ids/mask handling and output repack must then use
+    # the CP-aware paths.
+    cp_padded_split = False
 
     if cu_seqlens is not None:
         if not needs_padded_form:
@@ -354,6 +375,38 @@ def packed_context_parallel_forward(
             input_ids = input_ids_2d
             padded_repack_info = (cu_seqlens, seq_lens, max_seqlen)
 
+            # Context parallelism on the padded BSHD path: zigzag-split each
+            # row into 2*cp chunks (rank r keeps chunks r and 2*cp-1-r) and
+            # run the model on the [B, S/cp] local view. position_ids must be
+            # built on the full sequence BEFORE the split — the model only
+            # sees its local chunk and would otherwise compute wrong RoPE
+            # positions. attention_mask is dropped under CP (TE's CP attention
+            # takes no dense mask); padding is a per-row suffix, so with
+            # causal attention the outputs at valid positions are unaffected
+            # and padding positions are discarded during repack.
+            cp_size_padded = mpu.get_context_parallel_world_size()
+            if cp_size_padded > 1:
+                if has_vision_inputs:
+                    raise NotImplementedError(
+                        "Context parallel (CP > 1) with vision inputs is not "
+                        "supported yet on the padded BSHD path. Only text-only "
+                        "micro-batches may run with CP for this model."
+                    )
+                cp_rank_padded = mpu.get_context_parallel_rank()
+                position_ids = (
+                    torch.arange(max_seqlen, device=input_ids.device)
+                    .unsqueeze(0)
+                    .expand(batch_size, -1)
+                )
+                input_ids = split_padded_seqs_for_context_parallel(
+                    input_ids, cp_size_padded, cp_rank_padded
+                )
+                position_ids = split_padded_seqs_for_context_parallel(
+                    position_ids, cp_size_padded, cp_rank_padded
+                )
+                attention_mask = None
+                cp_padded_split = True
+
     # Every VLM forward is mask-free (attention_mask=None): the model
     # computes (m)RoPE positions internally, each batch slot holds one
     # sequence with trailing padding so causal attention yields correct
@@ -381,8 +434,10 @@ def packed_context_parallel_forward(
     # For BSHD text-only, drop the packed-form position_ids (a 1D tensor of
     # length total_len) — they don't match the 2D [B, S] input. Let mcore
     # compute the default torch.arange positions per row; padding positions
-    # are masked out by attention_mask.
-    if dense_mask_text_forward:
+    # are masked out by attention_mask. Under CP the split above already
+    # replaced position_ids with the zigzag-split full-sequence positions,
+    # which MUST be kept — the model cannot reconstruct them locally.
+    if dense_mask_text_forward and not cp_padded_split:
         position_ids = None
 
     try:
@@ -414,11 +469,30 @@ def packed_context_parallel_forward(
     # so a boolean mask of valid positions selects the packed sequence.
     if padded_repack_info is not None and is_pipeline_last_stage:
         _, repack_seq_lens, repack_max_seqlen = padded_repack_info
+        if cp_padded_split:
+            if gather_cp_output:
+                # Restore the full [B, S, V] sequence from the CP-local
+                # [B, S/cp, V] outputs (detached all-gather; this rank's own
+                # chunk keeps its gradient), then repack to [total_len, V].
+                output = gather_cp_padded_output(
+                    output, mpu.get_context_parallel_group(), seq_dim=1
+                )
+            else:
+                # CP-local loss path: return the flattened local grid
+                # [B * S/cp, V]. Padding positions are included so every CP
+                # rank contributes equal shapes; the loss side reassembles
+                # per-token stats with reassemble_cp_padded_logprobs and
+                # drops padding there.
+                return output.reshape(-1, *output.shape[2:])
         mask = (
             torch.arange(repack_max_seqlen, device=output.device)[None, :]
             < repack_seq_lens[:, None]
         )
         output = output[mask]
+    # The padded path never runs the packed THD postprocess: its CP gather
+    # (if any) already happened above in BSHD layout.
+    if padded_repack_info is not None:
+        return output
     output = postprocess_packed_seqs_context_parallel(
         output, cu_seqlens, is_pipeline_last_stage, gather_output=gather_cp_output
     )

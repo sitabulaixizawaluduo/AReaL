@@ -199,6 +199,24 @@ def test_qwen3_5_pipeline_parallel(tmp_path_factory):
 
 @pytest.mark.multi_gpu
 @pytest.mark.slow
+def test_qwen3_5_context_parallel(tmp_path_factory):
+    """Qwen3.5 (GDN hybrid, padded BSHD forward) under CP=2.
+
+    Exercises the BSHD zigzag CP path end to end: input/position_ids split,
+    GDN + gated-attention CP forward (megatron-core >= 0.18), CP-gathered
+    logits repack, and the megatron-vs-FSDP logprob cross-check inherited
+    from the shared ``forward`` test type.
+    """
+    if current_platform.device_count() < 2:
+        pytest.skip("context parallel requires 2 GPUs to run")
+    output = tmp_path_factory.mktemp("test_output") / "qwen3_5_context_parallel.out"
+    _run_test_with_torchrun(
+        "qwen3_5", "megatron:d1p1t1c2", test_type="forward", output=str(output)
+    )
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.slow
 @pytest.mark.skip(
     reason="megatron-bridge _broadcast_shared_embeddings does not support "
     "VPP + tied embeddings (TODO in model_bridge.py:1271). Not needed for "

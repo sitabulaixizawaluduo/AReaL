@@ -65,6 +65,10 @@ from areal.engine.core.model import (
     requires_padded_seq,
 )
 from areal.engine.megatron_utils import megatron_bridge_patches  # noqa: F401
+from areal.engine.megatron_utils.bshd_cp import (
+    build_bshd_cp_local_labels,
+    reconstruct_padded_2d,
+)
 from areal.engine.megatron_utils.checkpointer import MegatronCheckpointManager
 from areal.engine.megatron_utils.deterministic import set_deterministic_algorithms
 from areal.engine.megatron_utils.fp8 import FP8BlockwiseTensorHelper
@@ -79,6 +83,7 @@ from areal.engine.megatron_utils.packed_context_parallel import (
     _is_multi_modal_payload_key,
     extract_vision_from_multi_modal,
     packed_context_parallel_forward,
+    reassemble_cp_bshd_logprobs,
     reassemble_cp_packed_logprobs,
     split_packed_seqs_for_context_parallel,
 )
@@ -104,7 +109,14 @@ from areal.models.tree_attn.module import (
     patch_bridge_for_tree_training,
 )
 from areal.models.tree_attn.tree import build_packed_tree_batch
-from areal.utils import logging, name_resolve, names, perf_tracer, stats_tracker
+from areal.utils import (
+    logging,
+    name_resolve,
+    names,
+    perf_tracer,
+    pkg_version,
+    stats_tracker,
+)
 from areal.utils.constants import (
     DEFAULT_VECTORIZED_ALIGNMENT_BYTES,
     DIST_GROUP_DEFAULT_TIMEOUT,
@@ -355,7 +367,15 @@ class MegatronEngine(TrainEngine):
             # config flag so the layout can't be mis-set.
             self.use_padded_seq = requires_padded_seq(self.hf_config.model_type)
             if self.is_vision_model:
-                if self.parallel_strategy.context_parallel_size > 1:
+                if (
+                    self.parallel_strategy.context_parallel_size > 1
+                    and not self.use_padded_seq
+                ):
+                    # Non-BSHD VLMs (qwen2/3-vl) compute mRoPE inside the
+                    # model from the full [B, S] view, which a CP split would
+                    # break. BSHD models (Qwen3.5) may initialize with CP:
+                    # text-only micro-batches run via the BSHD CP split;
+                    # vision micro-batches are rejected at forward time.
                     raise NotImplementedError(
                         "Context parallel (CP > 1) is not supported with VLM models. "
                         f"Got context_parallel_size={self.parallel_strategy.context_parallel_size} "
@@ -370,13 +390,7 @@ class MegatronEngine(TrainEngine):
                 )
 
             if self.use_padded_seq and self.parallel_strategy.context_parallel_size > 1:
-                raise NotImplementedError(
-                    f"Context parallel (CP > 1) is not supported for "
-                    f"model_type={self.hf_config.model_type!r}, which requires the "
-                    "padded BSHD forward (it operates on [B, S] tensors while the "
-                    "CP path packs sequences). "
-                    f"Got context_parallel_size={self.parallel_strategy.context_parallel_size}."
-                )
+                self._validate_padded_seq_cp_support()
 
             self.quantization_config = getattr(
                 self.hf_config, "quantization_config", None
@@ -545,6 +559,53 @@ class MegatronEngine(TrainEngine):
                     )
                     glu_fc1_names.add(_normalize_glu_param_name(full_name))
         return glu_fc1_names
+
+    def _validate_padded_seq_cp_support(self) -> None:
+        """Validate CP prerequisites for models on the padded BSHD forward.
+
+        GDN/SSM hybrids (Qwen3.5 family) can run context parallel only when:
+        - megatron-core >= 0.18.0: GDN CP (all-to-all to head-parallel,
+          Megatron-LM PR #2642) and the gated-attention gate slicing fix
+          (PR #3529) first shipped in 0.18.0.
+        - The model is built via megatron-bridge (only its model definitions
+          wire up the GDN hybrid stack).
+        - cp_comm_type is unset: mcore's TransformerLayer forwards a non-None
+          cp_comm_type into the self-attention submodule constructor, and
+          GatedDeltaNet.__init__ does not accept it (Megatron-LM PR #4374 was
+          never merged) — a TypeError at build time.
+        - GDN linear attention heads are divisible by tp_size * cp_size.
+        """
+        cp_size = self.parallel_strategy.context_parallel_size
+        tp_size = self.parallel_strategy.tensor_parallel_size
+        if pkg_version.is_version_less("megatron-core", "0.18.0"):
+            raise NotImplementedError(
+                f"Context parallel (CP > 1) for model_type="
+                f"{self.hf_config.model_type!r} requires megatron-core>=0.18.0 "
+                "(GDN context parallel support), which first ships GDN CP "
+                "and the gated-attention gate fix."
+            )
+        if self.bridge_cls != "megatron-bridge":
+            raise NotImplementedError(
+                f"Context parallel (CP > 1) for model_type="
+                f"{self.hf_config.model_type!r} requires bridge_type="
+                f"'megatron-bridge'; got {self.bridge_cls!r}."
+            )
+        cp_comm_type = getattr(self.tf_config, "cp_comm_type", None)
+        if cp_comm_type is not None:
+            raise NotImplementedError(
+                f"cp_comm_type={cp_comm_type!r} is not supported with GDN "
+                "hybrid models: mcore injects it into the self-attention "
+                "submodule and GatedDeltaNet does not accept it. Leave "
+                "cp_comm_type unset (None)."
+            )
+        text_cfg = lang_config(self.hf_config)
+        for attr in ("linear_num_key_heads", "linear_num_value_heads"):
+            heads = getattr(text_cfg, attr, None)
+            if heads is not None and heads % (tp_size * cp_size) != 0:
+                raise ValueError(
+                    f"{attr}={heads} must be divisible by tp_size*cp_size="
+                    f"{tp_size * cp_size} for GDN context parallelism."
+                )
 
     def _build_hf_mcore_bridge(self):
         if self.bridge_cls == "mbridge":
@@ -950,15 +1011,31 @@ class MegatronEngine(TrainEngine):
             ):
                 if cp_local and cu_seqlens is not None:
                     padded_cu_seqlens = mb_input.padded_mb["cu_seqlens"]
-                    rolled_ids = torch.roll(
-                        mb_input.padded_mb["input_ids"], shifts=-1, dims=-1
-                    )
-                    cp_labels = split_packed_seqs_for_context_parallel(
-                        rolled_ids, padded_cu_seqlens
-                    )
+                    if self.use_padded_seq or self.is_vision_model:
+                        # Padded BSHD CP path: logits arrive as the flattened
+                        # CP-local [B * S/cp, V] grid (padding included), so
+                        # labels are built on the same zigzag-split grid.
+                        input_ids_2d, _ = reconstruct_padded_2d(
+                            mb_input.padded_mb["input_ids"], padded_cu_seqlens
+                        )
+                        cp_labels = build_bshd_cp_local_labels(
+                            input_ids_2d,
+                            mpu.get_context_parallel_world_size(),
+                            mpu.get_context_parallel_rank(),
+                        )
+                        cp_is_bshd = True
+                    else:
+                        rolled_ids = torch.roll(
+                            mb_input.padded_mb["input_ids"], shifts=-1, dims=-1
+                        )
+                        cp_labels = split_packed_seqs_for_context_parallel(
+                            rolled_ids, padded_cu_seqlens
+                        )
+                        cp_is_bshd = False
                     cp_inputs = dict(mb_input.orig_mb)
                     cp_inputs["_cp_local_labels"] = cp_labels
                     cp_inputs["_cp_padded_cu_seqlens"] = padded_cu_seqlens
+                    cp_inputs["_cp_bshd"] = cp_is_bshd
                     cp_inputs["_cp_padding_length"] = mb_input.padding_length
                     cp_inputs["_cp_old_cu_seqlens"] = mb_input.old_cu_seqlens
                     return output, functools.partial(_process_output, cp_inputs)
@@ -2359,22 +2436,26 @@ class MegatronEngine(TrainEngine):
                 vocab_mean_logits = output.detach().float().mean(-1)
                 vocab_norm_logits = output.detach().float().norm(dim=-1)
                 if cp_padded_cu_seqlens is not None:
-                    logprobs = reassemble_cp_packed_logprobs(
-                        logprobs, cp_padded_cu_seqlens
+                    # BSHD CP stats live on the flattened [B * S/cp] local
+                    # grid; packed CP stats live on the packed local layout.
+                    # Both reassemble to the full packed [total_len] order.
+                    reassemble_fn = (
+                        reassemble_cp_bshd_logprobs
+                        if inputs.get("_cp_bshd")
+                        else reassemble_cp_packed_logprobs
                     )
-                    entropy = reassemble_cp_packed_logprobs(
-                        entropy, cp_padded_cu_seqlens
-                    )
-                    vocab_min_logits = reassemble_cp_packed_logprobs(
+                    logprobs = reassemble_fn(logprobs, cp_padded_cu_seqlens)
+                    entropy = reassemble_fn(entropy, cp_padded_cu_seqlens)
+                    vocab_min_logits = reassemble_fn(
                         vocab_min_logits, cp_padded_cu_seqlens
                     )
-                    vocab_max_logits = reassemble_cp_packed_logprobs(
+                    vocab_max_logits = reassemble_fn(
                         vocab_max_logits, cp_padded_cu_seqlens
                     )
-                    vocab_mean_logits = reassemble_cp_packed_logprobs(
+                    vocab_mean_logits = reassemble_fn(
                         vocab_mean_logits, cp_padded_cu_seqlens
                     )
-                    vocab_norm_logits = reassemble_cp_packed_logprobs(
+                    vocab_norm_logits = reassemble_fn(
                         vocab_norm_logits, cp_padded_cu_seqlens
                     )
                     cp_padding_length = inputs.get("_cp_padding_length", 0)

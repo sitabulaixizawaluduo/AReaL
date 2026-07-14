@@ -11,9 +11,29 @@ sentinel prevents double-application. Apply patches at import time via
 
 from __future__ import annotations
 
+import warnings
+
 import areal.utils.logging as logging
 
 logger = logging.getLogger("MegatronBridgePatches")
+
+
+def _silence_mcore_gdn_indexing_deprecation() -> None:
+    """Silence the per-parameter indexing UserWarning from mcore GDN sharding.
+
+    megatron-core 0.18.0's ``gated_delta_net.py`` indexes parameters with a
+    list of slices (``param[slices]``), which torch flags with a deprecation
+    UserWarning on every GDN parameter — flooding logs at init and on every
+    weight-sync. Behavior is unchanged on current torch (the warning firing
+    at all means the legacy semantics are still in effect); revisit if
+    megatron-core or torch is upgraded past the deprecation window.
+    """
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Using a non-tuple sequence for multidimensional indexing",
+        category=UserWarning,
+        module=r"megatron\.core\.ssm\.gated_delta_net",
+    )
 
 
 def _patch_qwen3vl_pr3143_word_embeddings() -> None:
@@ -78,6 +98,7 @@ def _patch_qwen3vl_pr3143_word_embeddings() -> None:
 
 
 def _apply_patches_on_import() -> None:
+    _silence_mcore_gdn_indexing_deprecation()
     _patch_qwen3vl_pr3143_word_embeddings()
 
 

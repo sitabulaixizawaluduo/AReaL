@@ -109,6 +109,14 @@ def _run_vlm_test(
 # append one tuple here — no test-body changes needed.
 # ──────────────────────────────────────────────────────────────────────
 
+# Qwen3.5 is natively multimodal and must go through megatron-bridge (its
+# GDN hybrid stack only exists in the bridge model definitions). The other
+# entries keep the mbridge default.
+_QWEN3_5_VLM_ENV = {
+    "VLM_MODEL_PATH": DENSE_MODEL_PATHS["qwen3_5"],
+    "AREAL_TEST_BRIDGE_TYPE": "megatron-bridge",
+}
+
 _VLM_MODELS = [
     pytest.param(
         {"VLM_MODEL_PATH": DENSE_MODEL_PATHS["qwen2_5_vl"]},
@@ -117,6 +125,10 @@ _VLM_MODELS = [
     pytest.param(
         {"VLM_MODEL_PATH": DENSE_MODEL_PATHS["qwen3_vl"]},
         id="qwen3_vl",
+    ),
+    pytest.param(
+        _QWEN3_5_VLM_ENV,
+        id="qwen3_5",
     ),
     pytest.param(
         {"VLM_MODEL_PATH": MOE_MODEL_PATHS["qwen3_vl_moe"]},
@@ -184,8 +196,53 @@ def test_train_tensor_parallel(model_env, tmp_path_factory):
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Qwen3.5 with vision inputs under context parallelism.
+#
+# Qwen3.5 is the only VLM family with CP support: the megatron-bridge
+# (>= 0.5.0) model computes mRoPE and fuses vision embeddings on the full
+# sequence, zigzag-splits before the decoder, and returns CP-local logits
+# that the engine reassembles. Other VLMs still reject CP at init.
+# ──────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.gpu
+@pytest.mark.multi_gpu
+@pytest.mark.slow
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+def test_qwen3_5_vl_context_parallel_forward(tmp_path_factory):
+    """Qwen3.5 forward with vision inputs under CP=2 (gather-free logprobs)."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("context parallel requires at least 2 GPUs")
+    output = str(tmp_path_factory.mktemp("vlm_test") / "qwen3_5_cp_forward.out")
+    _run_vlm_test(
+        "forward",
+        output,
+        backend="megatron:d1p1t1c2",
+        env_overrides=_QWEN3_5_VLM_ENV,
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.multi_gpu
+@pytest.mark.slow
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+def test_qwen3_5_vl_context_parallel_train(tmp_path_factory):
+    """Qwen3.5 train_batch with vision inputs under CP=2 (CP-local loss path)."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("context parallel requires at least 2 GPUs")
+    output = str(tmp_path_factory.mktemp("vlm_test") / "qwen3_5_cp_train.out")
+    _run_vlm_test(
+        "train",
+        output,
+        backend="megatron:d1p1t1c2",
+        env_overrides=_QWEN3_5_VLM_ENV,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Qwen3-VL-MoE: 30B-A3B-Instruct under hybrid (attn|ffn) allocation.
-# CP > 1 is forbidden for VLMs (megatron_engine.py:347).
+# CP > 1 is rejected at init for non-Qwen3.5 VLMs (no CP wiring in their
+# model definitions).
 # ──────────────────────────────────────────────────────────────────────
 
 

@@ -409,6 +409,59 @@ def test_train_grad_norm_value(
     )
 
 
+def test_forward_memory_probe(
+    model_type: str, alloc_mode: str, output: str | None = None, vpp_size: int = 1
+):
+    """Measure retained GPU memory across one engine.forward (compute_logp path).
+
+    Writes three allocated-GB readings to ``<output>.memprobe``:
+    before forward, after forward (result still referenced), and after the
+    result is dropped + gc. A large before-vs-final delta that scales with
+    cp/dp indicates references retained inside the forward path.
+    """
+    import gc
+
+    print(
+        f"running forward_memory_probe: model_type={model_type} "
+        f"alloc_mode={alloc_mode}"
+    )
+    rank = int(os.environ["RANK"])
+    mb_spec = MicroBatchSpec(max_tokens_per_mb=4096)
+    seeding.set_random_seed(0, key=f"engine{rank}")
+    engine = make_engine(model_type, alloc_mode, mb_spec, vpp_size=vpp_size)
+    seeding.set_random_seed(0, key=f"data{rank}")
+    input_ = mock_input(batch_size=32, max_seqlen=512, device=engine.device)
+    bcasted_input = broadcast_tensor_container(
+        input_,
+        src_rank=engine.current_data_parallel_head(),
+        group=engine.context_and_model_parallel_group,
+    )
+    current_platform.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
+    mem0 = torch.cuda.memory_allocated() / 2**30
+    logprobs = engine.forward(
+        input_=bcasted_input,
+        aggregate_fn=lambda xs: torch.cat(xs, dim=0),
+    )
+    current_platform.synchronize()
+    mem1 = torch.cuda.memory_allocated() / 2**30
+    del logprobs
+    gc.collect()
+    mem2 = torch.cuda.memory_allocated() / 2**30
+    print(
+        f"rank {rank} alloc_mode={alloc_mode} memprobe: "
+        f"before={mem0:.3f}GB after_forward={mem1:.3f}GB after_release={mem2:.3f}GB "
+        f"retained={mem2 - mem0:.3f}GB"
+    )
+    dist.barrier()
+    engine.destroy()
+    if rank == 0 and output is not None:
+        with open(str(output) + ".memprobe", "w") as f:
+            f.write(f"{mem0:.4f} {mem1:.4f} {mem2:.4f}")
+        write_result(output, True)
+
+
 def test_train_dcp_save_load(
     model_type: str, alloc_mode: str, output: str | None = None, vpp_size: int = 1
 ):
@@ -725,6 +778,7 @@ def main():
             "train",
             "grad_norm_mb_invariance",
             "train_grad_norm_value",
+            "forward_memory_probe",
             "simple_dcp_save_load",
             "train_dcp_save_load",
             "train_hf_save_load",
@@ -751,6 +805,13 @@ def main():
         )
     elif args.test_type == "grad_norm_mb_invariance":
         test_grad_norm_mb_invariance(
+            args.model_type,
+            args.backend,
+            output=args.output,
+            vpp_size=args.vpp_size,
+        )
+    elif args.test_type == "forward_memory_probe":
+        test_forward_memory_probe(
             args.model_type,
             args.backend,
             output=args.output,

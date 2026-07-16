@@ -933,7 +933,43 @@ class MegatronEngine(TrainEngine):
         for model in self.model:
             model.zero_grad_buffer()
 
+    def _debug_log_param_grad_norms(self, top_k: int = 20):
+        """Env-gated (``AREAL_GRAD_DEBUG=1``) per-parameter grad-norm dump.
+
+        Prints the top-K parameters by local main_grad norm on every rank,
+        annotated with the rank's position in the parallel topology. Used to
+        localize which parameters carry an anomalous gradient (e.g. the
+        MoE + CP grad_norm blow-up) — expert vs router vs GDN vs dense.
+        Reads grads only; safe to call between backward and optimizer.step().
+        """
+        entries = []
+        for model in self.model:
+            for name, param in model.named_parameters():
+                grad = getattr(param, "main_grad", None)
+                if grad is None:
+                    grad = param.grad
+                if grad is None:
+                    continue
+                entries.append((grad.norm().item(), name, tuple(param.shape)))
+        entries.sort(reverse=True)
+        total = sum(n * n for n, _, _ in entries) ** 0.5
+        topo = (
+            f"rank={self.rank} dp={mpu.get_data_parallel_rank()} "
+            f"pp={mpu.get_pipeline_model_parallel_rank()} "
+            f"tp={mpu.get_tensor_model_parallel_rank()} "
+            f"cp={mpu.get_context_parallel_rank()} "
+            f"ep={mpu.get_expert_model_parallel_rank()}"
+        )
+        lines = [
+            f"[GradDebug {topo}] local grad sqrt(sum sq)={total:.4f}, top {top_k}:"
+        ]
+        for norm, name, shape in entries[:top_k]:
+            lines.append(f"[GradDebug {topo}]   {norm:.4f}  {name}  {shape}")
+        print("\n".join(lines), flush=True)
+
     def optimizer_step(self):
+        if os.getenv("AREAL_GRAD_DEBUG") == "1":
+            self._debug_log_param_grad_norms()
         with trace_scope("megatron_engine.step"):
             update_successful, grad_norm, _ = self.optimizer.step()
         current_lr = self.optimizer.param_groups[0]["lr"]

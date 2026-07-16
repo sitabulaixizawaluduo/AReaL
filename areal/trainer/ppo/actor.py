@@ -34,7 +34,6 @@ from areal.utils.functional import (
     reward_overlong_penalty,
     sapo_loss_fn,
 )
-from areal.utils.mem_debug import mem_debug, mem_snapshot
 from areal.utils.perf_tracer import trace_perf
 from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
@@ -136,46 +135,18 @@ class PPOActor:
 
     def _compute_logp(self, data: dict[str, Any]) -> torch.Tensor | None:
         self.engine.eval()
-        mem_debug("H1-before-engine-forward")
-        res = self.engine.forward(
+        return self.engine.forward(
             input_=data,
             aggregate_fn=lambda xs: torch.cat(xs, dim=-1),
         )
-        mem_debug("H2-after-engine-forward")
-        return res
 
     @trace_perf("ppo_actor.compute_advantages", category="compute")
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        res = batched_call(self._compute_advantages, data, pass_meta=True)
-        mem_debug("ADV2-exit-compute-advantages")
-        mem_snapshot("worker_after_advantages")
-        return res
+        return batched_call(self._compute_advantages, data, pass_meta=True)
 
     def _compute_advantages(
         self, data: dict[str, Any], meta: TrajBatchMeta | None = None
     ) -> dict[str, Any]:
-        mem_debug("ADV1-enter-compute-advantages")
-        import os as _os
-
-        if _os.environ.get("AREAL_MEM_DEBUG", "0") == "1":
-            from areal.utils.mem_debug import logger as _mem_logger
-
-            def _sz(v):
-                if torch.is_tensor(v):
-                    return v.numel() * v.element_size()
-                if isinstance(v, (list, tuple)):
-                    return sum(_sz(x) for x in v)
-                if isinstance(v, dict):
-                    return sum(_sz(x) for x in v.values())
-                return 0
-
-            sizes = sorted(
-                ((k, _sz(v) / 2**30) for k, v in data.items()),
-                key=lambda kv: -kv[1],
-            )
-            for k, gb in sizes:
-                if gb > 0.01:
-                    _mem_logger.info(f"[mem-debug] ADV-batch-key {k}: {gb:.2f}GB")
         bs = data["input_ids"].shape[0]
         max_seqlen = data["input_ids"].shape[1]
         batch_indices = torch.arange(

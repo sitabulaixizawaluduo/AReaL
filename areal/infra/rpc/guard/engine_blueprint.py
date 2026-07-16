@@ -37,7 +37,6 @@ from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.utils import logging, perf_tracer, seeding
 from areal.utils.data import broadcast_tensor_container, tensor_container_to
 from areal.utils.dynamic_import import import_from_string
-from areal.utils.mem_debug import mem_debug
 
 logger = logging.getLogger("EngineBP")
 
@@ -536,9 +535,7 @@ def call_engine_method():
                     args={"method": method_name, "engine": engine_name},
                 ):
                     method = getattr(engine, method_name)
-                    mem_debug("I1-before-rpc")
                     result = method(*args_bcast, **kwargs_bcast)
-                    mem_debug("I2-after-rpc")
 
                     # Handle update weights future
                     if isinstance(result, Future):

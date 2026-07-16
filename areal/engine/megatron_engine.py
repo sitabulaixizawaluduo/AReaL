@@ -2544,7 +2544,15 @@ class MegatronEngine(TrainEngine):
         # Calibrated against test_qwen3_5_grad_norm_cp_equivalence: CP=2
         # grad_norm was exactly 2x CP=1 before this correction.
         if is_cp_bshd:
-            loss_scale = loss_scale / mpu.get_context_parallel_world_size()
+            # Empirical calibration: d1c2 needs 1/cp; d2c2 additionally needs
+            # 1/dp (test_train_grad_norm_value: d2c2 was 2x d2 with 1/cp
+            # alone). The dp factor in the shared loss_multiplier evidently
+            # does not apply on the bridge in-model CP path either, so the
+            # total correction is 1/(cp*dp).
+            loss_scale = loss_scale / (
+                mpu.get_context_parallel_world_size()
+                * mpu.get_data_parallel_world_size()
+            )
         return loss * loss_scale
 
     def _compute_forward_result(

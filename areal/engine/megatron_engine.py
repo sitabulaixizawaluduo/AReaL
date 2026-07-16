@@ -136,6 +136,7 @@ from areal.utils.data import (
 from areal.utils.functional import gather_logprobs, gather_logprobs_entropy
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer, load_hf_tokenizer
 from areal.utils.lock import DistributedLock
+from areal.utils.mem_debug import mem_debug
 from areal.utils.network import find_free_ports, format_host_for_url, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
 from areal.utils.perf_tracer import trace_perf, trace_scope
@@ -1205,6 +1206,7 @@ class MegatronEngine(TrainEngine):
 
         # Step 2: Prepare micro-batches
         mb_list = self._prepare_mb_list(input_batched).to(self.device)
+        mem_debug("A-after-mb-list-to-device")
 
         # Step 3: Forward using Megatron's pipeline function, collecting results
         outputs: list[torch.Tensor] = []
@@ -1212,6 +1214,7 @@ class MegatronEngine(TrainEngine):
         def process_output(output: torch.Tensor, inputs: dict[str, Any]) -> None:
             result = self._compute_forward_result(output, inputs)
             outputs.append(result)
+            mem_debug(f"B-after-mb-{len(outputs)}")
             return None
 
         # CP output handling differs by layout:
@@ -1229,6 +1232,7 @@ class MegatronEngine(TrainEngine):
             forward_only=True,
             gather_cp_output=gather_cp_output,
         )
+        mem_debug("C-after-forward-backward")
 
         # Step 4: Aggregate, reorder, and broadcast outputs
         res = None
@@ -1244,6 +1248,7 @@ class MegatronEngine(TrainEngine):
             src_rank=mpu.get_pipeline_model_parallel_last_rank(),
             group=mpu.get_pipeline_model_parallel_group(),
         )
+        mem_debug("E-before-forward-batch-return")
         if meta is None:
             return res
         return split_batch(res, meta)

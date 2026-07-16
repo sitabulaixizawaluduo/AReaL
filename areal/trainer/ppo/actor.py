@@ -34,6 +34,7 @@ from areal.utils.functional import (
     reward_overlong_penalty,
     sapo_loss_fn,
 )
+from areal.utils.mem_debug import mem_debug
 from areal.utils.perf_tracer import trace_perf
 from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
@@ -135,10 +136,13 @@ class PPOActor:
 
     def _compute_logp(self, data: dict[str, Any]) -> torch.Tensor | None:
         self.engine.eval()
-        return self.engine.forward(
+        mem_debug("H1-before-engine-forward")
+        res = self.engine.forward(
             input_=data,
             aggregate_fn=lambda xs: torch.cat(xs, dim=-1),
         )
+        mem_debug("H2-after-engine-forward")
+        return res
 
     @trace_perf("ppo_actor.compute_advantages", category="compute")
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:

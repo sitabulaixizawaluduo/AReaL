@@ -698,7 +698,9 @@ class PPOTrainer:
                         args={"global_step": global_step},
                     ),
                 ):
+                    mem_debug("J1-before-compute-logp")
                     prox_logps = self.actor.compute_logp(rollout_batch)
+                    mem_debug("J2-after-compute-logp")
                     for traj, logp in zip(rollout_batch, prox_logps):
                         traj["prox_logp"] = logp
                     self.actor.get_device_stats().log("recompute logp")
@@ -713,6 +715,8 @@ class PPOTrainer:
             ):
                 adv_batch = self.actor.compute_advantages(rollout_batch)
                 self.actor.get_device_stats().log("compute advantages")
+                mem_debug("K-after-compute-advantages")
+                mem_snapshot("after_advantages")
 
             # Wait for async checkpoint staging to complete before modifying parameters
             self.saver.maybe_wait_for_staging()

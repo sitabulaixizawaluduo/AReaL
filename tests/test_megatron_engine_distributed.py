@@ -217,6 +217,45 @@ def test_qwen3_5_context_parallel(tmp_path_factory):
 
 @pytest.mark.multi_gpu
 @pytest.mark.slow
+def test_qwen3_5_grad_norm_cp_equivalence(tmp_path_factory):
+    """train_batch grad_norm must match between CP=1 and CP=2.
+
+    Runs the seeded ``train_grad_norm_value`` runner twice on the identical
+    batch (data is seeded on the DP head and broadcast over the
+    context-and-model-parallel group) and compares the reported grad norms.
+    Catches CP gradient-scaling bugs: an uncancelled CP amplification factor
+    shows up as an exact ~cp_size (or worse) ratio, far outside the tolerance
+    for bf16 reduction-order drift.
+    """
+    if current_platform.device_count() < 2:
+        pytest.skip("context parallel requires 2 GPUs to run")
+    out_dir = tmp_path_factory.mktemp("test_output")
+    out_c1 = out_dir / "qwen3_5_gradnorm_c1.out"
+    out_c2 = out_dir / "qwen3_5_gradnorm_c2.out"
+    _run_test_with_torchrun(
+        "qwen3_5",
+        "megatron:d1p1t1",
+        test_type="train_grad_norm_value",
+        output=str(out_c1),
+    )
+    _run_test_with_torchrun(
+        "qwen3_5",
+        "megatron:d1p1t1c2",
+        test_type="train_grad_norm_value",
+        output=str(out_c2),
+    )
+    g_c1 = float((out_dir / "qwen3_5_gradnorm_c1.out.gradnorm").read_text())
+    g_c2 = float((out_dir / "qwen3_5_gradnorm_c2.out.gradnorm").read_text())
+    rel_diff = abs(g_c1 - g_c2) / max(abs(g_c1), 1e-12)
+    assert rel_diff <= 0.05, (
+        f"grad_norm differs between CP=1 ({g_c1}) and CP=2 ({g_c2}): "
+        f"rel_diff={rel_diff:.4f}. A ratio near cp_size indicates an "
+        "uncancelled CP gradient amplification factor."
+    )
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.slow
 @pytest.mark.skip(
     reason="megatron-bridge _broadcast_shared_embeddings does not support "
     "VPP + tied embeddings (TODO in model_bridge.py:1271). Not needed for "

@@ -359,6 +359,56 @@ def test_grad_norm_mb_invariance(
     )
 
 
+def test_train_grad_norm_value(
+    model_type: str, alloc_mode: str, output: str | None = None, vpp_size: int = 1
+):
+    """Run one seeded train_batch and write the reported grad_norm to a file.
+
+    Companion of the CP-equivalence pytest: it launches this runner twice with
+    different allocation modes (e.g. ``d1p1t1`` vs ``d1p1t1c2``) and compares
+    the two written grad_norm values. Data is seeded on the DP head and
+    broadcast over the context-and-model-parallel group, so both invocations
+    train on the identical batch; weights are loaded from the same
+    checkpoint. The value lands in ``<output>.gradnorm``; the standard
+    pass/fail marker still goes to ``<output>``.
+    """
+    print(
+        f"running train_grad_norm_value: model_type={model_type} "
+        f"alloc_mode={alloc_mode}"
+    )
+    rank = int(os.environ["RANK"])
+    mb_spec = MicroBatchSpec(max_tokens_per_mb=4096)
+    seeding.set_random_seed(0, key=f"engine{rank}")
+    engine = make_engine(
+        model_type, alloc_mode, mb_spec, init_optimizer=True, vpp_size=vpp_size
+    )
+    seeding.set_random_seed(0, key=f"data{rank}")
+    input_ = mock_input(batch_size=16, max_seqlen=128, device=engine.device)
+    bcasted_input = broadcast_tensor_container(
+        input_,
+        src_rank=engine.current_data_parallel_head(),
+        group=engine.context_and_model_parallel_group,
+    )
+    result = engine.train_batch(
+        input_=bcasted_input,
+        loss_fn=mock_loss_fn,
+        loss_weight_fn=lambda x: x["cu_seqlens"][-1],
+    )
+    grad_norm = float(result["grad_norm"])
+    print(f"rank {rank} alloc_mode={alloc_mode} grad_norm={grad_norm}")
+    current_platform.synchronize()
+    dist.barrier()
+    engine.destroy()
+    if rank == 0 and output is not None:
+        with open(str(output) + ".gradnorm", "w") as f:
+            f.write(repr(grad_norm))
+        write_result(output, True)
+    print(
+        f"Test: test_train_grad_norm_value(model_type={model_type}, "
+        f"alloc_mode={alloc_mode}) Done."
+    )
+
+
 def test_train_dcp_save_load(
     model_type: str, alloc_mode: str, output: str | None = None, vpp_size: int = 1
 ):
@@ -700,6 +750,13 @@ def main():
         )
     elif args.test_type == "grad_norm_mb_invariance":
         test_grad_norm_mb_invariance(
+            args.model_type,
+            args.backend,
+            output=args.output,
+            vpp_size=args.vpp_size,
+        )
+    elif args.test_type == "train_grad_norm_value":
+        test_train_grad_norm_value(
             args.model_type,
             args.backend,
             output=args.output,

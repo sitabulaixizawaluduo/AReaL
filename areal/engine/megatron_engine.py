@@ -2402,6 +2402,9 @@ class MegatronEngine(TrainEngine):
         if local_weight == 0:
             return output.mean() * 0.0
 
+        # Captured before the _cp_* keys are stripped from `inputs` below.
+        is_cp_bshd = bool(inputs.get("_cp_bshd"))
+
         if self.config.is_critic and self.enable_tree_training:
             raise NotImplementedError(
                 "Tree training with critic model is not supported yet."
@@ -2533,6 +2536,15 @@ class MegatronEngine(TrainEngine):
             loss = loss_fn(values, inputs)
 
         loss_scale = local_weight / total_loss_weight * loss_multiplier
+        # Padded BSHD CP calibration: with the megatron-bridge in-model CP
+        # split, the resulting gradient carries an extra cp_size factor
+        # relative to the packed THD CP path (which is grad_norm-equivalent
+        # to CP=1 under the shared normalization above — verified via
+        # test_train_grad_norm_value on qwen3). Compensate by 1/cp_size here.
+        # Calibrated against test_qwen3_5_grad_norm_cp_equivalence: CP=2
+        # grad_norm was exactly 2x CP=1 before this correction.
+        if is_cp_bshd:
+            loss_scale = loss_scale / mpu.get_context_parallel_world_size()
         return loss * loss_scale
 
     def _compute_forward_result(

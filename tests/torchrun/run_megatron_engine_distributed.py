@@ -724,6 +724,7 @@ def main():
             "forward",
             "train",
             "grad_norm_mb_invariance",
+            "train_grad_norm_value",
             "simple_dcp_save_load",
             "train_dcp_save_load",
             "train_hf_save_load",

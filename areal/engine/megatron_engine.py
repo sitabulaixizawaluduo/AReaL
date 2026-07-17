@@ -511,7 +511,56 @@ class MegatronEngine(TrainEngine):
                 model_config.param_sync_func = model_config.param_sync_func[0]
         model_config.finalize_model_grads_func = finalize_model_grads
         self._create_optimizer(ft_spec)
+        if os.getenv("AREAL_GRAD_DEBUG") == "1":
+            self._register_grad_debug_dgrad_hooks()
         self._initialized = True
+
+    def _register_grad_debug_dgrad_hooks(self):
+        """Env-gated (``AREAL_GRAD_DEBUG=1``) residual-stream dgrad probe.
+
+        Registers a grad hook on the output hidden_states of the embedding and
+        of every decoder layer, accumulating the squared norm of the gradient
+        that flows through each layer boundary during backward. Comparing the
+        per-boundary profile between CP=1 and CP=2 localizes which layer's
+        backward amplifies the upstream gradient (the MoE+CP blow-up compounds
+        per layer: boundary norms grow monotonically toward the embedding).
+        Purely observational; norms are dumped by _debug_log_param_grad_norms.
+        """
+        boundary_pat = re.compile(r"(?:^|\.)decoder\.layers\.(\d+)$")
+        self._grad_debug_dgrad: dict[str, float] = {}
+
+        def make_forward_hook(key: str):
+            def forward_hook(module, args, output):
+                out = output[0] if isinstance(output, tuple) else output
+                if not (torch.is_tensor(out) and out.requires_grad):
+                    return
+
+                def grad_hook(grad):
+                    self._grad_debug_dgrad[key] = self._grad_debug_dgrad.get(
+                        key, 0.0
+                    ) + float(grad.float().pow(2).sum().item())
+
+                out.register_hook(grad_hook)
+
+            return forward_hook
+
+        n_hooked = 0
+        for model in self.model:
+            for mod_name, module in model.named_modules():
+                match = boundary_pat.search(mod_name)
+                if match:
+                    key = f"layers.{int(match.group(1)):02d}.out"
+                elif mod_name.endswith(".embedding"):
+                    key = "embedding.out"
+                else:
+                    continue
+                module.register_forward_hook(make_forward_hook(key))
+                n_hooked += 1
+        print(
+            f"[GradDebug rank={self.rank}] registered dgrad boundary hooks on "
+            f"{n_hooked} modules",
+            flush=True,
+        )
 
     def _build_glu_fc1_names(self) -> set[str]:
         """Detect which `linear_fc1` parameters belong to GLU MLPs.
@@ -978,6 +1027,16 @@ class MegatronEngine(TrainEngine):
         except Exception:
             dp_w = dp_cp_w = cp_w = edp_w = -1
         ctx = getattr(self, "_grad_debug_ctx", None) or {}
+        # mcore injects router aux/z loss gradients purely in BACKWARD via
+        # MoEAuxLossAutoScaler (forward loss value is untouched), scaled by a
+        # class-level static. The coeff=0 audit only covered forward wiring, so
+        # dump the backward scale to rule out a CP-dependent injection.
+        try:
+            from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler
+
+            aux_backward_scale = float(MoEAuxLossAutoScaler.main_loss_backward_scale)
+        except Exception:
+            aux_backward_scale = float("nan")
         topo = (
             f"rank={self.rank} dp={mpu.get_data_parallel_rank()} "
             f"pp={mpu.get_pipeline_model_parallel_rank()} "
@@ -997,8 +1056,20 @@ class MegatronEngine(TrainEngine):
             f"local_loss_tokens={ctx.get('local_loss_tokens', float('nan'))} "
             f"raw_loss={ctx.get('raw_loss', float('nan'))} "
             f"loss_scale={ctx.get('loss_scale', float('nan'))} "
+            f"aux_backward_scale={aux_backward_scale} "
             f"data_checksum={ctx.get('data_checksum', 0)}, top {top_k}:",
         ]
+        # Residual-stream boundary profile (see _register_grad_debug_dgrad_hooks):
+        # norm of the gradient crossing each layer boundary, embedding-side last.
+        # A per-layer amplification shows up as monotonic growth from the last
+        # layer toward the embedding; the boundary where the CP=2/CP=1 ratio
+        # first departs from 1 is the amplifying layer.
+        dgrad = getattr(self, "_grad_debug_dgrad", None)
+        if dgrad:
+            profile = " ".join(
+                f"{key}={sq**0.5:.4f}" for key, sq in sorted(dgrad.items())
+            )
+            lines.append(f"[GradDebug {topo}] dgrad boundary {profile}")
         for norm, name, shape in entries[:top_k]:
             lines.append(f"[GradDebug {topo}]   {norm:.4f}  {name}  {shape}")
         print("\n".join(lines), flush=True)
@@ -1197,6 +1268,7 @@ class MegatronEngine(TrainEngine):
                 raw_loss=0.0,
                 loss_scale=float("nan"),
             )
+            self._grad_debug_dgrad = {}
 
         def process_output(
             output: torch.Tensor, inputs: dict[str, Any]

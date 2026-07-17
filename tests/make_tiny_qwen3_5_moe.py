@@ -46,6 +46,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=str, default="/tmp/qwen3_5_moe_tiny")
     parser.add_argument("--seed", type=int, default=0)
+    # Routing-ablation variants for the MoE+CP grad blow-up bisection:
+    # --top_k equal to --num_experts makes routing dense (every token to every
+    # expert, dispatch machinery still exercised); --num_experts 1 --top_k 1
+    # removes routing entirely. Defaults reproduce the original tiny model.
+    parser.add_argument("--num_experts", type=int, default=16)
+    parser.add_argument("--top_k", type=int, default=4)
     args = parser.parse_args()
 
     from transformers import (
@@ -69,8 +75,8 @@ def main():
         linear_value_head_dim=64,
         moe_intermediate_size=128,
         shared_expert_intermediate_size=128,
-        num_experts=16,
-        num_experts_per_tok=4,
+        num_experts=args.num_experts,
+        num_experts_per_tok=args.top_k,
         max_position_embeddings=4096,
         tie_word_embeddings=False,
         # megatron-bridge derives params_dtype from the HF sub-config (the
@@ -141,7 +147,10 @@ def main():
         video_processor=Qwen3VLVideoProcessor(),
     )
     processor.save_pretrained(args.output)
-    print(f"Saved tiny Qwen3.5-MoE VL ({n_params / 1e6:.1f}M params) to {args.output}")
+    print(
+        f"Saved tiny Qwen3.5-MoE VL ({n_params / 1e6:.1f}M params, "
+        f"num_experts={args.num_experts}, top_k={args.top_k}) to {args.output}"
+    )
 
 
 if __name__ == "__main__":

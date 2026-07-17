@@ -78,6 +78,9 @@ from areal.engine.megatron_utils.megatron import (
     get_named_parameters,
     remove_padding,
 )
+from areal.engine.megatron_utils.megatron_bridge_patches import (
+    set_areal_moe_aux_loss_scale,
+)
 from areal.engine.megatron_utils.megatron_lora import get_vllm_lora_target_modules
 from areal.engine.megatron_utils.packed_context_parallel import (
     _is_multi_modal_payload_key,
@@ -1101,6 +1104,12 @@ class MegatronEngine(TrainEngine):
         gather_cp_output: bool = False,
     ) -> None:
         self._ensure_ready()
+
+        # Number of micro-batches in this forward-backward, used to match the
+        # MoE aux-loss backward scale to the main loss (see
+        # `_compute_logprobs_and_loss`). mcore's schedule applies an extra
+        # `cp_size / num_microbatches` to the 2-tuple main loss.
+        self._areal_num_microbatches = len(mb_list)
 
         def forward_step(batch_iter, model):
             mb_input: MicroBatchItem = next(batch_iter)
@@ -2560,6 +2569,9 @@ class MegatronEngine(TrainEngine):
     ) -> torch.Tensor:
         local_weight = loss_weight_fn(inputs)
         if local_weight == 0:
+            # Zero-weight micro-batch contributes no main-loss gradient; keep the
+            # router aux-loss gradient consistent by zeroing its backward scale.
+            set_areal_moe_aux_loss_scale(0.0)
             return output.mean() * 0.0
 
         # Env-gated data fingerprint for the MoE+CP grad probe. Accumulates a
@@ -2729,6 +2741,20 @@ class MegatronEngine(TrainEngine):
                 mpu.get_context_parallel_world_size()
                 * mpu.get_data_parallel_world_size()
             )
+        # Match the MoE router aux-loss backward scale to the main loss. mcore
+        # injects aux/z-loss gradients purely in backward via
+        # MoEAuxLossAutoScaler; its schedule would set that scale to the bf16
+        # grad scale (1.0) assuming finalize_model_grads does the per-token
+        # division, which AReaL disables by returning a 2-tuple loss. The main
+        # loss's effective backward multiplier is `loss_scale * cp_size /
+        # num_microbatches` (mcore's 2-tuple branch scales it by
+        # `cp_size / num_microbatches`). Register the same value so the patched
+        # set_loss_scale weights aux consistently. See
+        # megatron_bridge_patches._patch_moe_aux_loss_backward_scale.
+        num_mb = getattr(self, "_areal_num_microbatches", 1) or 1
+        set_areal_moe_aux_loss_scale(
+            float(loss_scale) * mpu.get_context_parallel_world_size() / num_mb
+        )
         # Debug-only forward-equivalence discriminator: the raw (pre-scale)
         # loss is the full-sequence loss on every CP rank, so CP=1 and CP=2
         # must agree up to bf16 kernel noise. A mismatch means the blow-up

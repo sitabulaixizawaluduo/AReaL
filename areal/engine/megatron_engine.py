@@ -965,6 +965,19 @@ class MegatronEngine(TrainEngine):
         entries.sort(reverse=True)
         total = sum(n * n for n, _, _ in entries) ** 0.5
         family_norms = {k: v**0.5 for k, v in family_sq.items()}
+        # Group sizes that govern per-family grad reduction/scaling. Dense params
+        # reduce over dp_cp; expert params reduce over expert-dp (which folds CP).
+        # A dense-vs-expert imbalance that tracks (dp_cp / expert_dp) points at the
+        # per-family reduction wiring; a uniform blow-up points at loss/token
+        # accounting (compare data_checksum / tokens / total_loss_weight below).
+        try:
+            dp_w = mpu.get_data_parallel_world_size()
+            dp_cp_w = mpu.get_data_parallel_world_size(with_context_parallel=True)
+            cp_w = mpu.get_context_parallel_world_size()
+            edp_w = mpu.get_expert_data_parallel_world_size()
+        except Exception:
+            dp_w = dp_cp_w = cp_w = edp_w = -1
+        ctx = getattr(self, "_grad_debug_ctx", None) or {}
         topo = (
             f"rank={self.rank} dp={mpu.get_data_parallel_rank()} "
             f"pp={mpu.get_pipeline_model_parallel_rank()} "
@@ -976,7 +989,13 @@ class MegatronEngine(TrainEngine):
             f"[GradDebug {topo}] local grad sqrt(sum sq)={total:.4f} "
             f"dense={family_norms['dense']:.4f} "
             f"expert={family_norms['expert']:.4f} "
-            f"router+shared={family_norms['router']:.4f}, top {top_k}:"
+            f"router+shared={family_norms['router']:.4f}",
+            f"[GradDebug {topo}] groups dp={dp_w} cp={cp_w} dp_cp={dp_cp_w} "
+            f"expert_dp={edp_w} | accounting total_loss_weight="
+            f"{ctx.get('total_loss_weight', float('nan'))} "
+            f"loss_multiplier={ctx.get('loss_multiplier', float('nan'))} "
+            f"local_loss_tokens={ctx.get('local_loss_tokens', float('nan'))} "
+            f"data_checksum={ctx.get('data_checksum', 0)}, top {top_k}:",
         ]
         for norm, name, shape in entries[:top_k]:
             lines.append(f"[GradDebug {topo}]   {norm:.4f}  {name}  {shape}")
@@ -1160,6 +1179,20 @@ class MegatronEngine(TrainEngine):
             * self.optimizer.get_loss_scale().item()
             * len(mb_list)
         )
+
+        # Env-gated (AREAL_GRAD_DEBUG=1) accounting context for the grad probe:
+        # records the normalization scalars and a per-rank data fingerprint so
+        # the bucketed grad-norm dump can discriminate the MoE+CP blow-up between
+        # (a) an expert-vs-dense grad-family imbalance and (b) uniform token /
+        # loss-weight mis-accounting. Reset each step; updated per micro-batch in
+        # `_compute_logprobs_and_loss`. Purely observational.
+        if os.getenv("AREAL_GRAD_DEBUG") == "1":
+            self._grad_debug_ctx = dict(
+                total_loss_weight=float(total_loss_weight.item()),
+                loss_multiplier=float(loss_multiplier),
+                data_checksum=0,
+                local_loss_tokens=0.0,
+            )
 
         def process_output(
             output: torch.Tensor, inputs: dict[str, Any]
@@ -2452,6 +2485,22 @@ class MegatronEngine(TrainEngine):
         local_weight = loss_weight_fn(inputs)
         if local_weight == 0:
             return output.mean() * 0.0
+
+        # Env-gated data fingerprint for the MoE+CP grad probe. Accumulates a
+        # cheap order-insensitive checksum of this rank's input_ids and its local
+        # loss-weight so `_debug_log_param_grad_norms` can report whether CP ranks
+        # receive distinct (correctly split) data and whether the loss-weight
+        # accounting is CP-consistent. Read-only; never affects the loss.
+        if (
+            os.getenv("AREAL_GRAD_DEBUG") == "1"
+            and getattr(self, "_grad_debug_ctx", None) is not None
+        ):
+            ids = inputs.get("input_ids")
+            if ids is not None:
+                self._grad_debug_ctx["data_checksum"] += int(
+                    ids.to(torch.int64).sum().item()
+                )
+            self._grad_debug_ctx["local_loss_tokens"] += float(local_weight)
 
         # Captured before the _cp_* keys are stripped from `inputs` below.
         is_cp_bshd = bool(inputs.get("_cp_bshd"))

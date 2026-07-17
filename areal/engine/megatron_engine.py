@@ -995,6 +995,8 @@ class MegatronEngine(TrainEngine):
             f"{ctx.get('total_loss_weight', float('nan'))} "
             f"loss_multiplier={ctx.get('loss_multiplier', float('nan'))} "
             f"local_loss_tokens={ctx.get('local_loss_tokens', float('nan'))} "
+            f"raw_loss={ctx.get('raw_loss', float('nan'))} "
+            f"loss_scale={ctx.get('loss_scale', float('nan'))} "
             f"data_checksum={ctx.get('data_checksum', 0)}, top {top_k}:",
         ]
         for norm, name, shape in entries[:top_k]:
@@ -1192,6 +1194,8 @@ class MegatronEngine(TrainEngine):
                 loss_multiplier=float(loss_multiplier),
                 data_checksum=0,
                 local_loss_tokens=0.0,
+                raw_loss=0.0,
+                loss_scale=float("nan"),
             )
 
         def process_output(
@@ -2653,6 +2657,18 @@ class MegatronEngine(TrainEngine):
                 mpu.get_context_parallel_world_size()
                 * mpu.get_data_parallel_world_size()
             )
+        # Debug-only forward-equivalence discriminator: the raw (pre-scale)
+        # loss is the full-sequence loss on every CP rank, so CP=1 and CP=2
+        # must agree up to bf16 kernel noise. A mismatch means the blow-up
+        # starts in the forward, not in backward/accounting.
+        if (
+            os.getenv("AREAL_GRAD_DEBUG") == "1"
+            and getattr(self, "_grad_debug_ctx", None) is not None
+        ):
+            self._grad_debug_ctx["raw_loss"] = self._grad_debug_ctx.get(
+                "raw_loss", 0.0
+            ) + float(loss.detach().item())
+            self._grad_debug_ctx["loss_scale"] = float(loss_scale)
         return loss * loss_scale
 
     def _compute_forward_result(

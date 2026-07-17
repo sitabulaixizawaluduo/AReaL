@@ -394,9 +394,10 @@ def test_train_grad_norm_value(
     # may differ. A mismatch within a group means the broadcast group is
     # miswired (e.g. under ep>1) and grad comparisons are meaningless.
     ids = bcasted_input["input_ids"]
+    n_valid = int(bcasted_input["attention_mask"].sum().item())
     print(
         f"[DataCheck rank={rank}] input_ids sum={int(ids.sum().item())} "
-        f"numel={ids.numel()} total_len={int(bcasted_input['cu_seqlens'][-1].item())}",
+        f"numel={ids.numel()} valid_tokens={n_valid}",
         flush=True,
     )
     result = engine.train_batch(

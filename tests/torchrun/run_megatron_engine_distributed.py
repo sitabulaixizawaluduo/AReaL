@@ -74,11 +74,21 @@ def write_result(out: str, succ: bool):
             f.write("Failed")
 
 
+def _model_vocab_size(model_type: str) -> int:
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(MODEL_PATHS[model_type], trust_remote_code=True)
+    if hasattr(config, "get_text_config"):
+        config = config.get_text_config()
+    return config.vocab_size
+
+
 def mock_input(
     batch_size=128,
     min_seqlen=1,
     max_seqlen=1024,
     device=current_platform.device_type,
+    vocab_size=None,
 ) -> dict[str, Any]:
     """Create mock padded input data (same format for huggingface) for testing.
     Returns a dict with input_ids, attention_mask, and position_ids.
@@ -88,8 +98,14 @@ def mock_input(
         min_seqlen, max_seqlen, (batch_size,), dtype=torch.int, device=device
     )
     max_seqlen = int(max(seqlens))
+    # Keep the historical [10000, 50000) range for full-size models so seeded
+    # baselines stay comparable; only clamp for small-vocab (tiny) models
+    # where those ids would index out of bounds in the embedding.
+    low, high = 10000, 50000
+    if vocab_size is not None and vocab_size < high:
+        low, high = 2, vocab_size
     input_ids = torch.randint(
-        10000, 50000, (batch_size, max_seqlen), dtype=torch.long, device=device
+        low, high, (batch_size, max_seqlen), dtype=torch.long, device=device
     )
     attn_mask = torch.zeros((batch_size, max_seqlen), dtype=torch.bool, device=device)
 
@@ -157,7 +173,12 @@ def test_forward(
     engine = make_engine(model_type, alloc_mode, mb_spec, vpp_size=vpp_size)
     seeding.set_random_seed(0, key=f"trainer{rank}")
 
-    input_ = mock_input(batch_size=16, max_seqlen=128, device=engine.device)
+    input_ = mock_input(
+        batch_size=16,
+        max_seqlen=128,
+        device=engine.device,
+        vocab_size=_model_vocab_size(model_type),
+    )
     print(f"rank {rank} is_data_parallel_head()={engine.is_data_parallel_head()}")
     bcasted_input = broadcast_tensor_container(
         input_,
@@ -257,7 +278,12 @@ def test_train(
     )
     seeding.set_random_seed(0, key=f"trainer{rank}")
 
-    input_ = mock_input(batch_size=16, max_seqlen=128, device=engine.device)
+    input_ = mock_input(
+        batch_size=16,
+        max_seqlen=128,
+        device=engine.device,
+        vocab_size=_model_vocab_size(model_type),
+    )
     print(f"rank {rank} is_data_parallel_head()={engine.is_data_parallel_head()}")
     bcasted_input = broadcast_tensor_container(
         input_,
@@ -321,7 +347,10 @@ def test_grad_norm_mb_invariance(
         # Reset seed again before building the batch so input is identical.
         seeding.set_random_seed(0, key=f"data{rank}")
         input_ = mock_input(
-            batch_size=batch_size, max_seqlen=max_seqlen, device=engine.device
+            batch_size=batch_size,
+            max_seqlen=max_seqlen,
+            device=engine.device,
+            vocab_size=_model_vocab_size(model_type),
         )
         bcasted_input = broadcast_tensor_container(
             input_,
@@ -389,7 +418,12 @@ def test_train_grad_norm_value(
         model_type, alloc_mode, mb_spec, init_optimizer=True, vpp_size=vpp_size
     )
     seeding.set_random_seed(0, key=f"data{rank}")
-    input_ = mock_input(batch_size=16, max_seqlen=128, device=engine.device)
+    input_ = mock_input(
+        batch_size=16,
+        max_seqlen=128,
+        device=engine.device,
+        vocab_size=_model_vocab_size(model_type),
+    )
     bcasted_input = broadcast_tensor_container(
         input_,
         src_rank=engine.current_data_parallel_head(),
@@ -446,7 +480,12 @@ def test_forward_memory_probe(
     seeding.set_random_seed(0, key=f"engine{rank}")
     engine = make_engine(model_type, alloc_mode, mb_spec, vpp_size=vpp_size)
     seeding.set_random_seed(0, key=f"data{rank}")
-    input_ = mock_input(batch_size=32, max_seqlen=512, device=engine.device)
+    input_ = mock_input(
+        batch_size=32,
+        max_seqlen=512,
+        device=engine.device,
+        vocab_size=_model_vocab_size(model_type),
+    )
     bcasted_input = broadcast_tensor_container(
         input_,
         src_rank=engine.current_data_parallel_head(),
@@ -500,7 +539,12 @@ def test_train_dcp_save_load(
 
     seeding.set_random_seed(0, key=f"trainer{rank}")
 
-    input_ = mock_input(batch_size=16, max_seqlen=128, device=engine.device)
+    input_ = mock_input(
+        batch_size=16,
+        max_seqlen=128,
+        device=engine.device,
+        vocab_size=_model_vocab_size(model_type),
+    )
     print(f"rank {rank} is_data_parallel_head()={engine.is_data_parallel_head()}")
     bcasted_input = broadcast_tensor_container(
         input_,
@@ -687,7 +731,12 @@ def test_train_hf_save_load(
         # saved weights differ from the on-disk checkpoint. Skipped for models too
         # large to hold an optimizer (see _MODEL_SAVELOAD_SKIP_TRAIN); the loaded
         # HF weights are already non-trivial, so the round-trip stays meaningful.
-        input_ = mock_input(batch_size=16, max_seqlen=128, device=engine.device)
+        input_ = mock_input(
+            batch_size=16,
+            max_seqlen=128,
+            device=engine.device,
+            vocab_size=_model_vocab_size(model_type),
+        )
         bcasted_input = broadcast_tensor_container(
             input_,
             src_rank=engine.current_data_parallel_head(),

@@ -59,6 +59,25 @@ def main():
     model = Qwen3_5MoeForCausalLM(config).to(torch.bfloat16)
     n_params = sum(p.numel() for p in model.parameters())
     model.save_pretrained(args.output)
+
+    # The engine unconditionally loads a tokenizer from the checkpoint dir,
+    # and AutoTokenizer on a bare config falls back to a slow-tokenizer
+    # conversion that requires sentencepiece/tiktoken. Ship a self-contained
+    # fast tokenizer matching vocab_size instead (the UTs feed random ids, so
+    # only pad/eos metadata matters).
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    vocab = {"<|endoftext|>": 0, "<|pad|>": 1}
+    vocab.update({f"<tok{i}>": i for i in range(2, config.vocab_size)})
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel(vocab, unk_token="<|endoftext|>")),
+        eos_token="<|endoftext|>",
+        pad_token="<|pad|>",
+        unk_token="<|endoftext|>",
+    )
+    tokenizer.save_pretrained(args.output)
     print(f"Saved tiny Qwen3.5-MoE ({n_params / 1e6:.1f}M params) to {args.output}")
 
 

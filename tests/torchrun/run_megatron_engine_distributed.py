@@ -31,6 +31,11 @@ MODEL_PATHS = {
     "qwen3moe": MOE_MODEL_PATHS["qwen3_moe"],
     "qwen3_5": DENSE_MODEL_PATHS["qwen3_5"],
     "qwen3_5_moe": MOE_MODEL_PATHS["qwen3_5_moe"],
+    # Tiny random-init Qwen3.5-MoE for small-topology isolation runs;
+    # generate with tests/make_tiny_qwen3_5_moe.py first.
+    "qwen3_5_moe_tiny": os.environ.get(
+        "AREAL_TINY_QWEN35_MOE_PATH", "/tmp/qwen3_5_moe_tiny"
+    ),
 }
 
 # bridge_type must default to mbridge for backwards compat with existing
@@ -40,6 +45,7 @@ MODEL_PATHS = {
 _MODEL_BRIDGE_OVERRIDES = {
     "qwen3_5": "megatron-bridge",
     "qwen3_5_moe": "megatron-bridge",
+    "qwen3_5_moe_tiny": "megatron-bridge",
 }
 
 # Models large enough that a full-AdamW optimizer state does not fit even when
@@ -758,7 +764,7 @@ def main():
     parser.add_argument(
         "--model_type",
         type=str,
-        choices=["qwen3", "qwen3moe", "qwen3_5", "qwen3_5_moe"],
+        choices=["qwen3", "qwen3moe", "qwen3_5", "qwen3_5_moe", "qwen3_5_moe_tiny"],
         default="qwen3",
         help="Type of model to test",
     )

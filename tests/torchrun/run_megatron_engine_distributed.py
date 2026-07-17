@@ -389,6 +389,16 @@ def test_train_grad_norm_value(
         src_rank=engine.current_data_parallel_head(),
         group=engine.context_and_model_parallel_group,
     )
+    # Data-wiring check: every rank in the same context-and-model-parallel
+    # group must report the identical checksum; ranks in different DP groups
+    # may differ. A mismatch within a group means the broadcast group is
+    # miswired (e.g. under ep>1) and grad comparisons are meaningless.
+    ids = bcasted_input["input_ids"]
+    print(
+        f"[DataCheck rank={rank}] input_ids sum={int(ids.sum().item())} "
+        f"numel={ids.numel()} total_len={int(bcasted_input['cu_seqlens'][-1].item())}",
+        flush=True,
+    )
     result = engine.train_batch(
         input_=bcasted_input,
         loss_fn=mock_loss_fn,
@@ -422,8 +432,7 @@ def test_forward_memory_probe(
     import gc
 
     print(
-        f"running forward_memory_probe: model_type={model_type} "
-        f"alloc_mode={alloc_mode}"
+        f"running forward_memory_probe: model_type={model_type} alloc_mode={alloc_mode}"
     )
     rank = int(os.environ["RANK"])
     mb_spec = MicroBatchSpec(max_tokens_per_mb=4096)

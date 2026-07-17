@@ -942,7 +942,16 @@ class MegatronEngine(TrainEngine):
         MoE + CP grad_norm blow-up) — expert vs router vs GDN vs dense.
         Reads grads only; safe to call between backward and optimizer.step().
         """
+
+        def _family(name: str) -> str:
+            if ".mlp.experts." in name:
+                return "expert"
+            if ".mlp.router." in name or ".mlp.shared_experts." in name:
+                return "router"
+            return "dense"
+
         entries = []
+        family_sq = {"dense": 0.0, "expert": 0.0, "router": 0.0}
         for model in self.model:
             for name, param in model.named_parameters():
                 grad = getattr(param, "main_grad", None)
@@ -950,9 +959,12 @@ class MegatronEngine(TrainEngine):
                     grad = param.grad
                 if grad is None:
                     continue
-                entries.append((grad.norm().item(), name, tuple(param.shape)))
+                sq = grad.norm().item()
+                entries.append((sq, name, tuple(param.shape)))
+                family_sq[_family(name)] += sq * sq
         entries.sort(reverse=True)
         total = sum(n * n for n, _, _ in entries) ** 0.5
+        family_norms = {k: v**0.5 for k, v in family_sq.items()}
         topo = (
             f"rank={self.rank} dp={mpu.get_data_parallel_rank()} "
             f"pp={mpu.get_pipeline_model_parallel_rank()} "
@@ -961,7 +973,10 @@ class MegatronEngine(TrainEngine):
             f"ep={mpu.get_expert_model_parallel_rank()}"
         )
         lines = [
-            f"[GradDebug {topo}] local grad sqrt(sum sq)={total:.4f}, top {top_k}:"
+            f"[GradDebug {topo}] local grad sqrt(sum sq)={total:.4f} "
+            f"dense={family_norms['dense']:.4f} "
+            f"expert={family_norms['expert']:.4f} "
+            f"router+shared={family_norms['router']:.4f}, top {top_k}:"
         ]
         for norm, name, shape in entries[:top_k]:
             lines.append(f"[GradDebug {topo}]   {norm:.4f}  {name}  {shape}")

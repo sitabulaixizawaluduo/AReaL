@@ -1147,6 +1147,26 @@ class MegatronEngine(TrainEngine):
             # value, so the CP-local loss path (_cp_local_labels) is unchanged.
             cp_local = cp_size > 1 and not gather_cp_output
 
+            # Register the MoE router aux-loss backward scale on every pipeline
+            # stage (the loss function that computes it directly runs only on
+            # the last stage, so under PP>1 earlier stages would otherwise use a
+            # stale scale). No-op unless a training forward-backward stashed the
+            # weighting context. `is_cp_bshd` mirrors the last-stage flag set at
+            # `cp_inputs["_cp_bshd"]` below.
+            aux_ctx = getattr(self, "_areal_aux_scale_ctx", None)
+            if not forward_only and aux_ctx is not None:
+                is_cp_bshd = (
+                    cp_local
+                    and cu_seqlens is not None
+                    and (self.use_padded_seq or self.is_vision_model)
+                )
+                self._register_moe_aux_loss_scale(
+                    aux_ctx["loss_weight_fn"](mb_input.orig_mb),
+                    aux_ctx["total_loss_weight"],
+                    aux_ctx["loss_multiplier"],
+                    is_cp_bshd,
+                )
+
             output = packed_context_parallel_forward(
                 model,
                 mb_input.padded_mb,
@@ -1260,6 +1280,15 @@ class MegatronEngine(TrainEngine):
             mpu.get_data_parallel_world_size()
             * self.optimizer.get_loss_scale().item()
             * len(mb_list)
+        )
+
+        # Weighting context so every pipeline stage can register the MoE
+        # aux-loss backward scale in forward_step; the loss function that would
+        # compute it directly runs only on the last pipeline stage.
+        self._areal_aux_scale_ctx = dict(
+            loss_weight_fn=loss_weight_fn,
+            total_loss_weight=total_loss_weight,
+            loss_multiplier=loss_multiplier,
         )
 
         # Env-gated (AREAL_GRAD_DEBUG=1) accounting context for the grad probe:
@@ -2558,6 +2587,64 @@ class MegatronEngine(TrainEngine):
 
         return mb_list
 
+    def _main_loss_scale(
+        self,
+        local_weight: torch.Tensor,
+        total_loss_weight: torch.Tensor,
+        loss_multiplier: float,
+        is_cp_bshd: bool,
+    ) -> torch.Tensor:
+        """Per-micro-batch scale applied to the main loss before backward.
+
+        ``w_i / W_total`` globally normalizes the micro-batch; ``loss_multiplier``
+        folds in dp_size, the optimizer loss scale, and num_microbatches (the
+        last compensates mcore's 2-tuple ``/= num_microbatches``).
+
+        Padded BSHD CP calibration: with the megatron-bridge in-model CP split
+        the gradient carries an extra cp_size factor vs the packed THD CP path
+        (grad_norm-equivalent to CP=1 under the shared normalization — verified
+        via test_train_grad_norm_value on qwen3). Empirically d1c2 needs 1/cp
+        and d2c2 additionally 1/dp (the dp factor in loss_multiplier does not
+        apply on the bridge in-model CP path), so the total correction is
+        1/(cp*dp).
+        """
+        loss_scale = local_weight / total_loss_weight * loss_multiplier
+        if is_cp_bshd:
+            loss_scale = loss_scale / (
+                mpu.get_context_parallel_world_size()
+                * mpu.get_data_parallel_world_size()
+            )
+        return loss_scale
+
+    def _register_moe_aux_loss_scale(
+        self,
+        local_weight: torch.Tensor,
+        total_loss_weight: torch.Tensor,
+        loss_multiplier: float,
+        is_cp_bshd: bool,
+    ) -> None:
+        """Register the MoE router aux-loss backward scale for the next backward.
+
+        mcore injects router aux/z-loss gradients purely in backward via
+        MoEAuxLossAutoScaler; its schedule would set the scale to the bf16 grad
+        scale (1.0), assuming finalize_model_grads does the per-token division —
+        which AReaL disables by returning a 2-tuple loss. The main loss's
+        effective backward multiplier is ``loss_scale * cp_size /
+        num_microbatches`` (mcore's 2-tuple branch scales the main loss by
+        ``cp_size / num_microbatches``), so register the same value to keep aux
+        consistent. Computed here rather than in the loss function so every
+        pipeline stage registers it, not just the last stage that owns the loss
+        (otherwise earlier stages' MoE layers use a stale scale under PP>1). See
+        megatron_bridge_patches._patch_moe_aux_loss_backward_scale.
+        """
+        loss_scale = self._main_loss_scale(
+            local_weight, total_loss_weight, loss_multiplier, is_cp_bshd
+        )
+        num_mb = getattr(self, "_areal_num_microbatches", 1) or 1
+        set_areal_moe_aux_loss_scale(
+            float(loss_scale) * mpu.get_context_parallel_world_size() / num_mb
+        )
+
     def _compute_logprobs_and_loss(
         self,
         output: torch.Tensor,
@@ -2569,9 +2656,6 @@ class MegatronEngine(TrainEngine):
     ) -> torch.Tensor:
         local_weight = loss_weight_fn(inputs)
         if local_weight == 0:
-            # Zero-weight micro-batch contributes no main-loss gradient; keep the
-            # router aux-loss gradient consistent by zeroing its backward scale.
-            set_areal_moe_aux_loss_scale(0.0)
             return output.mean() * 0.0
 
         # Env-gated data fingerprint for the MoE+CP grad probe. Accumulates a
@@ -2723,37 +2807,8 @@ class MegatronEngine(TrainEngine):
             values = output.squeeze(-1)
             loss = loss_fn(values, inputs)
 
-        loss_scale = local_weight / total_loss_weight * loss_multiplier
-        # Padded BSHD CP calibration: with the megatron-bridge in-model CP
-        # split, the resulting gradient carries an extra cp_size factor
-        # relative to the packed THD CP path (which is grad_norm-equivalent
-        # to CP=1 under the shared normalization above — verified via
-        # test_train_grad_norm_value on qwen3). Compensate by 1/cp_size here.
-        # Calibrated against test_qwen3_5_grad_norm_cp_equivalence: CP=2
-        # grad_norm was exactly 2x CP=1 before this correction.
-        if is_cp_bshd:
-            # Empirical calibration: d1c2 needs 1/cp; d2c2 additionally needs
-            # 1/dp (test_train_grad_norm_value: d2c2 was 2x d2 with 1/cp
-            # alone). The dp factor in the shared loss_multiplier evidently
-            # does not apply on the bridge in-model CP path either, so the
-            # total correction is 1/(cp*dp).
-            loss_scale = loss_scale / (
-                mpu.get_context_parallel_world_size()
-                * mpu.get_data_parallel_world_size()
-            )
-        # Match the MoE router aux-loss backward scale to the main loss. mcore
-        # injects aux/z-loss gradients purely in backward via
-        # MoEAuxLossAutoScaler; its schedule would set that scale to the bf16
-        # grad scale (1.0) assuming finalize_model_grads does the per-token
-        # division, which AReaL disables by returning a 2-tuple loss. The main
-        # loss's effective backward multiplier is `loss_scale * cp_size /
-        # num_microbatches` (mcore's 2-tuple branch scales it by
-        # `cp_size / num_microbatches`). Register the same value so the patched
-        # set_loss_scale weights aux consistently. See
-        # megatron_bridge_patches._patch_moe_aux_loss_backward_scale.
-        num_mb = getattr(self, "_areal_num_microbatches", 1) or 1
-        set_areal_moe_aux_loss_scale(
-            float(loss_scale) * mpu.get_context_parallel_world_size() / num_mb
+        loss_scale = self._main_loss_scale(
+            local_weight, total_loss_weight, loss_multiplier, is_cp_bshd
         )
         # Debug-only forward-equivalence discriminator: the raw (pre-scale)
         # loss is the full-sequence loss on every CP rank, so CP=1 and CP=2

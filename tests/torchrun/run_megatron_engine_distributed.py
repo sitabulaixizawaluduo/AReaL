@@ -100,10 +100,13 @@ def mock_input(
     max_seqlen = int(max(seqlens))
     # Keep the historical [10000, 50000) range for full-size models so seeded
     # baselines stay comparable; only clamp for small-vocab (tiny) models
-    # where those ids would index out of bounds in the embedding.
+    # where those ids would index out of bounds in the embedding. The top 64
+    # ids are reserved: tiny checkpoints park the family's vision/video
+    # special tokens there, and sampling one would trigger vision fusion on
+    # a batch with no pixel data.
     low, high = 10000, 50000
     if vocab_size is not None and vocab_size < high:
-        low, high = 2, vocab_size
+        low, high = 2, vocab_size - 64
     input_ids = torch.randint(
         low, high, (batch_size, max_seqlen), dtype=torch.long, device=device
     )

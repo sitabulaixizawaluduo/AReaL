@@ -73,6 +73,11 @@ def main():
         num_experts_per_tok=4,
         max_position_embeddings=4096,
         tie_word_embeddings=False,
+        # megatron-bridge derives params_dtype from the HF sub-config (the
+        # engine's dtype setting is ignored on the megatron-bridge path). An
+        # unset dtype falls back to fp32, for which no TE attention backend
+        # supports context parallelism.
+        dtype=torch.bfloat16,
     )
     # Vision tower shrunk to the minimum that keeps the family's structure;
     # patch/merge geometry stays at the release defaults. out_hidden_size must
@@ -84,6 +89,7 @@ def main():
         intermediate_size=128,
         out_hidden_size=HIDDEN_SIZE,
         num_position_embeddings=64,
+        dtype=torch.bfloat16,
     )
     config = Qwen3_5MoeConfig(
         text_config=text_config.to_dict(),

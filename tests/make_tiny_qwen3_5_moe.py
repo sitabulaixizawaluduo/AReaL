@@ -58,7 +58,11 @@ def main():
     )
     model = Qwen3_5MoeForCausalLM(config).to(torch.bfloat16)
     n_params = sum(p.numel() for p in model.parameters())
-    model.save_pretrained(args.output)
+    # transformers 5.x defaults to the hub serialization format for this
+    # family: VL-style `model.language_model.*` nesting with per-expert
+    # split weights. megatron-bridge maps runtime names (`model.layers.*`,
+    # grouped `mlp.experts.gate_up_proj`), so keep the runtime format.
+    model.save_pretrained(args.output, save_original_format=False)
 
     # The engine unconditionally loads a tokenizer from the checkpoint dir,
     # and AutoTokenizer on a bare config falls back to a slow-tokenizer

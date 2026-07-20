@@ -6,10 +6,9 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
-import pytest
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -206,7 +205,9 @@ def _load_qwen3_5_modules(monkeypatch):
         LLMBridge=_LLMBridge,
         register_model=lambda names: lambda cls: cls,
     )
-    _stub_module(monkeypatch, "transformers", PretrainedConfig=type("PretrainedConfig", (), {}))
+    _stub_module(
+        monkeypatch, "transformers", PretrainedConfig=type("PretrainedConfig", (), {})
+    )
 
     _stub_module(monkeypatch, "areal")
     _stub_module(monkeypatch, "areal.models")
@@ -256,14 +257,19 @@ def qwen3_5_modules(monkeypatch):
 
 def _collective_received(prepared_inputs, target_rank, cp_size):
     return torch.cat(
-        [torch.chunk(input_, cp_size, dim=0)[target_rank] for input_ in prepared_inputs],
+        [
+            torch.chunk(input_, cp_size, dim=0)[target_rank]
+            for input_ in prepared_inputs
+        ],
         dim=0,
     )
 
 
 def _simulate_cp2hp(monkeypatch, gdn, rank_inputs, split_sections):
     cp_size = len(rank_inputs)
-    sections_by_rank = [torch.split(input_, split_sections, dim=-1) for input_ in rank_inputs]
+    sections_by_rank = [
+        torch.split(input_, split_sections, dim=-1) for input_ in rank_inputs
+    ]
     outputs = []
     monkeypatch.setattr(gdn.dist, "get_world_size", lambda group=None: cp_size)
 
@@ -280,7 +286,9 @@ def _simulate_cp2hp(monkeypatch, gdn, rank_inputs, split_sections):
                 seq_len, batch, hidden = section.shape
                 hidden_per_cp = hidden // cp_size
                 flat = section.reshape(seq_len * batch, hidden)
-                prepared.append(torch.cat(torch.split(flat, hidden_per_cp, dim=-1), dim=0))
+                prepared.append(
+                    torch.cat(torch.split(flat, hidden_per_cp, dim=-1), dim=0)
+                )
             return _collective_received(prepared, target_rank, cp_size)
 
         monkeypatch.setattr(gdn, "_all_to_all_equal", fake_all_to_all)
@@ -298,7 +306,9 @@ def _simulate_cp2hp(monkeypatch, gdn, rank_inputs, split_sections):
 def _simulate_hp2cp(monkeypatch, gdn, rank_inputs, split_sections):
     cp_size = len(rank_inputs)
     local_sections = [section // cp_size for section in split_sections]
-    sections_by_rank = [torch.split(input_, local_sections, dim=-1) for input_ in rank_inputs]
+    sections_by_rank = [
+        torch.split(input_, local_sections, dim=-1) for input_ in rank_inputs
+    ]
     outputs = []
     monkeypatch.setattr(gdn.dist, "get_world_size", lambda group=None: cp_size)
 
@@ -310,7 +320,9 @@ def _simulate_hp2cp(monkeypatch, gdn, rank_inputs, split_sections):
             section_index = call_index
             call_index += 1
             flat_inputs = [
-                rank_sections[section_index].reshape(-1, rank_sections[section_index].shape[-1])
+                rank_sections[section_index].reshape(
+                    -1, rank_sections[section_index].shape[-1]
+                )
                 for rank_sections in sections_by_rank
             ]
             return _collective_received(flat_inputs, target_rank, cp_size)
@@ -327,7 +339,9 @@ def _simulate_hp2cp(monkeypatch, gdn, rank_inputs, split_sections):
     return outputs
 
 
-def test_get_parameter_local_cp_each_qkv_section_returns_rank_local_heads(qwen3_5_modules):
+def test_get_parameter_local_cp_each_qkv_section_returns_rank_local_heads(
+    qwen3_5_modules,
+):
     gdn = qwen3_5_modules.gdn
     cp_size = 4
     head_counts = [4, 4, 8]
@@ -389,8 +403,12 @@ def test_all_to_all_cp2hp_with_qkv_sections_preserves_section_boundaries(
             expected_sections.append(
                 torch.cat(
                     [
-                        torch.split(rank_inputs[source], split_sections, dim=-1)[section_id][
-                            ..., target_rank * width_per_rank : (target_rank + 1) * width_per_rank
+                        torch.split(rank_inputs[source], split_sections, dim=-1)[
+                            section_id
+                        ][
+                            ...,
+                            target_rank * width_per_rank : (target_rank + 1)
+                            * width_per_rank,
                         ]
                         for source in range(cp_size)
                     ],
@@ -527,15 +545,21 @@ def test_get_qwen3_5_layer_types_with_interval_four_returns_three_to_one_pattern
 
     actual = qwen3_5_modules.qwen._get_qwen3_5_layer_types(text_config)
 
-    assert actual == [
-        "linear_attention",
-        "linear_attention",
-        "linear_attention",
-        "full_attention",
-    ] * 2
+    assert (
+        actual
+        == [
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+        ]
+        * 2
+    )
 
 
-def test_bridge_q_gate_conversion_roundtrip_returns_original_hf_weights(qwen3_5_modules):
+def test_bridge_q_gate_conversion_roundtrip_returns_original_hf_weights(
+    qwen3_5_modules,
+):
     bridge_module = qwen3_5_modules.bridge
     bridge = bridge_module.Qwen3_5MoeBridge.__new__(bridge_module.Qwen3_5MoeBridge)
     bridge.hf_config = SimpleNamespace(

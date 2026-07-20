@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import math
 from dataclasses import dataclass, replace
 
 import torch
@@ -653,17 +652,25 @@ class Qwen3_5GatedDeltaNet(MegatronModule):
             dim=-1,
         )
 
-        query = query.reshape(batch, seq_len_for_conv, num_k_heads_local, self.head_k_dim)
+        query = query.reshape(
+            batch, seq_len_for_conv, num_k_heads_local, self.head_k_dim
+        )
         key = key.reshape(batch, seq_len_for_conv, num_k_heads_local, self.head_k_dim)
-        value = value.reshape(batch, seq_len_for_conv, num_v_heads_local, self.head_v_dim)
+        value = value.reshape(
+            batch, seq_len_for_conv, num_v_heads_local, self.head_v_dim
+        )
         z = z.reshape(batch, seq_len_for_conv, num_v_heads_local, self.head_v_dim)
         beta = b.sigmoid()
 
         A_log = self.A_log
         dt_bias = self.dt_bias
         if self.cp_size > 1:
-            A_log = _get_parameter_local_cp(A_log, dim=0, cp_rank=self.cp_rank, cp_size=self.cp_size)
-            dt_bias = _get_parameter_local_cp(dt_bias, dim=0, cp_rank=self.cp_rank, cp_size=self.cp_size)
+            A_log = _get_parameter_local_cp(
+                A_log, dim=0, cp_rank=self.cp_rank, cp_size=self.cp_size
+            )
+            dt_bias = _get_parameter_local_cp(
+                dt_bias, dim=0, cp_rank=self.cp_rank, cp_size=self.cp_size
+            )
 
         g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)
 

@@ -128,7 +128,9 @@ class Qwen3_5MoeBridge(LLMBridge):
         if transformer_config_class is None:
             return True
 
-        dataclass_fields = getattr(transformer_config_class, "__dataclass_fields__", None)
+        dataclass_fields = getattr(
+            transformer_config_class, "__dataclass_fields__", None
+        )
         if dataclass_fields is not None:
             return kwarg_name in dataclass_fields
 
@@ -140,9 +142,9 @@ class Qwen3_5MoeBridge(LLMBridge):
 
     def _adjust_mapping_for_shared_weights(self):
         text_config = _get_text_config(self.hf_config)
-        tie_word_embeddings = getattr(text_config, "tie_word_embeddings", False) or getattr(
-            self.hf_config, "tie_word_embeddings", False
-        )
+        tie_word_embeddings = getattr(
+            text_config, "tie_word_embeddings", False
+        ) or getattr(self.hf_config, "tie_word_embeddings", False)
         if tie_word_embeddings:
             self._DIRECT_MAPPING = dict(self._DIRECT_MAPPING)
             self._DIRECT_MAPPING["output_layer.weight"] = (
@@ -163,7 +165,9 @@ class Qwen3_5MoeBridge(LLMBridge):
         )
 
         kwargs = dict(
-            text_config_key="text_config" if hasattr(self.hf_config, "text_config") else None,
+            text_config_key="text_config"
+            if hasattr(self.hf_config, "text_config")
+            else None,
             attention_backend=AttnBackend.fused,
             layernorm_epsilon=text_config.rms_norm_eps,
             ffn_hidden_size=ffn_hidden_size,
@@ -266,7 +270,9 @@ class Qwen3_5MoeBridge(LLMBridge):
             raise NotImplementedError(f"Unsupported MLP parameter: {name}")
         return convert_names
 
-    def _weight_to_mcore_format(self, mcore_weights_name: str, hf_weights: list[torch.Tensor]):
+    def _weight_to_mcore_format(
+        self, mcore_weights_name: str, hf_weights: list[torch.Tensor]
+    ):
         # Full-attention q_proj in Qwen3.5 stores [query, gate] interleaved per query head.
         if (
             "self_attention.linear_qkv." in mcore_weights_name
@@ -276,7 +282,9 @@ class Qwen3_5MoeBridge(LLMBridge):
             text_config = _get_text_config(self.hf_config)
             num_kv_heads = text_config.num_key_value_heads
             num_attn_heads = text_config.num_attention_heads
-            head_dim = getattr(text_config, "head_dim", text_config.hidden_size // num_attn_heads)
+            head_dim = getattr(
+                text_config, "head_dim", text_config.hidden_size // num_attn_heads
+            )
             n_per_group = num_attn_heads // num_kv_heads
             group_dim = head_dim * n_per_group
 
@@ -310,7 +318,9 @@ class Qwen3_5MoeBridge(LLMBridge):
 
         return super()._weight_to_mcore_format(mcore_weights_name, hf_weights)
 
-    def _weight_to_hf_format(self, mcore_weights_name: str, mcore_weights: torch.Tensor):
+    def _weight_to_hf_format(
+        self, mcore_weights_name: str, mcore_weights: torch.Tensor
+    ):
         hf_names = self._weight_name_mapping_mcore_to_hf(mcore_weights_name)
 
         if (
@@ -321,7 +331,9 @@ class Qwen3_5MoeBridge(LLMBridge):
             text_config = _get_text_config(self.hf_config)
             num_kv_heads = text_config.num_key_value_heads
             num_attn_heads = text_config.num_attention_heads
-            head_dim = getattr(text_config, "head_dim", text_config.hidden_size // num_attn_heads)
+            head_dim = getattr(
+                text_config, "head_dim", text_config.hidden_size // num_attn_heads
+            )
             n_per_group = num_attn_heads // num_kv_heads
             per_kv_size = (2 * n_per_group + 2) * head_dim
             real_num_kv_heads = mcore_weights.shape[0] // per_kv_size

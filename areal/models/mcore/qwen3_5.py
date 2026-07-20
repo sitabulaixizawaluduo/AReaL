@@ -71,7 +71,9 @@ def hf_to_mcore_config_qwen3_5_moe(
     )
 
     rope_parameters = getattr(text_config, "rope_parameters", None) or {}
-    rotary_base = rope_parameters.get("rope_theta", getattr(text_config, "rope_theta", 10000.0))
+    rotary_base = rope_parameters.get(
+        "rope_theta", getattr(text_config, "rope_theta", 10000.0)
+    )
     rotary_percent = getattr(text_config, "partial_rotary_factor", 1.0)
 
     ffn_hidden_size = getattr(text_config, "intermediate_size", None)

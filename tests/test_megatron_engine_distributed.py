@@ -333,3 +333,80 @@ def test_qwen3_5_moe_hf_save_load(tmp_path_factory):
         test_type="train_hf_save_load",
         output=str(output),
     )
+
+
+@pytest.mark.slow
+def test_qwen3_5_moe_forward_single_gpu(tmp_path_factory):
+    if current_platform.device_count() < 1:
+        pytest.skip("Qwen3.5 MoE forward requires 1 GPU to run")
+    output = (
+        tmp_path_factory.mktemp("test_output") / "qwen3_5_moe_forward_single_gpu.out"
+    )
+    _run_test_with_torchrun(
+        "qwen3_5_moe_tiny",
+        "megatron:d1p1t1",
+        test_type="forward",
+        output=str(output),
+    )
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.slow
+def test_qwen3_5_moe_context_parallel(tmp_path_factory):
+    if current_platform.device_count() < 2:
+        pytest.skip("Qwen3.5 MoE context parallel requires 2 GPUs to run")
+    output = tmp_path_factory.mktemp("test_output") / "qwen3_5_moe_context_parallel.out"
+    _run_test_with_torchrun(
+        "qwen3_5_moe_tiny",
+        "megatron:d1p1t1c2",
+        test_type="forward",
+        output=str(output),
+    )
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.slow
+def test_qwen3_5_moe_tensor_parallel_cp(tmp_path_factory):
+    if current_platform.device_count() < 4:
+        pytest.skip("Qwen3.5 MoE tensor and context parallel requires 4 GPUs to run")
+    output = (
+        tmp_path_factory.mktemp("test_output") / "qwen3_5_moe_tensor_parallel_cp.out"
+    )
+    _run_test_with_torchrun(
+        "qwen3_5_moe_tiny",
+        "megatron:d1p1t2c2",
+        test_type="forward",
+        output=str(output),
+    )
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.slow
+def test_qwen3_5_moe_grad_norm_cp_equivalence(tmp_path_factory):
+    """Verify CP head sharding does not amplify the train_batch gradient."""
+    if current_platform.device_count() < 2:
+        pytest.skip("Qwen3.5 MoE grad norm CP equivalence requires 2 GPUs to run")
+    out_dir = tmp_path_factory.mktemp("test_output")
+    out_c1 = out_dir / "qwen3_5_moe_gradnorm_c1.out"
+    out_c2 = out_dir / "qwen3_5_moe_gradnorm_c2.out"
+    _run_test_with_torchrun(
+        "qwen3_5_moe_tiny",
+        "megatron:d1p1t1",
+        test_type="train_grad_norm_value",
+        output=str(out_c1),
+    )
+    _run_test_with_torchrun(
+        "qwen3_5_moe_tiny",
+        "megatron:d1p1t1c2",
+        test_type="train_grad_norm_value",
+        output=str(out_c2),
+    )
+    grad_norm_c1 = float(out_c1.with_suffix(out_c1.suffix + ".gradnorm").read_text())
+    grad_norm_c2 = float(out_c2.with_suffix(out_c2.suffix + ".gradnorm").read_text())
+    tolerance = 0.05
+    rel_diff = abs(grad_norm_c1 - grad_norm_c2) / max(abs(grad_norm_c1), 1e-12)
+    assert rel_diff <= tolerance, (
+        f"grad_norm differs between CP=1 ({grad_norm_c1}) and CP=2 ({grad_norm_c2}): "
+        f"rel_diff={rel_diff:.4f}, tolerance={tolerance:.4f}. This catches an "
+        "uncancelled CP gradient amplification factor."
+    )

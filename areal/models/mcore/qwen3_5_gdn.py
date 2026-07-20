@@ -143,13 +143,34 @@ def _all_to_all_cp2hp(
     return flat.reshape(seq_len * cp_size, batch, hidden_per_cp)
 
 
-def _all_to_all_hp2cp(input_: Tensor, cp_group) -> Tensor:
+def _all_to_all_hp2cp(
+    input_: Tensor,
+    cp_group,
+    split_size_or_sections: list[int] | None = None,
+) -> Tensor:
     """All-to-all from head shard to CP sequence shard for [S, B, H/CP]."""
     if cp_group is None:
         return input_
     cp_size = dist.get_world_size(group=cp_group)
     if cp_size == 1:
         return input_
+    if split_size_or_sections is not None:
+        # ``split_size_or_sections`` holds FULL (unsharded) section sizes, the
+        # same values passed to ``_all_to_all_cp2hp``. The head-parallel input
+        # carries ``section / cp_size`` channels per section, so slice with the
+        # CP-local sizes to stay the exact inverse of cp2hp.
+        for section in split_size_or_sections:
+            if section % cp_size != 0:
+                raise ValueError(
+                    f"Qwen3.5 GDN CP all2all requires every section size to be "
+                    f"divisible by CP {cp_size}, got {split_size_or_sections}."
+                )
+        local_sections = [section // cp_size for section in split_size_or_sections]
+        chunks = torch.split(input_, local_sections, dim=-1)
+        return torch.cat(
+            [_all_to_all_hp2cp(chunk, cp_group) for chunk in chunks],
+            dim=-1,
+        )
 
     seq_len, batch, hidden_per_cp = input_.shape
     if seq_len % cp_size != 0:

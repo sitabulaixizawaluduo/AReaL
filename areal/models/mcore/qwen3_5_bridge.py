@@ -158,12 +158,6 @@ class Qwen3_5MoeBridge(LLMBridge):
         if ffn_hidden_size is None:
             ffn_hidden_size = getattr(text_config, "shared_expert_intermediate_size")
 
-        rope_parameters = getattr(text_config, "rope_parameters", None) or {}
-        rotary_base = rope_parameters.get(
-            "rope_theta",
-            getattr(text_config, "rope_theta", 10000.0),
-        )
-
         kwargs = dict(
             text_config_key="text_config"
             if hasattr(self.hf_config, "text_config")
@@ -173,8 +167,6 @@ class Qwen3_5MoeBridge(LLMBridge):
             ffn_hidden_size=ffn_hidden_size,
             qk_layernorm=True,
             attention_output_gate=True,
-            rotary_base=rotary_base,
-            rotary_percent=getattr(text_config, "partial_rotary_factor", 1.0),
             # MoE
             moe_ffn_hidden_size=getattr(text_config, "moe_intermediate_size", None),
             moe_shared_expert_intermediate_size=getattr(
@@ -218,6 +210,7 @@ class Qwen3_5MoeBridge(LLMBridge):
             "rotary_base": (getattr(text_config, "rope_parameters", None) or {}).get(
                 "rope_theta", getattr(text_config, "rope_theta", 10000.0)
             ),
+            "rotary_percent": getattr(text_config, "partial_rotary_factor", 1.0),
         }
 
     def _weight_name_mapping_mcore_to_hf(self, mcore_weights_name: str) -> list[str]:

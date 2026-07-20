@@ -75,6 +75,14 @@ def hf_to_mcore_config_qwen3_5_moe(
         "rope_theta", getattr(text_config, "rope_theta", 10000.0)
     )
     rotary_percent = getattr(text_config, "partial_rotary_factor", 1.0)
+    # mcore 0.17's plain TransformerConfig has no rotary fields (MLA-only);
+    # rotary reaches GPTModel via Qwen3_5MoeBridge._get_gptmodel_args. Kept in
+    # MLATransformerConfig-style dicts only when the config class supports it.
+    rotary_args = (
+        {"rotary_base": rotary_base, "rotary_percent": rotary_percent}
+        if hasattr(TransformerConfig, "rotary_base")
+        else {}
+    )
 
     ffn_hidden_size = getattr(text_config, "intermediate_size", None)
     if ffn_hidden_size is None:
@@ -109,8 +117,7 @@ def hf_to_mcore_config_qwen3_5_moe(
         "num_attention_heads": text_config.num_attention_heads,
         "num_query_groups": text_config.num_key_value_heads,
         "kv_channels": getattr(text_config, "head_dim", None),
-        "rotary_base": rotary_base,
-        "rotary_percent": rotary_percent,
+        **rotary_args,
         "bf16": resolved_dtype == torch.bfloat16,
         "params_dtype": resolved_dtype,
         "pipeline_dtype": resolved_dtype,

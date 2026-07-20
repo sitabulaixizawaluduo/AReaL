@@ -1251,6 +1251,7 @@ _CONVERSION_FN_REGISTRY = {
     "qwen3_vl_moe": convert_qwen3_vl_moe_to_hf,
     "qwen3_vl": convert_qwen3_vl_to_hf,
     "qwen3_moe": convert_qwen3moe_to_hf,
+    "qwen3_5_moe": convert_qwen3moe_to_hf,
     "qwen2": convert_qwen2_to_hf,
     "qwen3": convert_qwen2_to_hf,
     "deepseekv3": convert_deepseekv3_to_hf,

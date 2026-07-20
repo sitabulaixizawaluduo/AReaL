@@ -61,6 +61,7 @@ from areal.engine.core.distributed import (
 )
 from areal.engine.core.model import (
     disable_dropout_in_model,
+    is_qwen3_5_model,
     is_valid_vision_model,
     lang_config,
     requires_padded_seq,
@@ -355,6 +356,20 @@ class MegatronEngine(TrainEngine):
             # the padded BSHD forward. Derived from model type rather than a
             # config flag so the layout can't be mis-set.
             self.use_padded_seq = requires_padded_seq(self.hf_config.model_type)
+            if self.bridge_cls == "mbridge" and is_qwen3_5_model(
+                self.hf_config.model_type
+            ):
+                # The mbridge registry path builds a text-only GPTModel (no
+                # vision tower) whose GDN module consumes packed THD input via
+                # fla varlen kernels, so neither the VLM padded routing nor the
+                # padded-BSHD requirement of the megatron-bridge path applies.
+                self.is_vision_model = False
+                self.use_padded_seq = False
+                self.logger.info(
+                    f"mbridge path for {self.hf_config.model_type}: training the "
+                    "text-only GPTModel with packed sequences (vision tower is "
+                    "not built; vision checkpoint weights pass through untouched)."
+                )
             if self.is_vision_model:
                 if self.parallel_strategy.context_parallel_size > 1:
                     raise NotImplementedError(

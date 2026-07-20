@@ -22,6 +22,10 @@ from areal.models.mcore.qwen3 import (
     hf_to_mcore_config_qwen3_dense,
     make_mcore_layer_specs_qwen3_dense,
 )
+from areal.models.mcore.qwen3_5 import (
+    hf_to_mcore_config_qwen3_5_moe,
+    make_mcore_layer_specs_qwen3_5_moe,
+)
 from areal.utils import logging
 
 logger = logging.getLogger("MCoreRegistry")
@@ -136,6 +140,8 @@ def make_hf_and_mcore_config(
         architecture = hf_config.architectures[0]
         if architecture == "Qwen3ForCausalLM":
             return hf_config, hf_to_mcore_config_qwen3_dense(hf_config, dtype)
+        elif architecture == "Qwen3_5MoeForConditionalGeneration":
+            return hf_config, hf_to_mcore_config_qwen3_5_moe(hf_config, dtype)
         elif architecture in (
             "BailingMoeV2_5ForCausalLM",
             "BailingMoeLinearForCausalLM",
@@ -153,6 +159,12 @@ def make_mcore_layer_specs(hf_config: PretrainedConfig, tf_config: TransformerCo
     architecture = hf_config.architectures[0]
     if architecture == "Qwen3ForCausalLM":
         return make_mcore_layer_specs_qwen3_dense(tf_config, use_te=True)
+    elif architecture == "Qwen3_5MoeForConditionalGeneration":
+        return make_mcore_layer_specs_qwen3_5_moe(
+            tf_config,
+            hf_config,
+            use_te=True,
+        )
     elif architecture in (
         "BailingMoeV2_5ForCausalLM",
         "BailingMoeLinearForCausalLM",

@@ -368,6 +368,199 @@ def convert_qwen3moe_to_hf(
     raise ValueError(f"Unknown parameter name: {name}")
 
 
+# Adapted from slime
+def convert_qwen3_5_moe_to_hf(
+    tf_config: TransformerConfig,
+    name: str,
+    param: Parameter | Tensor | FP8BlockwiseTensorHelper,
+):
+    """Convert Qwen3.5-MoE Megatron parameters to HuggingFace format.
+
+    Qwen3.5-MoE is a VL composite in HF with text weights under
+    ``model.language_model.*``. This converter handles the text-only mcore path:
+    - linear-attention (GDN) params under ``self_attention.linear_attn.*``
+    - full-attention fused ``linear_qkv`` with gated-Q (q+gate interleaving)
+    - MoE (including grouped fused-expert runtime format)
+    """
+    if name == "module.module.embedding.word_embeddings.weight":
+        return [("model.language_model.embed_tokens.weight", param)]
+    if name == "module.module.output_layer.weight":
+        return [("lm_head.weight", param)]
+    if name == "module.module.decoder.final_layernorm.weight":
+        return [("model.language_model.norm.weight", param)]
+    # defensive: if a wrapper adds language_model prefix in mcore names
+    if name == "module.module.language_model.embedding.word_embeddings.weight":
+        return [("model.language_model.embed_tokens.weight", param)]
+    if name == "module.module.language_model.output_layer.weight":
+        return [("lm_head.weight", param)]
+    if name == "module.module.language_model.decoder.final_layernorm.weight":
+        return [("model.language_model.norm.weight", param)]
+
+    try:
+        head_dim = (
+            tf_config.kv_channels
+            if tf_config.kv_channels is not None
+            else tf_config.hidden_size // tf_config.num_attention_heads
+        )
+    except (AttributeError, TypeError):
+        head_dim = tf_config.hidden_size // tf_config.num_attention_heads
+
+    if tf_config.num_query_groups is None:
+        raise ValueError("Qwen3.5-MoE models should have num_query_groups")
+    value_num_per_group = tf_config.num_attention_heads // tf_config.num_query_groups
+
+    match = re.match(r"module\.module\.decoder\.layers\.(\d+)\.(.+)", name)
+    if not match:
+        match = re.match(
+            r"module\.module\.language_model\.decoder\.layers\.(\d+)\.(.+)",
+            name,
+        )
+    if not match:
+        raise ValueError(f"Unknown parameter name: {name}")
+
+    layer_idx, rest = match.groups()
+    prefix = f"model.language_model.layers.{layer_idx}"
+
+    # experts (grouped gemm fused-expert runtime format)
+    if rest == "mlp.experts.linear_fc1":
+        return [(f"{prefix}.mlp.experts.gate_up_proj", param)]
+    if rest == "mlp.experts.linear_fc2":
+        return [(f"{prefix}.mlp.experts.down_proj", param)]
+
+    # experts (ungrouped per-expert format)
+    match = re.match(r"mlp\.experts\.(.+)\.weight(\d+)", rest)
+    if match:
+        fc_kind, expert_idx = match.groups()
+        if fc_kind == "linear_fc1":
+            gate_weight, up_weight = param.chunk(2, dim=0)
+            return [
+                (f"{prefix}.mlp.experts.{expert_idx}.gate_proj.weight", gate_weight),
+                (f"{prefix}.mlp.experts.{expert_idx}.up_proj.weight", up_weight),
+            ]
+        if fc_kind == "linear_fc2":
+            return [(f"{prefix}.mlp.experts.{expert_idx}.down_proj.weight", param)]
+        raise ValueError(f"Unknown expert parameter name: {name}")
+
+    # shared expert
+    match = re.match(r"mlp\.shared_experts\.(.+)", rest)
+    if match:
+        shared_rest = match.groups()[0]
+        if shared_rest == "linear_fc1.weight":
+            gate_weight, up_weight = param.chunk(2, dim=0)
+            return [
+                (f"{prefix}.mlp.shared_expert.gate_proj.weight", gate_weight),
+                (f"{prefix}.mlp.shared_expert.up_proj.weight", up_weight),
+            ]
+        if shared_rest == "linear_fc2.weight":
+            return [(f"{prefix}.mlp.shared_expert.down_proj.weight", param)]
+        if shared_rest == "gate_weight":
+            return [(f"{prefix}.mlp.shared_expert_gate.weight", param)]
+        raise ValueError(f"Unknown shared expert parameter name: {name}")
+
+    if rest == "self_attention.linear_proj.weight":
+        return [(f"{prefix}.self_attn.o_proj.weight", param)]
+
+    # full-attention fused QKV with gated Q (query+gate interleaving)
+    if rest == "self_attention.linear_qkv.weight":
+        p = param.view(tf_config.num_query_groups, -1, head_dim, tf_config.hidden_size)
+        q_param, k_param, v_param = torch.split(
+            p,
+            split_size_or_sections=[2 * value_num_per_group, 1, 1],
+            dim=1,
+        )
+        q_param = (
+            q_param.reshape(
+                tf_config.num_query_groups,
+                2,
+                value_num_per_group,
+                head_dim,
+                tf_config.hidden_size,
+            )
+            .transpose(1, 2)
+            .reshape(-1, tf_config.hidden_size)
+        )
+        k_param = k_param.reshape(-1, tf_config.hidden_size)
+        v_param = v_param.reshape(-1, tf_config.hidden_size)
+        return [
+            (f"{prefix}.self_attn.q_proj.weight", q_param),
+            (f"{prefix}.self_attn.k_proj.weight", k_param),
+            (f"{prefix}.self_attn.v_proj.weight", v_param),
+        ]
+    if rest == "self_attention.linear_qkv.bias":
+        p = param.view(tf_config.num_query_groups, -1)
+        q_bias, k_bias, v_bias = torch.split(
+            p,
+            split_size_or_sections=[
+                2 * value_num_per_group * head_dim,
+                head_dim,
+                head_dim,
+            ],
+            dim=1,
+        )
+        q_bias = (
+            q_bias.view(tf_config.num_query_groups, 2, value_num_per_group, head_dim)
+            .transpose(1, 2)
+            .reshape(-1)
+            .contiguous()
+        )
+        k_bias = k_bias.contiguous().flatten()
+        v_bias = v_bias.contiguous().flatten()
+        return [
+            (f"{prefix}.self_attn.q_proj.bias", q_bias),
+            (f"{prefix}.self_attn.k_proj.bias", k_bias),
+            (f"{prefix}.self_attn.v_proj.bias", v_bias),
+        ]
+
+    if rest == "mlp.linear_fc1.weight":
+        gate_weight, up_weight = param.chunk(2, dim=0)
+        return [
+            (f"{prefix}.mlp.gate_proj.weight", gate_weight),
+            (f"{prefix}.mlp.up_proj.weight", up_weight),
+        ]
+    if rest == "mlp.linear_fc2.weight":
+        return [(f"{prefix}.mlp.down_proj.weight", param)]
+    if rest == "self_attention.linear_qkv.layer_norm_weight":
+        return [(f"{prefix}.input_layernorm.weight", param)]
+    if rest == "mlp.linear_fc1.layer_norm_weight":
+        return [(f"{prefix}.post_attention_layernorm.weight", param)]
+    if rest == "pre_mlp_layernorm.weight":
+        return [(f"{prefix}.post_attention_layernorm.weight", param)]
+    if rest == "mlp.router.weight":
+        return [(f"{prefix}.mlp.gate.weight", param)]
+    if rest == "mlp.router.expert_bias":
+        return [(f"{prefix}.mlp.gate.e_score_correction_bias", param)]
+
+    # qk norm for full-attention layers
+    if rest == "self_attention.q_layernorm.weight":
+        return [(f"{prefix}.self_attn.q_norm.weight", param)]
+    if rest == "self_attention.k_layernorm.weight":
+        return [(f"{prefix}.self_attn.k_norm.weight", param)]
+
+    # Qwen3.5 linear-attention and direct passthrough attention params.
+    if rest.startswith("self_attention.") and rest[len("self_attention.") :] in [
+        "input_layernorm.weight",
+        "linear_attn.A_log",
+        "linear_attn.conv1d.weight",
+        "linear_attn.dt_bias",
+        "linear_attn.in_proj_a.weight",
+        "linear_attn.in_proj_b.weight",
+        "linear_attn.in_proj_qkv.weight",
+        "linear_attn.in_proj_z.weight",
+        "linear_attn.norm.weight",
+        "linear_attn.out_proj.weight",
+        "self_attn.k_norm.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.o_proj.weight",
+        "self_attn.q_norm.weight",
+        "self_attn.q_proj.weight",
+        "self_attn.v_proj.weight",
+    ]:
+        mapped_rest = rest[len("self_attention.") :]
+        return [(f"{prefix}.{mapped_rest}", param)]
+
+    raise ValueError(f"Unknown parameter name: {name}")
+
+
 def _vision_qkv_mcore_to_hf(param: Tensor, vision_num_heads: int) -> Tensor:
     """Convert vision encoder QKV from mcore interleaved to HF grouped format.
 
@@ -1241,8 +1434,8 @@ def convert_bailingmoe_to_hf(
 # A registry for conversion functions is more extensible.
 # Ordering matters: ``convert_to_hf`` dispatches on the FIRST substring hit, so
 # longer/more-specific keys MUST come before shorter ones that are substrings of
-# them. In particular, ``qwen3_vl_moe`` must precede ``qwen3_vl``,
-# ``qwen3_moe``, and ``qwen3``.
+# them. In particular, ``qwen3_vl_moe`` must precede ``qwen3_vl``, and
+# ``qwen3_5_moe`` / ``qwen3_moe`` must precede ``qwen3``.
 _CONVERSION_FN_REGISTRY = {
     "qwen3_lora": convert_qwen3_lora_to_hf,
     "qwen2_lora": convert_qwen3_lora_to_hf,
@@ -1250,8 +1443,8 @@ _CONVERSION_FN_REGISTRY = {
     "qwen2_5_vl": convert_qwen2_5_vl_to_hf,
     "qwen3_vl_moe": convert_qwen3_vl_moe_to_hf,
     "qwen3_vl": convert_qwen3_vl_to_hf,
+    "qwen3_5_moe": convert_qwen3_5_moe_to_hf,
     "qwen3_moe": convert_qwen3moe_to_hf,
-    "qwen3_5_moe": convert_qwen3moe_to_hf,
     "qwen2": convert_qwen2_to_hf,
     "qwen3": convert_qwen2_to_hf,
     "deepseekv3": convert_deepseekv3_to_hf,

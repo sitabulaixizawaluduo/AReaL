@@ -373,6 +373,7 @@ def convert_qwen3_5_moe_to_hf(
     tf_config: TransformerConfig,
     name: str,
     param: Parameter | Tensor | FP8BlockwiseTensorHelper,
+    hf_config=None,
 ):
     """Convert Qwen3.5-MoE Megatron parameters to HuggingFace format.
 
@@ -382,6 +383,8 @@ def convert_qwen3_5_moe_to_hf(
     - full-attention fused ``linear_qkv`` with gated-Q (q+gate interleaving)
     - MoE (including grouped fused-expert runtime format)
     """
+    freeze_vision_model = bool(getattr(tf_config, "freeze_vision_model", False))
+
     if name == "module.module.embedding.word_embeddings.weight":
         return [("model.language_model.embed_tokens.weight", param)]
     if name == "module.module.output_layer.weight":
@@ -395,6 +398,70 @@ def convert_qwen3_5_moe_to_hf(
         return [("lm_head.weight", param)]
     if name == "module.module.language_model.decoder.final_layernorm.weight":
         return [("model.language_model.norm.weight", param)]
+
+    if name.startswith("module.module.visual."):
+        if freeze_vision_model:
+            return []
+        return [(name[len("module.module.") :], param)]
+
+    vision_direct = {
+        "module.module.vision_model.patch_embed.proj.weight": "model.visual.patch_embed.proj.weight",
+        "module.module.vision_model.patch_embed.proj.bias": "model.visual.patch_embed.proj.bias",
+        "module.module.vision_model.pos_embed.weight": "model.visual.pos_embed.weight",
+        "module.module.vision_model.merger.norm.weight": "model.visual.merger.norm.weight",
+        "module.module.vision_model.merger.norm.bias": "model.visual.merger.norm.bias",
+        "module.module.vision_model.merger.linear_fc1.weight": "model.visual.merger.linear_fc1.weight",
+        "module.module.vision_model.merger.linear_fc1.bias": "model.visual.merger.linear_fc1.bias",
+        "module.module.vision_model.merger.linear_fc2.weight": "model.visual.merger.linear_fc2.weight",
+        "module.module.vision_model.merger.linear_fc2.bias": "model.visual.merger.linear_fc2.bias",
+    }
+    if name in vision_direct:
+        if freeze_vision_model:
+            return []
+        return [(vision_direct[name], param)]
+
+    vision_match = re.match(r"module\.module\.vision_model\.blocks\.(\d+)\.(.+)", name)
+    if vision_match:
+        if freeze_vision_model:
+            return []
+        layer_idx, rest = vision_match.groups()
+        base = f"model.visual.blocks.{layer_idx}"
+        if rest in (
+            "attn.qkv.weight",
+            "attn.qkv.bias",
+        ):
+            vision_num_heads = getattr(
+                getattr(hf_config, "vision_config", None), "num_heads", None
+            )
+            if vision_num_heads is None:
+                raise ValueError(
+                    "hf_config.vision_config.num_heads is required for Qwen3.5-MoE "
+                    "vision QKV conversion. Pass hf_config to convert_to_hf()."
+                )
+            param = _vision_qkv_mcore_to_hf(param, vision_num_heads)
+            kind = "weight" if rest.endswith("weight") else "bias"
+            return [(f"{base}.attn.qkv.{kind}", param)]
+        if rest == "attn.proj.weight":
+            return [(f"{base}.attn.proj.weight", param)]
+        if rest == "attn.proj.bias":
+            return [(f"{base}.attn.proj.bias", param)]
+        if rest == "norm1.weight":
+            return [(f"{base}.norm1.weight", param)]
+        if rest == "norm1.bias":
+            return [(f"{base}.norm1.bias", param)]
+        if rest == "norm2.weight":
+            return [(f"{base}.norm2.weight", param)]
+        if rest == "norm2.bias":
+            return [(f"{base}.norm2.bias", param)]
+        if rest == "mlp.linear_fc1.weight":
+            return [(f"{base}.mlp.linear_fc1.weight", param)]
+        if rest == "mlp.linear_fc1.bias":
+            return [(f"{base}.mlp.linear_fc1.bias", param)]
+        if rest == "mlp.linear_fc2.weight":
+            return [(f"{base}.mlp.linear_fc2.weight", param)]
+        if rest == "mlp.linear_fc2.bias":
+            return [(f"{base}.mlp.linear_fc2.bias", param)]
+        raise ValueError(f"Unknown Qwen3.5-MoE vision parameter name: {name}")
 
     try:
         head_dim = (

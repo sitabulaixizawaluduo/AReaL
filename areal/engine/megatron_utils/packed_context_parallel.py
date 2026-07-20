@@ -75,8 +75,10 @@ def split_packed_seqs_for_context_parallel(
     tensor: torch.Tensor,
     cu_seqlens: torch.Tensor,
 ) -> torch.Tensor:
-    """Split a 1D packed tensor using the same interleaved pattern as
-    preprocess_packed_seqs_context_parallel."""
+    """Split a packed tensor on dim-0 with the same zigzag CP pattern.
+
+    Supports both 1D tensors ``[N]`` and per-token tensors ``[N, ...]``.
+    """
     cp_size = mpu.get_context_parallel_world_size()
     cp_rank = mpu.get_context_parallel_rank()
     if cp_size <= 1:
@@ -85,8 +87,8 @@ def split_packed_seqs_for_context_parallel(
     input_lens = cu_seqlens[1:] - cu_seqlens[:-1]
     batch_size = input_lens.shape[0]
     output_len = input_lens.sum().item() // cp_size
-
-    splitted = torch.zeros(output_len, dtype=tensor.dtype, device=tensor.device)
+    output_shape = (output_len, *tensor.shape[1:])
+    splitted = torch.zeros(output_shape, dtype=tensor.dtype, device=tensor.device)
     for i in range(batch_size):
         seqlen = input_lens[i] // cp_size
         half_seqlen = seqlen // 2
@@ -289,6 +291,7 @@ def packed_context_parallel_forward(
     gather_cp_output: bool = True,
     is_vision_model: bool = False,
     use_padded_seq: bool = False,
+    vision_use_packed_thd: bool = False,
 ):
     input_ids = input_["input_ids"]
     position_ids = input_.get("position_ids", None)
@@ -306,7 +309,7 @@ def packed_context_parallel_forward(
     has_vision_inputs = is_vision_model and any(
         key in input_ for key in _VLM_FORWARD_KEYS
     )
-    # Padded-vs-packed routing is keyed on the MODEL type:
+    # Padded-vs-packed routing is keyed on the model type:
     # - VLM models cannot consume the wrapper-packed [1, total_len] layout
     #   (their internal packing needs a per-sequence 2D mask — mbridge
     #   crashes on the missing mask and megatron-bridge silently corrupts
@@ -314,7 +317,10 @@ def packed_context_parallel_forward(
     #   branch too.
     # - Architectures whose attention/SSM kernels reject packed sequences
     #   (use_padded_seq, e.g. Qwen3.5 GDN) must run on [B, S] padded input.
-    needs_padded_form = is_vision_model or use_padded_seq
+    # - Qwen3.5-MoE mbridge VLM explicitly supports packed THD + CP.
+    needs_padded_form = use_padded_seq or (
+        is_vision_model and not vision_use_packed_thd
+    )
 
     # Track shape metadata so the output can be repacked back to packed
     # [total_len, ...] form on the last PP stage.
@@ -326,10 +332,20 @@ def packed_context_parallel_forward(
                 raise ValueError(
                     "Attention mask should be None when using packed sequences."
                 )
+            packed_total_len = int(cu_seqlens[-1].item())
             input_ids, packed_seq_params = preprocess_packed_seqs_context_parallel(
                 input_ids, cu_seqlens
             )
             input_ids = input_ids.contiguous()
+            if (
+                position_ids is not None
+                and torch.is_tensor(position_ids)
+                and position_ids.shape[0] == packed_total_len
+            ):
+                position_ids = split_packed_seqs_for_context_parallel(
+                    position_ids,
+                    cu_seqlens,
+                )
         else:
             # VLM and BSHD-only models expect [B, S] padded input. Reconstruct
             # padded 2D tensors from packed 1D via boolean masking — avoids
@@ -353,6 +369,16 @@ def packed_context_parallel_forward(
             input_ids_2d[attention_mask] = input_ids
             input_ids = input_ids_2d
             padded_repack_info = (cu_seqlens, seq_lens, max_seqlen)
+
+    if (
+        vision_use_packed_thd
+        and position_ids is not None
+        and torch.is_tensor(position_ids)
+        and position_ids.ndim == 2
+        and position_ids.shape[-1] == 3
+    ):
+        # packed [total_local_tokens, 3] -> mcore mrope [3, 1, total_local_tokens]
+        position_ids = position_ids.transpose(0, 1).unsqueeze(1).contiguous()
 
     # Every VLM forward is mask-free (attention_mask=None): the model
     # computes (m)RoPE positions internally, each batch slot holds one

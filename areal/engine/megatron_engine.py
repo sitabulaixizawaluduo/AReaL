@@ -94,6 +94,7 @@ from areal.models.mcore.hf_save import (
     save_critic_value_head,
     save_weights_to_hf_with_mbridge_fast,
 )
+from areal.models.mcore.qwen3_5_vl_model import build_qwen3_5_segment_position_ids
 from areal.models.mcore.registry import make_hf_and_mcore_config, make_mcore_model
 from areal.models.tree_attn.functional import (
     _gather_packed_tree_logprobs,
@@ -215,6 +216,7 @@ class MegatronEngine(TrainEngine):
         self.bridge_cls: str = getattr(self.mcore_config, "bridge_type", "mbridge")
         self.bridge_lora: MegatronBridgeLoRA | None = None
         self.is_vision_model: bool = False
+        self.vision_use_packed_thd: bool = False
         self.processor = None
 
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
@@ -352,26 +354,28 @@ class MegatronEngine(TrainEngine):
             )
 
             self.is_vision_model = is_valid_vision_model(self.hf_config.model_type)
-            # GDN/SSM models (e.g. Qwen3.5) reject packed THD input and must run
-            # the padded BSHD forward. Derived from model type rather than a
-            # config flag so the layout can't be mis-set.
             self.use_padded_seq = requires_padded_seq(self.hf_config.model_type)
+            self.vision_use_packed_thd = False
             if self.bridge_cls == "mbridge" and is_qwen3_5_model(
                 self.hf_config.model_type
             ):
-                # The mbridge registry path builds a text-only GPTModel (no
-                # vision tower) whose GDN module consumes packed THD input via
-                # fla varlen kernels, so neither the VLM padded routing nor the
-                # padded-BSHD requirement of the megatron-bridge path applies.
-                self.is_vision_model = False
+                # Qwen3.5 mbridge path keeps packed THD for both text-only and
+                # multimodal runs.
                 self.use_padded_seq = False
-                self.logger.info(
-                    f"mbridge path for {self.hf_config.model_type}: training the "
-                    "text-only GPTModel with packed sequences (vision tower is "
-                    "not built; vision checkpoint weights pass through untouched)."
+                self.vision_use_packed_thd = self.is_vision_model and hasattr(
+                    self.hf_config, "vision_config"
                 )
+                if self.vision_use_packed_thd:
+                    self.logger.info(
+                        "mbridge path for %s: enabling packed THD multimodal data "
+                        "routing with context parallelism.",
+                        self.hf_config.model_type,
+                    )
             if self.is_vision_model:
-                if self.parallel_strategy.context_parallel_size > 1:
+                if (
+                    self.parallel_strategy.context_parallel_size > 1
+                    and not self.vision_use_packed_thd
+                ):
                     raise NotImplementedError(
                         "Context parallel (CP > 1) is not supported with VLM models. "
                         f"Got context_parallel_size={self.parallel_strategy.context_parallel_size} "
@@ -396,6 +400,9 @@ class MegatronEngine(TrainEngine):
 
             self.quantization_config = getattr(
                 self.hf_config, "quantization_config", None
+            )
+            self.tf_config.freeze_vision_model = bool(
+                getattr(self.mcore_config, "freeze_vision_model", False)
             )
 
             self._check_and_apply_fp8_config()
@@ -568,6 +575,9 @@ class MegatronEngine(TrainEngine):
                 self.config.path, trust_remote_code=True
             )
             self.bridge.dtype = self.dtype
+            self.bridge.freeze_vision_model = bool(
+                getattr(self.mcore_config, "freeze_vision_model", False)
+            )
             if self.config.gradient_checkpointing:
                 self.bridge.set_extra_args(
                     recompute_granularity=self.mcore_config.recompute_granularity,
@@ -948,6 +958,7 @@ class MegatronEngine(TrainEngine):
                 gather_cp_output=not cp_local,
                 is_vision_model=self.is_vision_model,
                 use_padded_seq=self.use_padded_seq,
+                vision_use_packed_thd=self.vision_use_packed_thd,
             )
 
             # Release tree attention metadata after forward pass
@@ -1917,6 +1928,11 @@ class MegatronEngine(TrainEngine):
         for name, param in get_named_parameters(self.model, num_moe_experts):
             if ".experts." in name and not self.config.use_lora:
                 continue
+            if (
+                getattr(self.mcore_config, "freeze_vision_model", False)
+                and ".vision_model." in name
+            ):
+                continue
             if self.config.use_lora and (
                 ".adapter." not in name or not getattr(param, "requires_grad", False)
             ):
@@ -2233,7 +2249,8 @@ class MegatronEngine(TrainEngine):
                     f" minimum ({recommended_min_n_mbs}) to avoid pipeline bubbles."
                 )
             return mb_list
-        # Amend position ids (skip for VLM — model computes mRoPE internally)
+        # Amend position ids for text-only paths. Qwen3.5 packed VLM builds
+        # explicit 3D mRoPE position ids later on packed micro-batches.
         if not self.is_vision_model:
             input_ = amend_position_ids(input_)
         # Split the input into micro-batches
@@ -2300,6 +2317,19 @@ class MegatronEngine(TrainEngine):
         if self.is_vision_model:
             for mb, padded_mb in zip(mb_list.mbs, mb_list.padded_mbs):
                 extract_vision_from_multi_modal(mb, padded_mb)
+                if self.vision_use_packed_thd:
+                    if padded_mb["input_ids"].dtype != torch.long:
+                        padded_mb["input_ids"] = padded_mb["input_ids"].to(torch.long)
+                    padded_mb["position_ids"] = build_qwen3_5_segment_position_ids(
+                        packed_input_ids=padded_mb["input_ids"],
+                        cu_seqlens=padded_mb["cu_seqlens"],
+                        spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
+                        image_token_id=self.hf_config.image_token_id,
+                        video_token_id=self.hf_config.video_token_id,
+                        vision_start_token_id=self.hf_config.vision_start_token_id,
+                        image_grid_thw=padded_mb.get("image_grid_thw"),
+                        video_grid_thw=padded_mb.get("video_grid_thw"),
+                    )
             mb_list.data = {
                 k: v
                 for k, v in mb_list.data.items()

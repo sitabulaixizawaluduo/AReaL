@@ -973,6 +973,14 @@ class MegatronEngineConfig:
         },
     )
 
+    freeze_vision_model: bool = field(
+        default=False,
+        metadata={
+            "help": "Freeze Qwen3.5 vision tower parameters. When enabled, "
+            "vision gradients are disabled and live weight sync skips vision tensors."
+        },
+    )
+
     use_mbridge_save: bool = field(
         default=False,
         metadata={

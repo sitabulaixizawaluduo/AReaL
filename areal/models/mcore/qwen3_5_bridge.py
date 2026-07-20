@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import inspect
+from collections.abc import Callable
 
 import torch
 from mbridge.core import LLMBridge, register_model
@@ -8,6 +9,13 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
 
 from areal.models.mcore.qwen3_5 import make_mcore_layer_specs_qwen3_5_moe
+
+try:
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        Qwen3_5MoeVisionModel,
+    )
+except ImportError:  # pragma: no cover
+    Qwen3_5MoeVisionModel = None
 
 
 def _get_text_config(hf_config):
@@ -19,11 +27,63 @@ class Qwen3_5MoeBridge(LLMBridge):
     """mbridge bridge for Qwen3.5-MoE text model path on top of a VL checkpoint."""
 
     TransformerConfigClass = TransformerConfig
+    HfVisionClass: type | None = Qwen3_5MoeVisionModel
 
     _DIRECT_MAPPING = {
         "embedding.word_embeddings.weight": "model.language_model.embed_tokens.weight",
+        "language_model.embedding.word_embeddings.weight": "model.language_model.embed_tokens.weight",
         "decoder.final_layernorm.weight": "model.language_model.norm.weight",
+        "language_model.decoder.final_layernorm.weight": "model.language_model.norm.weight",
         "output_layer.weight": "lm_head.weight",
+        "language_model.output_layer.weight": "lm_head.weight",
+        "vision_model.patch_embed.proj.weight": "model.visual.patch_embed.proj.weight",
+        "vision_model.patch_embed.proj.bias": "model.visual.patch_embed.proj.bias",
+        "vision_model.pos_embed.weight": "model.visual.pos_embed.weight",
+        "vision_model.merger.norm.weight": "model.visual.merger.norm.weight",
+        "vision_model.merger.norm.bias": "model.visual.merger.norm.bias",
+        "vision_model.merger.linear_fc1.weight": "model.visual.merger.linear_fc1.weight",
+        "vision_model.merger.linear_fc1.bias": "model.visual.merger.linear_fc1.bias",
+        "vision_model.merger.linear_fc2.weight": "model.visual.merger.linear_fc2.weight",
+        "vision_model.merger.linear_fc2.bias": "model.visual.merger.linear_fc2.bias",
+    }
+
+    _VISUAL_MAPPING = {
+        "vision_model.blocks.{layer_number}.attn.proj.weight": [
+            "model.visual.blocks.{layer_number}.attn.proj.weight"
+        ],
+        "vision_model.blocks.{layer_number}.attn.proj.bias": [
+            "model.visual.blocks.{layer_number}.attn.proj.bias"
+        ],
+        "vision_model.blocks.{layer_number}.attn.qkv.weight": [
+            "model.visual.blocks.{layer_number}.attn.qkv.weight"
+        ],
+        "vision_model.blocks.{layer_number}.attn.qkv.bias": [
+            "model.visual.blocks.{layer_number}.attn.qkv.bias"
+        ],
+        "vision_model.blocks.{layer_number}.mlp.linear_fc1.weight": [
+            "model.visual.blocks.{layer_number}.mlp.linear_fc1.weight"
+        ],
+        "vision_model.blocks.{layer_number}.mlp.linear_fc1.bias": [
+            "model.visual.blocks.{layer_number}.mlp.linear_fc1.bias"
+        ],
+        "vision_model.blocks.{layer_number}.mlp.linear_fc2.weight": [
+            "model.visual.blocks.{layer_number}.mlp.linear_fc2.weight"
+        ],
+        "vision_model.blocks.{layer_number}.mlp.linear_fc2.bias": [
+            "model.visual.blocks.{layer_number}.mlp.linear_fc2.bias"
+        ],
+        "vision_model.blocks.{layer_number}.norm1.weight": [
+            "model.visual.blocks.{layer_number}.norm1.weight"
+        ],
+        "vision_model.blocks.{layer_number}.norm1.bias": [
+            "model.visual.blocks.{layer_number}.norm1.bias"
+        ],
+        "vision_model.blocks.{layer_number}.norm2.weight": [
+            "model.visual.blocks.{layer_number}.norm2.weight"
+        ],
+        "vision_model.blocks.{layer_number}.norm2.bias": [
+            "model.visual.blocks.{layer_number}.norm2.bias"
+        ],
     }
 
     _ATTENTION_MAPPING = {
@@ -150,6 +210,9 @@ class Qwen3_5MoeBridge(LLMBridge):
             self._DIRECT_MAPPING["output_layer.weight"] = (
                 "model.language_model.embed_tokens.weight"
             )
+            self._DIRECT_MAPPING["language_model.output_layer.weight"] = (
+                "model.language_model.embed_tokens.weight"
+            )
 
     def _build_config(self):
         text_config = _get_text_config(self.hf_config)
@@ -187,6 +250,10 @@ class Qwen3_5MoeBridge(LLMBridge):
         )
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
+        rope_parameters = getattr(text_config, "rope_parameters", None) or {}
+        if self._supports_transformer_config_kwarg("mrope_section"):
+            kwargs["mrope_section"] = rope_parameters.get("mrope_section", [11, 11, 10])
+
         if self._supports_transformer_config_kwarg("use_gated_attention"):
             kwargs["use_gated_attention"] = True
 
@@ -219,6 +286,12 @@ class Qwen3_5MoeBridge(LLMBridge):
         if mcore_weights_name in self._DIRECT_MAPPING:
             return [self._DIRECT_MAPPING[mcore_weights_name]]
 
+        if mcore_weights_name.startswith("vision_model."):
+            return self._weight_name_mapping_visual(mcore_weights_name)
+
+        if mcore_weights_name.startswith("language_model."):
+            mcore_weights_name = mcore_weights_name.removeprefix("language_model.")
+
         if (
             "self_attention" in mcore_weights_name
             or "input_layernorm.weight" in mcore_weights_name
@@ -227,6 +300,67 @@ class Qwen3_5MoeBridge(LLMBridge):
         if "mlp" in mcore_weights_name or "pre_mlp_layernorm" in mcore_weights_name:
             return self._weight_name_mapping_mlp(mcore_weights_name)
         raise NotImplementedError(f"Unsupported parameter name: {mcore_weights_name}")
+
+    def _weight_name_mapping_visual(self, name: str) -> list[str]:
+        split_name = name.split(".")
+        layer_number = split_name[2]
+        split_name[2] = "{layer_number}"
+        key = ".".join(split_name)
+        mapping_names = self._VISUAL_MAPPING[key]
+        convert_names = [x.format(layer_number=layer_number) for x in mapping_names]
+        if not convert_names:
+            raise NotImplementedError(f"Unsupported visual parameter: {name}")
+        return convert_names
+
+    def _convert_vision_qkv_hf_to_mcore(
+        self,
+        mcore_weights_name: str,
+        hf_weights: list[torch.Tensor],
+    ) -> torch.Tensor:
+        x = hf_weights[0]
+        vision_num_heads = self.hf_config.vision_config.num_heads
+        head_dim = self.hf_config.vision_config.hidden_size // vision_num_heads
+        is_bias = ".bias" in mcore_weights_name
+
+        if is_bias:
+            q, k, v = x.view(3, vision_num_heads, head_dim)
+            return torch.cat(
+                [
+                    q.reshape(vision_num_heads, head_dim),
+                    k.reshape(vision_num_heads, head_dim),
+                    v.reshape(vision_num_heads, head_dim),
+                ],
+                dim=1,
+            ).reshape(-1)
+
+        hidden_size = x.shape[-1]
+        q, k, v = x.view(3, vision_num_heads, head_dim, hidden_size)
+        return torch.cat(
+            [
+                q.reshape(vision_num_heads, head_dim, hidden_size),
+                k.reshape(vision_num_heads, head_dim, hidden_size),
+                v.reshape(vision_num_heads, head_dim, hidden_size),
+            ],
+            dim=1,
+        ).reshape(-1, hidden_size)
+
+    def _convert_vision_qkv_mcore_to_hf(
+        self,
+        mcore_weights_name: str,
+        mcore_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        vision_num_heads = self.hf_config.vision_config.num_heads
+        hidden_vision = mcore_weights.shape[0] // 3
+        head_dim = hidden_vision // vision_num_heads
+        is_bias = ".bias" in mcore_weights_name
+
+        if is_bias:
+            x = mcore_weights.view(vision_num_heads, 3, head_dim)
+            return x.permute(1, 0, 2).contiguous().view(-1)
+
+        in_features = mcore_weights.shape[-1]
+        x = mcore_weights.view(vision_num_heads, 3, head_dim, in_features)
+        return x.permute(1, 0, 2, 3).contiguous().view(-1, in_features)
 
     def _weight_name_mapping_attention(self, name: str) -> list[str]:
         layer_number = name.split(".")[2]
@@ -266,6 +400,13 @@ class Qwen3_5MoeBridge(LLMBridge):
     def _weight_to_mcore_format(
         self, mcore_weights_name: str, hf_weights: list[torch.Tensor]
     ):
+        if (
+            mcore_weights_name.startswith("vision_model.blocks.")
+            and ".attn.qkv." in mcore_weights_name
+            and len(hf_weights) == 1
+        ):
+            return self._convert_vision_qkv_hf_to_mcore(mcore_weights_name, hf_weights)
+
         # Full-attention q_proj in Qwen3.5 stores [query, gate] interleaved per query head.
         if (
             "self_attention.linear_qkv." in mcore_weights_name
@@ -317,6 +458,15 @@ class Qwen3_5MoeBridge(LLMBridge):
         hf_names = self._weight_name_mapping_mcore_to_hf(mcore_weights_name)
 
         if (
+            mcore_weights_name.startswith("vision_model.blocks.")
+            and ".attn.qkv." in mcore_weights_name
+            and len(hf_names) == 1
+        ):
+            return hf_names, [
+                self._convert_vision_qkv_mcore_to_hf(mcore_weights_name, mcore_weights)
+            ]
+
+        if (
             "self_attention.linear_qkv." in mcore_weights_name
             and "layer_norm" not in mcore_weights_name
             and len(hf_names) == 3
@@ -364,3 +514,64 @@ class Qwen3_5MoeBridge(LLMBridge):
             return hf_names, [q, k, v]
 
         return super()._weight_to_hf_format(mcore_weights_name, mcore_weights)
+
+    def _model_provider(
+        self, post_model_creation_callbacks: list[Callable[[torch.nn.Module], None]]
+    ):
+        share_embeddings_and_output_weights = getattr(
+            _get_text_config(self.hf_config), "tie_word_embeddings", False
+        )
+
+        def provider(pre_process, post_process, vp_stage=None):
+            if not hasattr(self.hf_config, "vision_config"):
+                return super(Qwen3_5MoeBridge, self)._model_provider(
+                    post_model_creation_callbacks
+                )(pre_process, post_process, vp_stage=vp_stage)
+
+            from areal.models.mcore.qwen3_5_vl_model import Qwen3_5MoeVLModel
+
+            if self.HfVisionClass is None:
+                raise ImportError(
+                    "Qwen3_5MoeVisionModel is unavailable. Please install a transformers "
+                    "build that includes qwen3_5_moe vision classes."
+                )
+
+            transformer_layer_spec = self._get_transformer_layer_spec(vp_stage)
+            text_config = _get_text_config(self.hf_config)
+            rope_parameters = getattr(text_config, "rope_parameters", None) or {}
+            model = Qwen3_5MoeVLModel(
+                language_transformer_config=self.config,
+                language_transformer_layer_spec=transformer_layer_spec,
+                language_vocab_size=text_config.vocab_size,
+                language_max_sequence_length=text_config.max_position_embeddings,
+                hf_config=self.hf_config,
+                hf_vision_cls=self.HfVisionClass,
+                parallel_output=True,
+                language_rotary_percent=getattr(
+                    text_config, "partial_rotary_factor", 1.0
+                ),
+                language_rotary_base=rope_parameters.get(
+                    "rope_theta",
+                    getattr(text_config, "rope_theta", 10000.0),
+                ),
+                pre_process=pre_process,
+                post_process=post_process,
+                fp16_lm_cross_entropy=False,
+                language_share_embeddings_and_output_weights=share_embeddings_and_output_weights,
+                image_token_id=self.hf_config.image_token_id,
+                video_token_id=self.hf_config.video_token_id,
+                vision_start_token_id=self.hf_config.vision_start_token_id,
+                freeze_vision_model=getattr(self, "freeze_vision_model", False),
+            )
+
+            for callback in post_model_creation_callbacks:
+                callback(
+                    model,
+                    pre_process=pre_process,
+                    post_process=post_process,
+                    config=self.config,
+                    hf_config=self.hf_config,
+                )
+            return model
+
+        return provider

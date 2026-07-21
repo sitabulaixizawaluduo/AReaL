@@ -31,6 +31,9 @@ MODEL_PATHS = {
     "qwen3moe": MOE_MODEL_PATHS["qwen3_moe"],
     "qwen3_5": DENSE_MODEL_PATHS["qwen3_5"],
     "qwen3_5_moe": MOE_MODEL_PATHS["qwen3_5_moe"],
+    # Tiny random-init Qwen3.5-MoE for small-topology isolation runs;
+    # generate with tests/make_tiny_qwen3_5_moe.py first.
+    "qwen3_5_moe_tiny": os.environ.get("TINY_QWEN35_MOE_PATH", "/tmp/qwen3_5_moe_tiny"),
 }
 
 # bridge_type must default to mbridge for backwards compat with existing
@@ -40,6 +43,7 @@ MODEL_PATHS = {
 _MODEL_BRIDGE_OVERRIDES = {
     "qwen3_5": "megatron-bridge",
     "qwen3_5_moe": "megatron-bridge",
+    "qwen3_5_moe_tiny": "megatron-bridge",
 }
 
 # Models large enough that a full-AdamW optimizer state does not fit even when
@@ -68,11 +72,21 @@ def write_result(out: str, succ: bool):
             f.write("Failed")
 
 
+def _model_vocab_size(model_type: str) -> int:
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(MODEL_PATHS[model_type], trust_remote_code=True)
+    if hasattr(config, "get_text_config"):
+        config = config.get_text_config()
+    return config.vocab_size
+
+
 def mock_input(
     batch_size=128,
     min_seqlen=1,
     max_seqlen=1024,
     device=current_platform.device_type,
+    vocab_size=None,
 ) -> dict[str, Any]:
     """Create mock padded input data (same format for huggingface) for testing.
     Returns a dict with input_ids, attention_mask, and position_ids.
@@ -82,8 +96,17 @@ def mock_input(
         min_seqlen, max_seqlen, (batch_size,), dtype=torch.int, device=device
     )
     max_seqlen = int(max(seqlens))
+    # Keep the historical [10000, 50000) range for full-size models so seeded
+    # baselines stay comparable; only clamp for small-vocab (tiny) models
+    # where those ids would index out of bounds in the embedding. The top 64
+    # ids are reserved: tiny checkpoints park the family's vision/video
+    # special tokens there, and sampling one would trigger vision fusion on
+    # a batch with no pixel data.
+    low, high = 10000, 50000
+    if vocab_size is not None and vocab_size < high:
+        low, high = 2, vocab_size - 64
     input_ids = torch.randint(
-        10000, 50000, (batch_size, max_seqlen), dtype=torch.long, device=device
+        low, high, (batch_size, max_seqlen), dtype=torch.long, device=device
     )
     attn_mask = torch.zeros((batch_size, max_seqlen), dtype=torch.bool, device=device)
 
@@ -151,7 +174,12 @@ def test_forward(
     engine = make_engine(model_type, alloc_mode, mb_spec, vpp_size=vpp_size)
     seeding.set_random_seed(0, key=f"trainer{rank}")
 
-    input_ = mock_input(batch_size=16, max_seqlen=128, device=engine.device)
+    input_ = mock_input(
+        batch_size=16,
+        max_seqlen=128,
+        device=engine.device,
+        vocab_size=_model_vocab_size(model_type),
+    )
     print(f"rank {rank} is_data_parallel_head()={engine.is_data_parallel_head()}")
     bcasted_input = broadcast_tensor_container(
         input_,
@@ -251,7 +279,12 @@ def test_train(
     )
     seeding.set_random_seed(0, key=f"trainer{rank}")
 
-    input_ = mock_input(batch_size=16, max_seqlen=128, device=engine.device)
+    input_ = mock_input(
+        batch_size=16,
+        max_seqlen=128,
+        device=engine.device,
+        vocab_size=_model_vocab_size(model_type),
+    )
     print(f"rank {rank} is_data_parallel_head()={engine.is_data_parallel_head()}")
     bcasted_input = broadcast_tensor_container(
         input_,
@@ -315,7 +348,10 @@ def test_grad_norm_mb_invariance(
         # Reset seed again before building the batch so input is identical.
         seeding.set_random_seed(0, key=f"data{rank}")
         input_ = mock_input(
-            batch_size=batch_size, max_seqlen=max_seqlen, device=engine.device
+            batch_size=batch_size,
+            max_seqlen=max_seqlen,
+            device=engine.device,
+            vocab_size=_model_vocab_size(model_type),
         )
         bcasted_input = broadcast_tensor_container(
             input_,
@@ -359,6 +395,61 @@ def test_grad_norm_mb_invariance(
     )
 
 
+def test_train_grad_norm_value(
+    model_type: str, alloc_mode: str, output: str | None = None, vpp_size: int = 1
+):
+    """Run one seeded train_batch and write the reported grad_norm to a file.
+
+    Companion of the CP-equivalence pytest: it launches this runner twice with
+    different allocation modes (e.g. ``d1p1t1`` vs ``d1p1t1c2``) and compares
+    the two written grad_norm values. Data is seeded on the DP head and
+    broadcast over the context-and-model-parallel group, so both invocations
+    train on the identical batch; weights are loaded from the same
+    checkpoint. The value lands in ``<output>.gradnorm``; the standard
+    pass/fail marker still goes to ``<output>``.
+    """
+    print(
+        f"running train_grad_norm_value: model_type={model_type} "
+        f"alloc_mode={alloc_mode}"
+    )
+    rank = int(os.environ["RANK"])
+    mb_spec = MicroBatchSpec(max_tokens_per_mb=4096)
+    seeding.set_random_seed(0, key=f"engine{rank}")
+    engine = make_engine(
+        model_type, alloc_mode, mb_spec, init_optimizer=True, vpp_size=vpp_size
+    )
+    seeding.set_random_seed(0, key=f"data{rank}")
+    input_ = mock_input(
+        batch_size=16,
+        max_seqlen=128,
+        device=engine.device,
+        vocab_size=_model_vocab_size(model_type),
+    )
+    bcasted_input = broadcast_tensor_container(
+        input_,
+        src_rank=engine.current_data_parallel_head(),
+        group=engine.context_and_model_parallel_group,
+    )
+    result = engine.train_batch(
+        input_=bcasted_input,
+        loss_fn=mock_loss_fn,
+        loss_weight_fn=lambda x: x["cu_seqlens"][-1],
+    )
+    grad_norm = float(result["grad_norm"])
+    print(f"rank {rank} alloc_mode={alloc_mode} grad_norm={grad_norm}")
+    current_platform.synchronize()
+    dist.barrier()
+    engine.destroy()
+    if rank == 0 and output is not None:
+        with open(str(output) + ".gradnorm", "w") as f:
+            f.write(repr(grad_norm))
+        write_result(output, True)
+    print(
+        f"Test: test_train_grad_norm_value(model_type={model_type}, "
+        f"alloc_mode={alloc_mode}) Done."
+    )
+
+
 def test_train_dcp_save_load(
     model_type: str, alloc_mode: str, output: str | None = None, vpp_size: int = 1
 ):
@@ -381,7 +472,12 @@ def test_train_dcp_save_load(
 
     seeding.set_random_seed(0, key=f"trainer{rank}")
 
-    input_ = mock_input(batch_size=16, max_seqlen=128, device=engine.device)
+    input_ = mock_input(
+        batch_size=16,
+        max_seqlen=128,
+        device=engine.device,
+        vocab_size=_model_vocab_size(model_type),
+    )
     print(f"rank {rank} is_data_parallel_head()={engine.is_data_parallel_head()}")
     bcasted_input = broadcast_tensor_container(
         input_,
@@ -568,7 +664,12 @@ def test_train_hf_save_load(
         # saved weights differ from the on-disk checkpoint. Skipped for models too
         # large to hold an optimizer (see _MODEL_SAVELOAD_SKIP_TRAIN); the loaded
         # HF weights are already non-trivial, so the round-trip stays meaningful.
-        input_ = mock_input(batch_size=16, max_seqlen=128, device=engine.device)
+        input_ = mock_input(
+            batch_size=16,
+            max_seqlen=128,
+            device=engine.device,
+            vocab_size=_model_vocab_size(model_type),
+        )
         bcasted_input = broadcast_tensor_container(
             input_,
             src_rank=engine.current_data_parallel_head(),
@@ -645,7 +746,7 @@ def main():
     parser.add_argument(
         "--model_type",
         type=str,
-        choices=["qwen3", "qwen3moe", "qwen3_5", "qwen3_5_moe"],
+        choices=["qwen3", "qwen3moe", "qwen3_5", "qwen3_5_moe", "qwen3_5_moe_tiny"],
         default="qwen3",
         help="Type of model to test",
     )
@@ -674,6 +775,7 @@ def main():
             "forward",
             "train",
             "grad_norm_mb_invariance",
+            "train_grad_norm_value",
             "simple_dcp_save_load",
             "train_dcp_save_load",
             "train_hf_save_load",
@@ -700,6 +802,13 @@ def main():
         )
     elif args.test_type == "grad_norm_mb_invariance":
         test_grad_norm_mb_invariance(
+            args.model_type,
+            args.backend,
+            output=args.output,
+            vpp_size=args.vpp_size,
+        )
+    elif args.test_type == "train_grad_norm_value":
+        test_train_grad_norm_value(
             args.model_type,
             args.backend,
             output=args.output,

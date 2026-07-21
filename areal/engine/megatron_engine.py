@@ -65,6 +65,10 @@ from areal.engine.core.model import (
     requires_padded_seq,
 )
 from areal.engine.megatron_utils import megatron_bridge_patches  # noqa: F401
+from areal.engine.megatron_utils.bshd_cp import (
+    build_bshd_cp_local_labels,
+    reconstruct_padded_2d,
+)
 from areal.engine.megatron_utils.checkpointer import MegatronCheckpointManager
 from areal.engine.megatron_utils.deterministic import set_deterministic_algorithms
 from areal.engine.megatron_utils.fp8 import FP8BlockwiseTensorHelper
@@ -74,11 +78,15 @@ from areal.engine.megatron_utils.megatron import (
     get_named_parameters,
     remove_padding,
 )
+from areal.engine.megatron_utils.megatron_bridge_patches import (
+    set_moe_aux_loss_backward_scale,
+)
 from areal.engine.megatron_utils.megatron_lora import get_vllm_lora_target_modules
 from areal.engine.megatron_utils.packed_context_parallel import (
     _is_multi_modal_payload_key,
     extract_vision_from_multi_modal,
     packed_context_parallel_forward,
+    reassemble_cp_bshd_logprobs,
     reassemble_cp_packed_logprobs,
     split_packed_seqs_for_context_parallel,
 )
@@ -104,7 +112,14 @@ from areal.models.tree_attn.module import (
     patch_bridge_for_tree_training,
 )
 from areal.models.tree_attn.tree import build_packed_tree_batch
-from areal.utils import logging, name_resolve, names, perf_tracer, stats_tracker
+from areal.utils import (
+    logging,
+    name_resolve,
+    names,
+    perf_tracer,
+    pkg_version,
+    stats_tracker,
+)
 from areal.utils.constants import (
     DEFAULT_VECTORIZED_ALIGNMENT_BYTES,
     DIST_GROUP_DEFAULT_TIMEOUT,
@@ -355,7 +370,15 @@ class MegatronEngine(TrainEngine):
             # config flag so the layout can't be mis-set.
             self.use_padded_seq = requires_padded_seq(self.hf_config.model_type)
             if self.is_vision_model:
-                if self.parallel_strategy.context_parallel_size > 1:
+                if (
+                    self.parallel_strategy.context_parallel_size > 1
+                    and not self.use_padded_seq
+                ):
+                    # Non-BSHD VLMs (qwen2/3-vl via mbridge) have no CP wiring
+                    # in their model definitions. BSHD models (Qwen3.5 via
+                    # megatron-bridge >= 0.5.0) may run with CP: the bridge
+                    # model itself computes mRoPE, fuses vision embeddings on
+                    # the full sequence, and zigzag-splits before the decoder.
                     raise NotImplementedError(
                         "Context parallel (CP > 1) is not supported with VLM models. "
                         f"Got context_parallel_size={self.parallel_strategy.context_parallel_size} "
@@ -370,13 +393,7 @@ class MegatronEngine(TrainEngine):
                 )
 
             if self.use_padded_seq and self.parallel_strategy.context_parallel_size > 1:
-                raise NotImplementedError(
-                    f"Context parallel (CP > 1) is not supported for "
-                    f"model_type={self.hf_config.model_type!r}, which requires the "
-                    "padded BSHD forward (it operates on [B, S] tensors while the "
-                    "CP path packs sequences). "
-                    f"Got context_parallel_size={self.parallel_strategy.context_parallel_size}."
-                )
+                self._validate_padded_seq_cp_support()
 
             self.quantization_config = getattr(
                 self.hf_config, "quantization_config", None
@@ -546,6 +563,61 @@ class MegatronEngine(TrainEngine):
                     )
                     glu_fc1_names.add(_normalize_glu_param_name(full_name))
         return glu_fc1_names
+
+    def _validate_padded_seq_cp_support(self) -> None:
+        """Validate CP prerequisites for models on the padded BSHD forward.
+
+        GDN/SSM hybrids (Qwen3.5 family) can run context parallel only when:
+        - megatron-core >= 0.18.0: GDN CP (all-to-all to head-parallel,
+          Megatron-LM PR #2642) and the gated-attention gate slicing fix
+          (PR #3529) first shipped in 0.18.0.
+        - The model is built via megatron-bridge (only its model definitions
+          wire up the GDN hybrid stack).
+        - cp_comm_type is unset: mcore's TransformerLayer forwards a non-None
+          cp_comm_type into the self-attention submodule constructor, and
+          GatedDeltaNet.__init__ does not accept it (Megatron-LM PR #4374 was
+          never merged) — a TypeError at build time.
+        - GDN linear attention heads are divisible by tp_size * cp_size.
+        """
+        cp_size = self.parallel_strategy.context_parallel_size
+        tp_size = self.parallel_strategy.tensor_parallel_size
+        if pkg_version.is_version_less("megatron-core", "0.18.0"):
+            raise NotImplementedError(
+                f"Context parallel (CP > 1) for model_type="
+                f"{self.hf_config.model_type!r} requires megatron-core>=0.18.0 "
+                "(GDN context parallel support), which first ships GDN CP "
+                "and the gated-attention gate fix."
+            )
+        if pkg_version.is_version_less("megatron-bridge", "0.5.0"):
+            raise NotImplementedError(
+                f"Context parallel (CP > 1) for model_type="
+                f"{self.hf_config.model_type!r} requires megatron-bridge>=0.5.0: "
+                "its Qwen3.5 model definitions carry the in-model CP wiring "
+                "(mRoPE on the full sequence, vision fusion, zigzag split "
+                "before the decoder)."
+            )
+        if self.bridge_cls != "megatron-bridge":
+            raise NotImplementedError(
+                f"Context parallel (CP > 1) for model_type="
+                f"{self.hf_config.model_type!r} requires bridge_type="
+                f"'megatron-bridge'; got {self.bridge_cls!r}."
+            )
+        cp_comm_type = getattr(self.tf_config, "cp_comm_type", None)
+        if cp_comm_type is not None:
+            raise NotImplementedError(
+                f"cp_comm_type={cp_comm_type!r} is not supported with GDN "
+                "hybrid models: mcore injects it into the self-attention "
+                "submodule and GatedDeltaNet does not accept it. Leave "
+                "cp_comm_type unset (None)."
+            )
+        text_cfg = lang_config(self.hf_config)
+        for attr in ("linear_num_key_heads", "linear_num_value_heads"):
+            heads = getattr(text_cfg, attr, None)
+            if heads is not None and heads % (tp_size * cp_size) != 0:
+                raise ValueError(
+                    f"{attr}={heads} must be divisible by tp_size*cp_size="
+                    f"{tp_size * cp_size} for GDN context parallelism."
+                )
 
     def _build_hf_mcore_bridge(self):
         if self.bridge_cls == "mbridge":
@@ -891,6 +963,12 @@ class MegatronEngine(TrainEngine):
     ) -> None:
         self._ensure_ready()
 
+        # Number of micro-batches in this forward-backward, used to match the
+        # MoE aux-loss backward scale to the main loss (see
+        # `_compute_logprobs_and_loss`). mcore's schedule applies an extra
+        # `cp_size / num_microbatches` to the 2-tuple main loss.
+        self._num_microbatches_in_batch = len(mb_list)
+
         def forward_step(batch_iter, model):
             mb_input: MicroBatchItem = next(batch_iter)
 
@@ -927,6 +1005,26 @@ class MegatronEngine(TrainEngine):
             # value, so the CP-local loss path (_cp_local_labels) is unchanged.
             cp_local = cp_size > 1 and not gather_cp_output
 
+            # Register the MoE router aux-loss backward scale on every pipeline
+            # stage (the loss function that computes it directly runs only on
+            # the last stage, so under PP>1 earlier stages would otherwise use a
+            # stale scale). No-op unless a training forward-backward stashed the
+            # weighting context. `is_cp_bshd` mirrors the last-stage flag set at
+            # `cp_inputs["_cp_bshd"]` below.
+            aux_ctx = getattr(self, "_aux_scale_ctx", None)
+            if not forward_only and aux_ctx is not None:
+                is_cp_bshd = (
+                    cp_local
+                    and cu_seqlens is not None
+                    and (self.use_padded_seq or self.is_vision_model)
+                )
+                self._register_moe_aux_loss_scale(
+                    aux_ctx["loss_weight_fn"](mb_input.orig_mb),
+                    aux_ctx["total_loss_weight"],
+                    aux_ctx["loss_multiplier"],
+                    is_cp_bshd,
+                )
+
             output = packed_context_parallel_forward(
                 model,
                 mb_input.padded_mb,
@@ -951,15 +1049,31 @@ class MegatronEngine(TrainEngine):
             ):
                 if cp_local and cu_seqlens is not None:
                     padded_cu_seqlens = mb_input.padded_mb["cu_seqlens"]
-                    rolled_ids = torch.roll(
-                        mb_input.padded_mb["input_ids"], shifts=-1, dims=-1
-                    )
-                    cp_labels = split_packed_seqs_for_context_parallel(
-                        rolled_ids, padded_cu_seqlens
-                    )
+                    if self.use_padded_seq or self.is_vision_model:
+                        # Padded BSHD CP path: logits arrive as the flattened
+                        # CP-local [B * S/cp, V] grid (padding included), so
+                        # labels are built on the same zigzag-split grid.
+                        input_ids_2d, _ = reconstruct_padded_2d(
+                            mb_input.padded_mb["input_ids"], padded_cu_seqlens
+                        )
+                        cp_labels = build_bshd_cp_local_labels(
+                            input_ids_2d,
+                            mpu.get_context_parallel_world_size(),
+                            mpu.get_context_parallel_rank(),
+                        )
+                        cp_is_bshd = True
+                    else:
+                        rolled_ids = torch.roll(
+                            mb_input.padded_mb["input_ids"], shifts=-1, dims=-1
+                        )
+                        cp_labels = split_packed_seqs_for_context_parallel(
+                            rolled_ids, padded_cu_seqlens
+                        )
+                        cp_is_bshd = False
                     cp_inputs = dict(mb_input.orig_mb)
                     cp_inputs["_cp_local_labels"] = cp_labels
                     cp_inputs["_cp_padded_cu_seqlens"] = padded_cu_seqlens
+                    cp_inputs["_cp_bshd"] = cp_is_bshd
                     cp_inputs["_cp_padding_length"] = mb_input.padding_length
                     cp_inputs["_cp_old_cu_seqlens"] = mb_input.old_cu_seqlens
                     return output, functools.partial(_process_output, cp_inputs)
@@ -1024,6 +1138,15 @@ class MegatronEngine(TrainEngine):
             mpu.get_data_parallel_world_size()
             * self.optimizer.get_loss_scale().item()
             * len(mb_list)
+        )
+
+        # Weighting context so every pipeline stage can register the MoE
+        # aux-loss backward scale in forward_step; the loss function that would
+        # compute it directly runs only on the last pipeline stage.
+        self._aux_scale_ctx = dict(
+            loss_weight_fn=loss_weight_fn,
+            total_loss_weight=total_loss_weight,
+            loss_multiplier=loss_multiplier,
         )
 
         def process_output(
@@ -1130,8 +1253,20 @@ class MegatronEngine(TrainEngine):
             outputs.append(result)
             return None
 
+        # CP output handling differs by layout:
+        # - Packed THD: gather CP-local LOGITS inside forward so downstream
+        #   split_with_sizes sees full sequences (legacy behavior).
+        # - Padded BSHD: NEVER gather logits — with large vocabularies the
+        #   [B, S, V] all-gather allocates tens of GiB and OOMs. Instead run
+        #   the CP-local path: compute logprobs on the local [B*S/cp, V] grid
+        #   and reassemble the 1D result in _compute_forward_result
+        #   (O(S) communication instead of O(S*V)).
+        gather_cp_output = not (self.use_padded_seq or self.is_vision_model)
         self.forward_backward_batch(
-            mb_list, process_output, forward_only=True, gather_cp_output=True
+            mb_list,
+            process_output,
+            forward_only=True,
+            gather_cp_output=gather_cp_output,
         )
 
         # Step 4: Aggregate, reorder, and broadcast outputs
@@ -1364,8 +1499,7 @@ class MegatronEngine(TrainEngine):
         )
 
     def _init_context_and_model_parallel_group(self) -> None:
-        # Initialize context and model parallel groups, which are only used in AReaL
-        # for data distribution
+        # Initialize context and model parallel groups for data distribution.
         rank_generator = mpu.RankGenerator(
             tp=self.parallel_strategy.tensor_parallel_size,
             ep=1,
@@ -2330,6 +2464,61 @@ class MegatronEngine(TrainEngine):
 
         return mb_list
 
+    def _main_loss_scale(
+        self,
+        local_weight: torch.Tensor,
+        total_loss_weight: torch.Tensor,
+        loss_multiplier: float,
+        is_cp_bshd: bool,
+    ) -> torch.Tensor:
+        """Per-micro-batch scale applied to the main loss before backward.
+
+        ``w_i / W_total`` globally normalizes the micro-batch; ``loss_multiplier``
+        folds in dp_size, the optimizer loss scale, and num_microbatches (the
+        last compensates mcore's 2-tuple ``/= num_microbatches``).
+
+        On the padded BSHD context-parallel path, the bridge's in-model CP split
+        leaves an uncancelled ``cp_size * dp_size`` factor relative to the shared
+        normalization used by the packed CP path. Dividing by ``cp_size * dp_size``
+        restores grad-norm parity with CP=1.
+        """
+        loss_scale = local_weight / total_loss_weight * loss_multiplier
+        if is_cp_bshd:
+            loss_scale = loss_scale / (
+                mpu.get_context_parallel_world_size()
+                * mpu.get_data_parallel_world_size()
+            )
+        return loss_scale
+
+    def _register_moe_aux_loss_scale(
+        self,
+        local_weight: torch.Tensor,
+        total_loss_weight: torch.Tensor,
+        loss_multiplier: float,
+        is_cp_bshd: bool,
+    ) -> None:
+        """Register the MoE router aux-loss backward scale for the next backward.
+
+        mcore injects router aux/z-loss gradients purely in backward via
+        MoEAuxLossAutoScaler; its schedule would set the scale to the bf16 grad
+        scale (1.0), assuming finalize_model_grads does the per-token division —
+        which this engine bypasses by returning a 2-tuple loss. The main loss's
+        effective backward multiplier is ``loss_scale * cp_size /
+        num_microbatches`` (mcore's 2-tuple branch scales the main loss by
+        ``cp_size / num_microbatches``), so register the same value to keep aux
+        consistent. Computed here rather than in the loss function so every
+        pipeline stage registers it, not just the last stage that owns the loss
+        (otherwise earlier stages' MoE layers use a stale scale under PP>1). See
+        megatron_bridge_patches._patch_moe_aux_loss_backward_scale.
+        """
+        loss_scale = self._main_loss_scale(
+            local_weight, total_loss_weight, loss_multiplier, is_cp_bshd
+        )
+        num_mb = getattr(self, "_num_microbatches_in_batch", 1) or 1
+        set_moe_aux_loss_backward_scale(
+            float(loss_scale) * mpu.get_context_parallel_world_size() / num_mb
+        )
+
     def _compute_logprobs_and_loss(
         self,
         output: torch.Tensor,
@@ -2342,6 +2531,9 @@ class MegatronEngine(TrainEngine):
         local_weight = loss_weight_fn(inputs)
         if local_weight == 0:
             return output.mean() * 0.0
+
+        # Captured before the _cp_* keys are stripped from `inputs` below.
+        is_cp_bshd = bool(inputs.get("_cp_bshd"))
 
         if self.config.is_critic and self.enable_tree_training:
             raise NotImplementedError(
@@ -2397,22 +2589,26 @@ class MegatronEngine(TrainEngine):
                 vocab_mean_logits = output.detach().float().mean(-1)
                 vocab_norm_logits = output.detach().float().norm(dim=-1)
                 if cp_padded_cu_seqlens is not None:
-                    logprobs = reassemble_cp_packed_logprobs(
-                        logprobs, cp_padded_cu_seqlens
+                    # BSHD CP stats live on the flattened [B * S/cp] local
+                    # grid; packed CP stats live on the packed local layout.
+                    # Both reassemble to the full packed [total_len] order.
+                    reassemble_fn = (
+                        reassemble_cp_bshd_logprobs
+                        if inputs.get("_cp_bshd")
+                        else reassemble_cp_packed_logprobs
                     )
-                    entropy = reassemble_cp_packed_logprobs(
-                        entropy, cp_padded_cu_seqlens
-                    )
-                    vocab_min_logits = reassemble_cp_packed_logprobs(
+                    logprobs = reassemble_fn(logprobs, cp_padded_cu_seqlens)
+                    entropy = reassemble_fn(entropy, cp_padded_cu_seqlens)
+                    vocab_min_logits = reassemble_fn(
                         vocab_min_logits, cp_padded_cu_seqlens
                     )
-                    vocab_max_logits = reassemble_cp_packed_logprobs(
+                    vocab_max_logits = reassemble_fn(
                         vocab_max_logits, cp_padded_cu_seqlens
                     )
-                    vocab_mean_logits = reassemble_cp_packed_logprobs(
+                    vocab_mean_logits = reassemble_fn(
                         vocab_mean_logits, cp_padded_cu_seqlens
                     )
-                    vocab_norm_logits = reassemble_cp_packed_logprobs(
+                    vocab_norm_logits = reassemble_fn(
                         vocab_norm_logits, cp_padded_cu_seqlens
                     )
                     cp_padding_length = inputs.get("_cp_padding_length", 0)
@@ -2469,7 +2665,9 @@ class MegatronEngine(TrainEngine):
             values = output.squeeze(-1)
             loss = loss_fn(values, inputs)
 
-        loss_scale = local_weight / total_loss_weight * loss_multiplier
+        loss_scale = self._main_loss_scale(
+            local_weight, total_loss_weight, loss_multiplier, is_cp_bshd
+        )
         return loss * loss_scale
 
     def _compute_forward_result(
@@ -2493,7 +2691,17 @@ class MegatronEngine(TrainEngine):
                     else None,
                 )
                 return logprobs
-            labels = torch.roll(inputs["input_ids"], shifts=-1, dims=-1)
+            # CP-local path (padded BSHD under CP): logits arrive as the
+            # flattened local [B*S/cp, V] grid with matching zigzag labels.
+            # Compute logprobs locally, then reassemble the 1D result — never
+            # all-gather full-vocab logits (O(S*V) memory blows up on large
+            # vocabularies).
+            cp_local_labels = inputs.get("_cp_local_labels")
+            cp_padded_cu_seqlens = inputs.get("_cp_padded_cu_seqlens")
+            if cp_local_labels is not None:
+                labels = cp_local_labels
+            else:
+                labels = torch.roll(inputs["input_ids"], shifts=-1, dims=-1)
             logprobs = gather_logprobs(
                 output,
                 labels,
@@ -2502,8 +2710,26 @@ class MegatronEngine(TrainEngine):
                 if mpu.get_tensor_model_parallel_world_size() > 1
                 else None,
             )
+            if cp_padded_cu_seqlens is not None:
+                reassemble_fn = (
+                    reassemble_cp_bshd_logprobs
+                    if inputs.get("_cp_bshd")
+                    else reassemble_cp_packed_logprobs
+                )
+                logprobs = reassemble_fn(logprobs, cp_padded_cu_seqlens)
+                logprobs = unpad_logits(
+                    logprobs,
+                    inputs.get("_cp_padding_length", 0),
+                    cp_padded_cu_seqlens,
+                    inputs.get("_cp_old_cu_seqlens"),
+                )
             return logprobs
         else:
+            if inputs.get("_cp_local_labels") is not None:
+                raise NotImplementedError(
+                    "Critic value computation under the CP-local padded path "
+                    "is not supported yet."
+                )
             values = output.squeeze(-1)
             return values
 

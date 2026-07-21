@@ -359,6 +359,35 @@ def test_vlm_logprob_value(backend: str, output: str | None = None):
     print(f"rank {rank}: test_vlm_logprob_value({backend}) Done.")
 
 
+def test_vlm_train_grad_norm_value(backend: str, output: str | None = None):
+    """Seeded train_batch; writes grad_norm to ``<output>.gradnorm``.
+
+    Run at CP=1 and CP=2 with the same seed and compare the sidecar values —
+    catches uncancelled CP gradient scaling in the vision branch (replicated
+    vision-tower grads + TP averaging hook + embedding-scatter backward).
+    """
+    rank = int(os.environ["RANK"])
+    engine = make_vlm_engine(backend, init_optimizer=True)
+    bcasted_input = _make_input(engine)
+
+    engine.train()
+    train_result = engine.train_batch(
+        input_=bcasted_input,
+        loss_fn=lambda logprobs, entropy, input_data, **kwargs: torch.mean(logprobs),
+        loss_weight_fn=lambda x: torch.tensor(1.0, device=engine.device),
+    )
+    grad_norm = float(train_result["grad_norm"])
+    assert torch.isfinite(torch.tensor(grad_norm)), f"non-finite grad_norm: {grad_norm}"
+    print(f"rank {rank} backend={backend} grad_norm={grad_norm}")
+
+    _cleanup(engine)
+    if rank == 0 and output is not None:
+        with open(f"{output}.gradnorm", "w") as f:
+            f.write(repr(grad_norm))
+        write_result(output, "Passed")
+    print(f"rank {rank}: test_vlm_train_grad_norm_value({backend}) Done.")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", type=str, default="megatron:d1p1t2")
@@ -374,6 +403,7 @@ def main():
             "dcp_save_load",
             "train",
             "logprob_value",
+            "train_grad_norm_value",
         ],
         default="train",
     )
@@ -392,6 +422,8 @@ def main():
         test_vlm_train(args.backend, output=args.output)
     elif args.test_type == "logprob_value":
         test_vlm_logprob_value(args.backend, output=args.output)
+    elif args.test_type == "train_grad_norm_value":
+        test_vlm_train_grad_norm_value(args.backend, output=args.output)
     else:
         raise NotImplementedError(f"Unknown test type: {args.test_type}")
 

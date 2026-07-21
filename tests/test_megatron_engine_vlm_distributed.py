@@ -327,3 +327,41 @@ def test_qwen3_5_moe_vl_logprob_cp_equivalence(tmp_path_factory):
         f"({logprob_c2}): rel_diff={rel_diff:.4f} > 0.02. This indicates broken "
         "CP data routing (mRoPE positions, vision-embed selection, or zigzag)."
     )
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.slow
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+@_tiny_qwen35_skip
+def test_qwen3_5_moe_vl_grad_norm_cp_equivalence(tmp_path_factory):
+    """Multimodal train_batch grad_norm CP=1 vs CP=2 must agree within 5%.
+
+    Backward counterpart of the logprob equivalence test: locks the vision
+    branch under CP (replicated vision-tower grads + TP averaging hook +
+    embedding-scatter backward) against uncancelled gradient scaling.
+    """
+    if torch.cuda.device_count() < 2:
+        pytest.skip("Qwen3.5-MoE VL grad_norm equivalence requires 2 GPUs to run")
+    out_dir = tmp_path_factory.mktemp("vlm_test")
+    out_c1 = out_dir / "qwen3_5_moe_vl_gradnorm_c1.out"
+    out_c2 = out_dir / "qwen3_5_moe_vl_gradnorm_c2.out"
+    _run_vlm_test(
+        "train_grad_norm_value",
+        str(out_c1),
+        backend="megatron:d1p1t1",
+        env_overrides=_TINY_QWEN35_ENV,
+    )
+    _run_vlm_test(
+        "train_grad_norm_value",
+        str(out_c2),
+        backend="megatron:d1p1t1c2",
+        env_overrides=_TINY_QWEN35_ENV,
+    )
+    grad_norm_c1 = float(pathlib.Path(f"{out_c1}.gradnorm").read_text())
+    grad_norm_c2 = float(pathlib.Path(f"{out_c2}.gradnorm").read_text())
+    rel_diff = abs(grad_norm_c1 - grad_norm_c2) / max(abs(grad_norm_c1), 1e-12)
+    assert rel_diff <= 0.05, (
+        f"multimodal grad_norm differs between CP=1 ({grad_norm_c1}) and CP=2 "
+        f"({grad_norm_c2}): rel_diff={rel_diff:.4f} > 0.05. This catches an "
+        "uncancelled CP gradient scaling factor in the vision branch."
+    )

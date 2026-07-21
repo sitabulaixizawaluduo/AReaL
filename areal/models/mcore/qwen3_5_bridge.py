@@ -9,6 +9,13 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
 
 from areal.models.mcore.qwen3_5 import make_mcore_layer_specs_qwen3_5_moe
+from areal.models.mcore.qwen3_5_weight_utils import (
+    qwen3_5_gated_qkv_hf_to_mcore,
+    qwen3_5_gated_qkv_mcore_to_hf,
+    qwen3_5_gdn_qkv_section_sizes,
+    relayout_fused_sections_for_tp,
+    undo_relayout_fused_sections_for_tp,
+)
 
 try:
     from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
@@ -413,27 +420,27 @@ class Qwen3_5MoeBridge(LLMBridge):
             and "layer_norm" not in mcore_weights_name
             and len(hf_weights) == 3
         ):
-            text_config = _get_text_config(self.hf_config)
-            num_kv_heads = text_config.num_key_value_heads
-            num_attn_heads = text_config.num_attention_heads
-            head_dim = getattr(
-                text_config, "head_dim", text_config.hidden_size // num_attn_heads
-            )
-            n_per_group = num_attn_heads // num_kv_heads
-            group_dim = head_dim * n_per_group
-
             q, k, v = hf_weights
-            real_num_kv_heads = q.shape[0] // (2 * group_dim)
-            q = (
-                q.view(real_num_kv_heads, n_per_group, 2, head_dim, -1)
-                .transpose(1, 2)
-                .flatten(1, 3)
+            return qwen3_5_gated_qkv_hf_to_mcore(self.hf_config, q, k, v)
+
+        if len(hf_weights) == 1 and (
+            "self_attention.linear_attn.in_proj_qkv.weight" in mcore_weights_name
+            or "self_attention.linear_attn.conv1d.weight" in mcore_weights_name
+        ):
+            tp_size = 1
+            try:
+                from megatron.core import parallel_state as mpu
+
+                if mpu.model_parallel_is_initialized():
+                    tp_size = mpu.get_tensor_model_parallel_world_size()
+            except (ImportError, RuntimeError, AttributeError):  # pragma: no cover
+                pass
+            return relayout_fused_sections_for_tp(
+                hf_weights[0],
+                section_sizes=qwen3_5_gdn_qkv_section_sizes(self.hf_config),
+                tp_size=tp_size,
+                dim=0,
             )
-            k = k.view(real_num_kv_heads, head_dim, -1)
-            v = v.view(real_num_kv_heads, head_dim, -1)
-            if ".bias" in mcore_weights_name:
-                return torch.cat([q, k, v], dim=1).reshape(-1).contiguous()
-            return torch.cat([q, k, v], dim=1).reshape(-1, q.shape[-1]).contiguous()
 
         if "mlp.experts.linear_fc" in mcore_weights_name and len(hf_weights) == 1:
             w = hf_weights[0]
@@ -471,47 +478,29 @@ class Qwen3_5MoeBridge(LLMBridge):
             and "layer_norm" not in mcore_weights_name
             and len(hf_names) == 3
         ):
-            text_config = _get_text_config(self.hf_config)
-            num_kv_heads = text_config.num_key_value_heads
-            num_attn_heads = text_config.num_attention_heads
-            head_dim = getattr(
-                text_config, "head_dim", text_config.hidden_size // num_attn_heads
-            )
-            n_per_group = num_attn_heads // num_kv_heads
-            per_kv_size = (2 * n_per_group + 2) * head_dim
-            real_num_kv_heads = mcore_weights.shape[0] // per_kv_size
-
-            if ".bias" in mcore_weights_name:
-                w = mcore_weights.view(real_num_kv_heads, per_kv_size)
-            else:
-                w = mcore_weights.view(real_num_kv_heads, per_kv_size, -1)
-
-            q, k, v = torch.split(
-                w,
-                [2 * n_per_group * head_dim, head_dim, head_dim],
-                dim=1,
-            )
-
-            if ".bias" in mcore_weights_name:
-                q = (
-                    q.view(real_num_kv_heads, 2, n_per_group, head_dim)
-                    .transpose(1, 2)
-                    .reshape(-1)
-                    .contiguous()
-                )
-                k = k.reshape(-1).contiguous()
-                v = v.reshape(-1).contiguous()
-            else:
-                q = (
-                    q.view(real_num_kv_heads, 2, n_per_group, head_dim, -1)
-                    .transpose(1, 2)
-                    .reshape(-1, w.shape[-1])
-                    .contiguous()
-                )
-                k = k.reshape(-1, w.shape[-1]).contiguous()
-                v = v.reshape(-1, w.shape[-1]).contiguous()
-
+            q, k, v = qwen3_5_gated_qkv_mcore_to_hf(self.hf_config, mcore_weights)
             return hf_names, [q, k, v]
+
+        if len(hf_names) == 1 and (
+            "self_attention.linear_attn.in_proj_qkv.weight" in mcore_weights_name
+            or "self_attention.linear_attn.conv1d.weight" in mcore_weights_name
+        ):
+            tp_size = 1
+            try:
+                from megatron.core import parallel_state as mpu
+
+                if mpu.model_parallel_is_initialized():
+                    tp_size = mpu.get_tensor_model_parallel_world_size()
+            except (ImportError, RuntimeError, AttributeError):  # pragma: no cover
+                pass
+            return hf_names, [
+                undo_relayout_fused_sections_for_tp(
+                    mcore_weights,
+                    section_sizes=qwen3_5_gdn_qkv_section_sizes(self.hf_config),
+                    tp_size=tp_size,
+                    dim=0,
+                )
+            ]
 
         return super()._weight_to_hf_format(mcore_weights_name, mcore_weights)
 

@@ -21,6 +21,12 @@ from areal.engine.megatron_utils.fp8 import (
     get_block_size_from_config,
 )
 from areal.infra.platforms import current_platform
+from areal.models.mcore.qwen3_5_weight_utils import (
+    is_qwen3_5_moe_config,
+    qwen3_5_gated_qkv_hf_to_mcore,
+    qwen3_5_gdn_qkv_section_sizes,
+    relayout_fused_sections_for_tp,
+)
 from areal.models.mcore.registry import unwrap_to_gpt_model
 from areal.utils import logging
 
@@ -342,7 +348,17 @@ def _weight_to_mcore_tp(
     - MoE expert weights: slice along expert dimension
     - Generic weights: slice based on shape mismatch
     """
-    if (
+    qwen3_5_res = _construct_qwen3_5_param_to_load(
+        hf_config=hf_config,
+        mcore_weights_name=mcore_weights_name,
+        mcore_param_shape=mcore_param_shape,
+        hf_weights_safe_slice=hf_weights_safe_slice,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+    )
+    if qwen3_5_res is not None:
+        res = qwen3_5_res
+    elif (
         "self_attention.linear_qkv." in mcore_weights_name
         and "layer_norm" not in mcore_weights_name
     ):
@@ -448,6 +464,46 @@ def _weight_to_mcore_tp(
     if dtype is not None and not isinstance(res, FP8BlockwiseTensorHelper):
         res = res.to(dtype)
     return res
+
+
+def _construct_qwen3_5_param_to_load(
+    hf_config,
+    mcore_weights_name: str,
+    mcore_param_shape: list,
+    hf_weights_safe_slice: list,
+    tp_rank: int,
+    tp_size: int,
+) -> torch.Tensor | FP8BlockwiseTensorHelper | None:
+    if not is_qwen3_5_moe_config(hf_config):
+        return None
+
+    if (
+        "self_attention.linear_qkv." in mcore_weights_name
+        and "layer_norm" not in mcore_weights_name
+        and len(hf_weights_safe_slice) == 3
+    ):
+        q, k, v = hf_weights_safe_slice
+        q = q[:] if not isinstance(q, torch.Tensor) else q
+        k = k[:] if not isinstance(k, torch.Tensor) else k
+        v = v[:] if not isinstance(v, torch.Tensor) else v
+        full = qwen3_5_gated_qkv_hf_to_mcore(hf_config, q, k, v)
+        return _slice_generic_weight(mcore_param_shape, [full], tp_rank, tp_size)
+
+    if len(hf_weights_safe_slice) == 1 and (
+        "self_attention.linear_attn.in_proj_qkv.weight" in mcore_weights_name
+        or "self_attention.linear_attn.conv1d.weight" in mcore_weights_name
+    ):
+        x = hf_weights_safe_slice[0]
+        x = x[:] if not isinstance(x, torch.Tensor) else x
+        full = relayout_fused_sections_for_tp(
+            x,
+            section_sizes=qwen3_5_gdn_qkv_section_sizes(hf_config),
+            tp_size=tp_size,
+            dim=0,
+        )
+        return _slice_generic_weight(mcore_param_shape, [full], tp_rank, tp_size)
+
+    return None
 
 
 def _load_weight_with_bridge_worker(

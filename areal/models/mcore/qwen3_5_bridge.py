@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import inspect
+import os
 from collections.abc import Callable
 
 import torch
@@ -241,6 +242,10 @@ class Qwen3_5MoeBridge(LLMBridge):
             ffn_hidden_size=ffn_hidden_size,
             qk_layernorm=True,
             attention_output_gate=True,
+            # TE CP attention algorithm ("p2p"/"all_gather"/"a2a"/"a2a+p2p").
+            # Env override to bisect/work around TE AttnFuncWithCPAndKVP2P
+            # backward-NaN bugs without a config schema change.
+            cp_comm_type=os.environ.get("AREAL_CP_COMM_TYPE") or None,
             # MoE
             moe_ffn_hidden_size=getattr(text_config, "moe_intermediate_size", None),
             moe_shared_expert_intermediate_size=getattr(

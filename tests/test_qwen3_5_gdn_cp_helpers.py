@@ -241,6 +241,11 @@ def _load_qwen3_5_modules(monkeypatch):
         "areal.models.mcore.qwen3_5",
         "areal/models/mcore/qwen3_5.py",
     )
+    _load_module(
+        monkeypatch,
+        "areal.models.mcore.qwen3_5_weight_utils",
+        "areal/models/mcore/qwen3_5_weight_utils.py",
+    )
     bridge = _load_module(
         monkeypatch,
         "areal.models.mcore.qwen3_5_bridge",

@@ -356,12 +356,16 @@ class MegatronEngine(TrainEngine):
             self.is_vision_model = is_valid_vision_model(self.hf_config.model_type)
             self.use_padded_seq = requires_padded_seq(self.hf_config.model_type)
             self.vision_use_packed_thd = False
+            self.merge_pad_into_last_seq = False
             if self.bridge_cls == "mbridge" and is_qwen3_5_model(
                 self.hf_config.model_type
             ):
                 # Qwen3.5 mbridge path keeps packed THD for both text-only and
-                # multimodal runs.
+                # multimodal runs. Batch padding must extend the last sequence
+                # (BSHD-style) because a standalone degenerate pad segment
+                # NaNs TE<2.16 THD context-parallel attention backward.
                 self.use_padded_seq = False
+                self.merge_pad_into_last_seq = True
                 self.vision_use_packed_thd = self.is_vision_model and hasattr(
                     self.hf_config, "vision_config"
                 )
@@ -2291,6 +2295,7 @@ class MegatronEngine(TrainEngine):
             pad_value=0.0,
             pad_to_maximum=self.config.pad_to_maximum,
             seq_align_to=align_to_multiple_of,
+            merge_pad_into_last_seq=self.merge_pad_into_last_seq,
         )
         self.logger.info(
             f"#microbatch: {len(mb_list.group_lens)}, microbatch #tokens: {mb_list.group_lens}, "

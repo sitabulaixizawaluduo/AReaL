@@ -824,12 +824,20 @@ def pad_packed_tensor_dict(
     pad_to_length: int,
     pad_value: float = 0.0,
     seq_align_to: int | None = None,
+    merge_pad_into_last_seq: bool = False,
 ) -> tuple[dict[str, Any], int, torch.Tensor, int]:
     """Pad a packed dict of tensors to a specified length.
     This function assumes that the input data contains "cu_seqlens" and "max_seqlen" key,
     and all other tensors of shape [total_length, ] will be padded to `pad_to_length`.
     This function will pad a new sequence filled with `pad_value` to the end of each tensor,
     and update the "cu_seqlens" and "max_seqlen" keys accordingly.
+
+    With ``merge_pad_into_last_seq=True`` the batch-level pad tokens extend the
+    LAST real sequence (BSHD-style trailing padding) instead of forming their
+    own cu_seqlens segment. A standalone degenerate pad segment triggers NaNs
+    in TransformerEngine's THD context-parallel attention backward on
+    TE < 2.16 (AttnFuncWithCPAndKVP2P / QKVOA2A), while trailing padding
+    inside a causal sequence is handled correctly.
 
     Args:
         data (Dict): Dictionary containing tensors to be packed.
@@ -945,8 +953,14 @@ def pad_packed_tensor_dict(
             old_cu_seqlens,
             align_to_length,
         )
-    new_cu_seqlens = F.pad(cu_seqlens, (0, 1), value=pad_to_length)
-    new_max_seqlen = max(max_seqlen, pad_length)
+    if merge_pad_into_last_seq:
+        new_cu_seqlens = cu_seqlens.clone()
+        new_cu_seqlens[-1] = pad_to_length
+        last_seq_len = int(new_cu_seqlens[-1] - new_cu_seqlens[-2])
+        new_max_seqlen = max(max_seqlen, last_seq_len)
+    else:
+        new_cu_seqlens = F.pad(cu_seqlens, (0, 1), value=pad_to_length)
+        new_max_seqlen = max(max_seqlen, pad_length)
     padded_data = {}
     for key, value in data.items():
         if key == "cu_seqlens":
@@ -988,6 +1002,7 @@ def pad_mb_list(
     pad_to_maximum: bool = False,
     batch_align_to: int | None = None,
     seq_align_to: int | None = None,
+    merge_pad_into_last_seq: bool = False,
 ) -> MicroBatchList:
     """Pad the micro-batch list to the maximum length or to a specific size to:
         1. Reduce memory fragmentation.
@@ -1032,6 +1047,7 @@ def pad_mb_list(
             pad_to_length,
             pad_value=pad_value,
             seq_align_to=seq_align_to,
+            merge_pad_into_last_seq=merge_pad_into_last_seq,
         )
         padded_mb_inputs.append(padded_mb)
         pad_lengths.append(pad_len)

@@ -196,7 +196,7 @@ def qwen3_5_hf_modules(monkeypatch):
 def _make_hf_config(geometry: str):
     if geometry == "tiny":
         text = SimpleNamespace(
-            model_type="qwen3_5_moe",
+            model_type="qwen3_5_moe_text",
             hidden_size=256,
             num_attention_heads=8,
             num_key_value_heads=2,
@@ -210,7 +210,7 @@ def _make_hf_config(geometry: str):
         )
     elif geometry == "large":
         text = SimpleNamespace(
-            model_type="qwen3_5_moe",
+            model_type="qwen3_5_moe_text",
             hidden_size=2048,
             num_attention_heads=16,
             num_key_value_heads=4,
@@ -355,7 +355,7 @@ def test_hf_load_qwen3_5_gdn_fused_qkv_tp_shards_preserve_sections_and_reconstru
 
 def _make_qwen3_5_moe_config(*, hidden: int, ffn: int, num_experts: int):
     text = SimpleNamespace(
-        model_type="qwen3_5_moe",
+        model_type="qwen3_5_moe_text",
         hidden_size=hidden,
         moe_intermediate_size=ffn,
         num_experts=num_experts,
@@ -554,3 +554,22 @@ def test_qwen3_5_grouped_expert_roundtrip_bridge_and_converter(
         )
         torch.testing.assert_close(roundtrip_fc1, gate_up[expert_idx], rtol=0, atol=0)
         torch.testing.assert_close(roundtrip_fc2, down[expert_idx], rtol=0, atol=0)
+
+
+def test_is_qwen3_5_moe_config_matches_real_checkpoint_model_types(
+    qwen3_5_hf_modules,
+):
+    detect = qwen3_5_hf_modules.utils.is_qwen3_5_moe_config
+
+    real_composite = SimpleNamespace(
+        model_type="qwen3_5_moe",
+        text_config=SimpleNamespace(model_type="qwen3_5_moe_text"),
+    )
+    assert detect(real_composite), (
+        "real checkpoints carry text_config.model_type='qwen3_5_moe_text'; "
+        "exact-matching 'qwen3_5_moe' made the whole qwen3_5 loader dispatch "
+        "dead code on real checkpoints"
+    )
+    assert detect(SimpleNamespace(model_type="qwen3_5_moe"))
+    assert not detect(SimpleNamespace(model_type="qwen3_vl_moe"))
+    assert not detect(SimpleNamespace(model_type="qwen3_moe"))

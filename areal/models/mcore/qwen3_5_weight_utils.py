@@ -8,11 +8,17 @@ def get_qwen3_5_text_config(hf_config):
 
 
 def is_qwen3_5_moe_config(hf_config) -> bool:
+    # Real checkpoints nest text_config with model_type "qwen3_5_moe_text"
+    # while the top-level composite says "qwen3_5_moe" — match the family
+    # prefix on either level instead of exact-matching one of them.
     text_cfg = get_qwen3_5_text_config(hf_config)
-    model_type = getattr(text_cfg, "model_type", None) or getattr(
-        hf_config, "model_type", None
-    )
-    return model_type == "qwen3_5_moe"
+    for candidate in (
+        getattr(text_cfg, "model_type", None),
+        getattr(hf_config, "model_type", None),
+    ):
+        if candidate and str(candidate).startswith("qwen3_5"):
+            return True
+    return False
 
 
 def _qwen3_5_head_dims(hf_config) -> tuple[int, int, int, int]:

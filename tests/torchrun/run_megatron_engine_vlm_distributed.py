@@ -42,11 +42,15 @@ def write_result(path: str, result: str):
         f.write(result)
 
 
-def mock_vlm_input(engine: "MegatronEngine") -> dict[str, Any]:
+def mock_vlm_input(engine: "MegatronEngine", seed: int = 0) -> dict[str, Any]:
     """Create mock VLM input with vision tokens.
 
-    Pulls patch geometry from ``engine.hf_config`` so this works for both
-    Qwen2.5-VL (patch_size=14) and Qwen3-VL (patch_size=16).
+    Pulls patch geometry from ``engine.hf_config`` so this works for
+    Qwen2.5-VL (patch_size=14), Qwen3-VL (patch_size=16), and Qwen3.5.
+    Image-token runs are bracketed with ``vision_start/end`` tokens when the
+    config defines them — HF ``get_rope_index`` (and the Qwen3.5 packed
+    per-segment mRoPE builder) locate images via ``vision_start_token_id``.
+    Deterministic under ``seed`` so CP=1 vs CP=2 runs see identical batches.
     """
     vc = engine.hf_config.vision_config
     patch_size = getattr(vc, "patch_size", 14)
@@ -54,7 +58,10 @@ def mock_vlm_input(engine: "MegatronEngine") -> dict[str, Any]:
     spatial_merge_size = getattr(vc, "spatial_merge_size", 2)
     in_channels = getattr(vc, "in_channels", 3)
     image_token_id = getattr(engine.hf_config, "image_token_id", 151655)
+    vision_start_token_id = getattr(engine.hf_config, "vision_start_token_id", None)
+    vision_end_token_id = getattr(engine.hf_config, "vision_end_token_id", None)
     device = engine.device
+    generator = torch.Generator().manual_seed(seed)
 
     patch_dim = in_channels * temporal_patch_size * patch_size * patch_size
 
@@ -64,28 +71,45 @@ def mock_vlm_input(engine: "MegatronEngine") -> dict[str, Any]:
         grid_t * (grid_h // spatial_merge_size) * (grid_w // spatial_merge_size)
     )
 
-    batch_size = 1
-    num_text_tokens = 16
-    seq_len = num_text_tokens + num_image_tokens
+    sequences: list[torch.Tensor] = []
+    multi_modal_input: list[dict[str, torch.Tensor]] = []
+    for num_text_tokens in (16, 24):
+        text_tokens = torch.randint(
+            0, 1000, (num_text_tokens,), dtype=torch.long, generator=generator
+        )
+        image_tokens = torch.full((num_image_tokens,), image_token_id, dtype=torch.long)
+        parts = [text_tokens[: num_text_tokens // 2]]
+        if vision_start_token_id is not None:
+            parts.append(torch.tensor([vision_start_token_id], dtype=torch.long))
+        parts.append(image_tokens)
+        if vision_end_token_id is not None:
+            parts.append(torch.tensor([vision_end_token_id], dtype=torch.long))
+        parts.append(text_tokens[num_text_tokens // 2 :])
+        sequences.append(torch.cat(parts))
 
-    text_tokens = torch.randint(0, 1000, (num_text_tokens,), dtype=torch.long)
-    image_tokens = torch.full((num_image_tokens,), image_token_id, dtype=torch.long)
-    input_ids = torch.cat([text_tokens, image_tokens]).unsqueeze(0).to(device)
-    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=device)
+        pixel_values = torch.randn(
+            total_patches, patch_dim, dtype=torch.float32, generator=generator
+        )
+        image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.long)
+        multi_modal_input.append(
+            {
+                "pixel_values": pixel_values.to(device),
+                "image_grid_thw": image_grid_thw.to(device),
+            }
+        )
 
-    pixel_values = torch.randn(
-        total_patches, patch_dim, dtype=torch.float32, device=device
-    )
-    image_grid_thw = torch.tensor(
-        [[grid_t, grid_h, grid_w]], dtype=torch.long, device=device
-    )
+    batch_size = len(sequences)
+    seq_len = max(seq.numel() for seq in sequences)
+    input_ids = torch.zeros(batch_size, seq_len, dtype=torch.long)
+    attention_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool)
+    for i, seq in enumerate(sequences):
+        input_ids[i, : seq.numel()] = seq
+        attention_mask[i, : seq.numel()] = True
 
     return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "multi_modal_input": [
-            {"pixel_values": pixel_values, "image_grid_thw": image_grid_thw}
-        ],
+        "input_ids": input_ids.to(device),
+        "attention_mask": attention_mask.to(device),
+        "multi_modal_input": multi_modal_input,
     }
 
 
@@ -304,6 +328,37 @@ def test_vlm_train(backend: str, output: str | None = None):
     print(f"rank {rank}: test_vlm_train({backend}) Done.")
 
 
+def test_vlm_logprob_value(backend: str, output: str | None = None):
+    """Seeded eval forward; writes summed logprob to ``<output>.logprob``.
+
+    Run at CP=1 and CP=2 with the same seed and compare the sidecar values:
+    a relative difference beyond a few percent indicates broken CP data
+    routing (mRoPE positions, vision-embed selection, or zigzag layout).
+    """
+    rank = int(os.environ["RANK"])
+    engine = make_vlm_engine(backend, init_optimizer=False, wrap_with_ddp=False)
+    bcasted_input = _make_input(engine)
+
+    engine.eval()
+    logprobs = engine.forward(
+        input_=bcasted_input,
+        aggregate_fn=lambda xs: torch.cat(xs, dim=0),
+    )
+    total = None
+    if logprobs is not None:
+        total = float(logprobs.double().sum().item())
+        assert torch.isfinite(torch.tensor(total)), f"non-finite logprob sum: {total}"
+    print(f"rank {rank} backend={backend} logprob_sum={total}")
+
+    _cleanup(engine)
+    if rank == 0 and output is not None:
+        assert total is not None, "rank 0 must be a data-parallel head"
+        with open(f"{output}.logprob", "w") as f:
+            f.write(repr(total))
+        write_result(output, "Passed")
+    print(f"rank {rank}: test_vlm_logprob_value({backend}) Done.")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", type=str, default="megatron:d1p1t2")
@@ -312,7 +367,14 @@ def main():
     parser.add_argument(
         "--test_type",
         type=str,
-        choices=["init", "forward", "save_load", "dcp_save_load", "train"],
+        choices=[
+            "init",
+            "forward",
+            "save_load",
+            "dcp_save_load",
+            "train",
+            "logprob_value",
+        ],
         default="train",
     )
     args = parser.parse_args()
@@ -328,6 +390,8 @@ def main():
         test_vlm_dcp_save_load(args.backend, output=args.output)
     elif args.test_type == "train":
         test_vlm_train(args.backend, output=args.output)
+    elif args.test_type == "logprob_value":
+        test_vlm_logprob_value(args.backend, output=args.output)
     else:
         raise NotImplementedError(f"Unknown test type: {args.test_type}")
 

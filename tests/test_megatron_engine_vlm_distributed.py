@@ -232,3 +232,98 @@ def test_qwen3vl_moe_dcp_save_load(tmp_path_factory):
         backend="megatron:(attn:d2p1t4|ffn:d1p1t2e4)",
         env_overrides={"VLM_MODEL_PATH": MOE_MODEL_PATHS["qwen3_vl_moe"]},
     )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Qwen3.5-MoE (tiny fixture) on the mbridge registry path: the ONLY VLM
+# family where CP > 1 is allowed (packed THD + GDN a2a CP + per-segment
+# mRoPE; the megatron_engine VLM CP guard exempts mbridge qwen3_5).
+#
+# GPU runbook:
+#   python tests/make_tiny_qwen3_5_moe.py --output /tmp/qwen3_5_moe_tiny
+#   pytest tests/test_megatron_engine_vlm_distributed.py -k qwen3_5_moe_vl -x -s
+# ──────────────────────────────────────────────────────────────────────
+
+_TINY_QWEN35_PATH = os.environ.get(
+    "AREAL_TINY_QWEN35_MOE_PATH", "/tmp/qwen3_5_moe_tiny"
+)
+_TINY_QWEN35_ENV = {"VLM_MODEL_PATH": _TINY_QWEN35_PATH}
+_tiny_qwen35_skip = pytest.mark.skipif(
+    not pathlib.Path(_TINY_QWEN35_PATH).exists(),
+    reason=(
+        "tiny Qwen3.5-MoE fixture missing — run "
+        "`python tests/make_tiny_qwen3_5_moe.py` first "
+        f"(looked at {_TINY_QWEN35_PATH})"
+    ),
+)
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+@_tiny_qwen35_skip
+def test_qwen3_5_moe_vl_forward_single_gpu(tmp_path_factory):
+    """Multimodal forward smoke on the mbridge packed-THD path (1 GPU)."""
+    output = str(tmp_path_factory.mktemp("vlm_test") / "qwen3_5_moe_vl_forward.out")
+    _run_vlm_test(
+        "forward",
+        output,
+        backend="megatron:d1p1t1",
+        env_overrides=_TINY_QWEN35_ENV,
+    )
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.slow
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+@_tiny_qwen35_skip
+def test_qwen3_5_moe_vl_forward_context_parallel(tmp_path_factory):
+    """Multimodal forward with CP=2 (2 GPUs): GDN a2a + mRoPE zigzag + vision."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("Qwen3.5-MoE VL context parallel requires 2 GPUs to run")
+    output = str(tmp_path_factory.mktemp("vlm_test") / "qwen3_5_moe_vl_cp2.out")
+    _run_vlm_test(
+        "forward",
+        output,
+        backend="megatron:d1p1t1c2",
+        env_overrides=_TINY_QWEN35_ENV,
+    )
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.slow
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+@_tiny_qwen35_skip
+def test_qwen3_5_moe_vl_logprob_cp_equivalence(tmp_path_factory):
+    """Multimodal logprob CP=1 vs CP=2 must agree within 2% relative diff.
+
+    Catches broken CP routing for images: wrong per-segment mRoPE positions,
+    mis-selected CP-local vision embeddings, or zigzag layout drift. Healthy
+    band established by radixark/miles PR #1308: abs logprob diff ~0.011-0.016
+    for real Qwen3-VL runs.
+    """
+    if torch.cuda.device_count() < 2:
+        pytest.skip("Qwen3.5-MoE VL logprob equivalence requires 2 GPUs to run")
+    out_dir = tmp_path_factory.mktemp("vlm_test")
+    out_c1 = out_dir / "qwen3_5_moe_vl_logprob_c1.out"
+    out_c2 = out_dir / "qwen3_5_moe_vl_logprob_c2.out"
+    _run_vlm_test(
+        "logprob_value",
+        str(out_c1),
+        backend="megatron:d1p1t1",
+        env_overrides=_TINY_QWEN35_ENV,
+    )
+    _run_vlm_test(
+        "logprob_value",
+        str(out_c2),
+        backend="megatron:d1p1t1c2",
+        env_overrides=_TINY_QWEN35_ENV,
+    )
+    logprob_c1 = float(pathlib.Path(f"{out_c1}.logprob").read_text())
+    logprob_c2 = float(pathlib.Path(f"{out_c2}.logprob").read_text())
+    rel_diff = abs(logprob_c1 - logprob_c2) / max(abs(logprob_c1), 1e-12)
+    assert rel_diff <= 0.02, (
+        f"multimodal logprob differs between CP=1 ({logprob_c1}) and CP=2 "
+        f"({logprob_c2}): rel_diff={rel_diff:.4f} > 0.02. This indicates broken "
+        "CP data routing (mRoPE positions, vision-embed selection, or zigzag)."
+    )

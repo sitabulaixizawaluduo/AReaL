@@ -435,6 +435,13 @@ class Qwen3_5MoeVLModel(MegatronModule):
             rotary_base=language_rotary_base,
             scatter_embedding_sequence_parallel=False,
         )
+        # mcore's MultimodalRotaryEmbedding defaults cp_group to the global CP
+        # group and whole-row zigzag-splits the freqs. Our packed THD path
+        # requires FULL-length per-token freqs (_apply_rotary_pos_emb_thd exact
+        # path does the per-sequence zigzag selection itself from cu_seqlens);
+        # neutralize the embedding-side split to avoid double sharding.
+        if hasattr(self.language_model, "rotary_pos_emb"):
+            self.language_model.rotary_pos_emb.cp_group = None
 
     @staticmethod
     def _hook_fp32_rotary_emb(module: torch.nn.Module):

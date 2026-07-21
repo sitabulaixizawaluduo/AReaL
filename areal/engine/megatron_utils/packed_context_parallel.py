@@ -337,10 +337,22 @@ def packed_context_parallel_forward(
                 input_ids, cu_seqlens
             )
             input_ids = input_ids.contiguous()
+            # mRoPE per-token positions [total, 3] must stay FULL-length: mcore's
+            # _apply_rotary_pos_emb_thd exact path (freqs.size(0)==cu_seqlens[-1])
+            # performs the per-sequence zigzag selection itself via
+            # _get_thd_freqs_on_this_cp_rank(offset=cu_seqlens[i]). Pre-splitting
+            # here would double-shard the freqs (rope_utils.py, mcore 0.17).
+            is_mrope_position_ids = (
+                position_ids is not None
+                and torch.is_tensor(position_ids)
+                and position_ids.ndim == 2
+                and position_ids.shape[-1] == 3
+            )
             if (
                 position_ids is not None
                 and torch.is_tensor(position_ids)
                 and position_ids.shape[0] == packed_total_len
+                and not is_mrope_position_ids
             ):
                 position_ids = split_packed_seqs_for_context_parallel(
                     position_ids,
@@ -377,7 +389,7 @@ def packed_context_parallel_forward(
         and position_ids.ndim == 2
         and position_ids.shape[-1] == 3
     ):
-        # packed [total_local_tokens, 3] -> mcore mrope [3, 1, total_local_tokens]
+        # packed FULL-length [total_tokens, 3] -> mcore mrope [3, 1, total_tokens]
         position_ids = position_ids.transpose(0, 1).unsqueeze(1).contiguous()
 
     # Every VLM forward is mask-free (attention_mask=None): the model

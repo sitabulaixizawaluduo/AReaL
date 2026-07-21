@@ -374,3 +374,64 @@ def test_single_image_spanning_segment_matches_hf(qwen3_5_vl_modules):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
+
+
+def _mcore_thd_exact_freq_indices(
+    cp_rank: int, cp_size: int, cu_seqlens: torch.Tensor
+) -> torch.Tensor:
+    """Vendored selection arithmetic of mcore 0.17 rope_utils.py:
+    _apply_rotary_pos_emb_thd exact path (freqs.size(0)==cu_seqlens[-1]) +
+    _get_thd_freqs_on_this_cp_rank(offset=cu_seqlens[i])."""
+    token_indices = torch.arange(int(cu_seqlens[-1]))
+    seqlens_local = ((cu_seqlens[1:] - cu_seqlens[:-1]) // cp_size).tolist()
+    slices = []
+    for i, local_len in enumerate(seqlens_local):
+        offset = int(cu_seqlens[i])
+        full_len = local_len * cp_size
+        seg = local_len // 2
+        slices.append(
+            token_indices[offset + cp_rank * seg : offset + (cp_rank + 1) * seg]
+        )
+        slices.append(
+            token_indices[
+                offset + full_len - (cp_rank + 1) * seg : offset
+                + full_len
+                - cp_rank * seg
+            ]
+        )
+    return torch.cat(slices)
+
+
+def test_mcore_thd_rope_selection_matches_areal_zigzag_split(
+    qwen3_5_vl_modules, monkeypatch
+):
+    """Pins the mrope/CP contract that crashed on cluster (128 vs 79).
+
+    With FULL-length per-token freqs, mcore's THD exact path must select for
+    each CP rank exactly the token positions AReaL's data-side per-sequence
+    zigzag split assigns to that rank. Pre-splitting positions (the old
+    behavior) breaks this: freqs enter the non-exact fallback and get mangled.
+    """
+    modules = qwen3_5_vl_modules
+    cp_size = 2
+    cu_seqlens = torch.tensor([0, 24, 60, 256], dtype=torch.long)
+    token_positions = torch.arange(256, dtype=torch.long)
+
+    monkeypatch.setattr(modules.mpu, "get_context_parallel_world_size", lambda: cp_size)
+    for cp_rank in range(cp_size):
+        monkeypatch.setattr(
+            modules.mpu,
+            "get_context_parallel_rank",
+            lambda cp_rank=cp_rank: cp_rank,
+        )
+        data_side = modules.packed_cp.split_packed_seqs_for_context_parallel(
+            token_positions, cu_seqlens
+        )
+        rope_side = _mcore_thd_exact_freq_indices(cp_rank, cp_size, cu_seqlens)
+
+        assert rope_side.shape == data_side.shape, (
+            f"rank {cp_rank}: mcore rope selects {rope_side.numel()} freq rows, "
+            f"data split holds {data_side.numel()} tokens — the 128-vs-79 class "
+            "of mismatch"
+        )
+        torch.testing.assert_close(rope_side, data_side, rtol=0, atol=0)

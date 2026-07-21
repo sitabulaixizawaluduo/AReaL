@@ -73,7 +73,10 @@ def mock_vlm_input(engine: "MegatronEngine", seed: int = 0) -> dict[str, Any]:
 
     sequences: list[torch.Tensor] = []
     multi_modal_input: list[dict[str, torch.Tensor]] = []
-    for num_text_tokens in (16, 24):
+    # 8 sequences: PP schedules need >= pp_size * n_mbs_divisor microbatches
+    # per DP head (e.g. p2 demands min_groups=4), and FFD cannot split fewer
+    # sequences than groups.
+    for num_text_tokens in (16, 24, 20, 28, 18, 26, 22, 30):
         text_tokens = torch.randint(
             0, 1000, (num_text_tokens,), dtype=torch.long, generator=generator
         )

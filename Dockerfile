@@ -86,8 +86,12 @@ RUN NVCC_APPEND_FLAGS="--threads 4" APEX_PARALLEL_BUILD=8 APEX_CPP_EXT=1 APEX_CU
     git+https://github.com/NVIDIA/apex.git
 
 # Install transformer engine (for FP8 training)
+# Pinned to release_v2.16: fixes THD context-parallel attention backward NaN
+# (AttnFuncWithCPAndKVP2P) and matches flash-attn 2.8.3's
+# window_size_left/right API. "stable" drifted (2.14.1 was broken for
+# packed THD + CP, required by the Qwen3.5 mbridge path).
 RUN uv pip -v install --no-build-isolation --no-cache-dir \
-    git+https://github.com/NVIDIA/TransformerEngine.git@stable
+    git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.16
 
 # FlashMLA (Multi-head Latent Attention for DeepSeek-V3)
 RUN git clone https://github.com/deepseek-ai/FlashMLA.git /flash-mla \

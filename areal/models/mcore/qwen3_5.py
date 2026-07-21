@@ -171,19 +171,19 @@ def _build_qwen3_5_linear_attn_spec(
                     in_proj_a=col,
                     out_proj=row,
                 ),
+                params={
+                    "linear_num_key_heads": text_config.linear_num_key_heads,
+                    "linear_num_value_heads": text_config.linear_num_value_heads,
+                    "linear_key_head_dim": text_config.linear_key_head_dim,
+                    "linear_value_head_dim": text_config.linear_value_head_dim,
+                    "linear_conv_kernel_dim": text_config.linear_conv_kernel_dim,
+                    "hidden_act": text_config.hidden_act,
+                    "bias": False,
+                    "conv_bias": False,
+                },
             ),
             input_layernorm=norm,
         ),
-        params={
-            "linear_num_key_heads": text_config.linear_num_key_heads,
-            "linear_num_value_heads": text_config.linear_num_value_heads,
-            "linear_key_head_dim": text_config.linear_key_head_dim,
-            "linear_value_head_dim": text_config.linear_value_head_dim,
-            "linear_conv_kernel_dim": text_config.linear_conv_kernel_dim,
-            "hidden_act": text_config.hidden_act,
-            "bias": False,
-            "conv_bias": False,
-        },
     )
 
 

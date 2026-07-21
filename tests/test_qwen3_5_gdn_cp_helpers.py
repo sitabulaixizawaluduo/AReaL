@@ -640,3 +640,39 @@ def test_gated_delta_net_named_parameters_match_bridge_linear_attn_mapping(
     }
 
     assert actual == expected
+
+
+def test_linear_attn_spec_places_gdn_params_on_inner_spec(qwen3_5_modules, monkeypatch):
+    monkeypatch.setattr(
+        qwen3_5_modules.qwen,
+        "_te_linear_and_norm",
+        lambda: (object, object, object),
+    )
+    text_config = SimpleNamespace(
+        linear_num_key_heads=4,
+        linear_num_value_heads=8,
+        linear_key_head_dim=2,
+        linear_value_head_dim=2,
+        linear_conv_kernel_dim=3,
+        hidden_act="silu",
+    )
+
+    spec = qwen3_5_modules.qwen._build_qwen3_5_linear_attn_spec(text_config)
+
+    inner_params = spec.submodules.linear_attn.params
+    required = {
+        "linear_num_key_heads",
+        "linear_num_value_heads",
+        "linear_key_head_dim",
+        "linear_value_head_dim",
+        "linear_conv_kernel_dim",
+    }
+    assert required <= set(inner_params), (
+        "GDN constructor hyperparams must live on the inner linear_attn "
+        f"ModuleSpec; missing {required - set(inner_params)}"
+    )
+    assert not spec.params, (
+        "outer Qwen3_5GatedDeltaAttention spec must stay params-free: mcore's "
+        "TransformerLayer injects its own kwargs (pg_collection, ...) there, "
+        "and the wrapper does not forward arbitrary kwargs to the GDN module"
+    )

@@ -401,6 +401,24 @@ def test_vlm_train_grad_norm_value(backend: str, output: str | None = None):
         loss_weight_fn=lambda x: torch.tensor(1.0, device=engine.device),
     )
     grad_norm = float(train_result["grad_norm"])
+    if not torch.isfinite(torch.tensor(grad_norm)):
+        # Locate the first NaN/Inf producers so a single failing run
+        # identifies the module (GDN / gated attn / MoE / vision / embedding).
+        bad = []
+        for name, param in engine.model.named_parameters():
+            grad = getattr(param, "main_grad", None)
+            if grad is None:
+                grad = param.grad
+            if grad is None:
+                continue
+            n_nan = int(torch.isnan(grad).sum())
+            n_inf = int(torch.isinf(grad).sum())
+            if n_nan or n_inf:
+                bad.append(f"{name}: nan={n_nan} inf={n_inf} numel={grad.numel()}")
+        print(
+            f"rank {rank} NON-FINITE grad_norm={grad_norm}; offending params "
+            f"({len(bad)}):\n" + "\n".join(bad[:40])
+        )
     assert torch.isfinite(torch.tensor(grad_norm)), f"non-finite grad_norm: {grad_norm}"
     print(f"rank {rank} backend={backend} grad_norm={grad_norm}")
 
@@ -417,6 +435,7 @@ def main():
     parser.add_argument("--backend", type=str, default="megatron:d1p1t2")
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--save_dir", type=str, default=None)
+    parser.add_argument("--detect_anomaly", action="store_true")
     parser.add_argument(
         "--test_type",
         type=str,
@@ -432,6 +451,8 @@ def main():
         default="train",
     )
     args = parser.parse_args()
+    if args.detect_anomaly:
+        torch.autograd.set_detect_anomaly(True)
 
     if args.test_type == "init":
         test_vlm_init(args.backend, output=args.output)

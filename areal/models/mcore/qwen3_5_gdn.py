@@ -303,6 +303,7 @@ class Qwen3_5GatedDeltaNet(MegatronModule):
         hidden_act: str = "silu",
         bias: bool = False,
         conv_bias: bool = False,
+        pg_collection=None,
     ):
         super().__init__(config)
         self.config = config
@@ -320,9 +321,21 @@ class Qwen3_5GatedDeltaNet(MegatronModule):
         self.value_dim = self.num_v_heads * self.head_v_dim
         self.conv_dim = self.key_dim * 2 + self.value_dim
 
-        self.tp_size = _get_tp_world_size()
-        self.cp_size = _get_cp_world_size()
-        self.cp_rank = _get_cp_rank()
+        # mcore >= 0.17 TransformerLayer injects a ProcessGroupCollection;
+        # prefer it over the global mpu state (repo distributed-code rule),
+        # falling back to mpu for direct instantiation (CPU UTs, tools).
+        self._cp_group_override = None
+        if pg_collection is not None and getattr(pg_collection, "tp", None) is not None:
+            self.tp_size = pg_collection.tp.size()
+        else:
+            self.tp_size = _get_tp_world_size()
+        if pg_collection is not None and getattr(pg_collection, "cp", None) is not None:
+            self._cp_group_override = pg_collection.cp
+            self.cp_size = pg_collection.cp.size()
+            self.cp_rank = pg_collection.cp.rank()
+        else:
+            self.cp_size = _get_cp_world_size()
+            self.cp_rank = _get_cp_rank()
 
         if self.num_k_heads % self.tp_size != 0 or self.num_v_heads % self.tp_size != 0:
             raise ValueError(
@@ -573,7 +586,9 @@ class Qwen3_5GatedDeltaNet(MegatronModule):
         b, _ = self.in_proj_b(hidden_states)
         a, _ = self.in_proj_a(hidden_states)
 
-        cp_group = _get_cp_group() if self.cp_size > 1 else None
+        cp_group = None
+        if self.cp_size > 1:
+            cp_group = self._cp_group_override or _get_cp_group()
         undo_idx = None
         redo_idx = None
 
@@ -803,8 +818,14 @@ class Qwen3_5GatedDeltaAttention(MegatronModule):
         submodules: Qwen3_5GatedDeltaAttentionSubmodules,
         layer_number: int,
         attn_mask_type=None,
+        pg_collection=None,
         **kwargs,
     ):
+        # mcore's TransformerLayer forwards attention_optional_kwargs
+        # (cp_comm_type, vp_stage, ...); only pg_collection is meaningful for
+        # the GDN module — the rest describe core-attention behavior it
+        # replaces entirely.
+        del kwargs
         super().__init__(config)
         self.config = config
         self.layer_number = layer_number
@@ -817,7 +838,7 @@ class Qwen3_5GatedDeltaAttention(MegatronModule):
         self.linear_attn = build_module(
             submodules.linear_attn,
             config=self.config,
-            **kwargs,
+            pg_collection=pg_collection,
         )
 
     def forward(

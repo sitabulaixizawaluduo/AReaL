@@ -37,14 +37,24 @@ MODEL_PATHS = {
 }
 
 # bridge_type must default to mbridge for backwards compat with existing
-# qwen3/qwen3moe tests; the qwen3_5 family (dense + MoE) is forced to
-# megatron-bridge because that's the only bridge that handles its GDN hybrid
-# attention layers.
-_MODEL_BRIDGE_OVERRIDES = {
-    "qwen3_5": "megatron-bridge",
-    "qwen3_5_moe": "megatron-bridge",
-    "qwen3_5_moe_tiny": "mbridge",
-}
+# qwen3/qwen3moe tests. The qwen3_5 family is routed per-run by
+# _resolve_bridge_type: megatron-bridge without CP (the long-validated
+# baseline), mbridge when CP > 1 (the only bridge whose GDN supports CP on
+# mcore 0.17). AREAL_TEST_BRIDGE_TYPE forces either bridge explicitly.
+_MODEL_BRIDGE_OVERRIDES = {}
+
+_QWEN3_5_MODEL_TYPES = {"qwen3_5", "qwen3_5_moe", "qwen3_5_moe_tiny"}
+
+
+def _resolve_bridge_type(model_type: str, alloc_mode) -> str:
+    env_override = os.environ.get("AREAL_TEST_BRIDGE_TYPE")
+    if env_override:
+        return env_override
+    if model_type in _QWEN3_5_MODEL_TYPES:
+        cp_size = getattr(alloc_mode.parallel, "context_parallel_size", 1)
+        return "mbridge" if cp_size > 1 else "megatron-bridge"
+    return _MODEL_BRIDGE_OVERRIDES.get(model_type, "mbridge")
+
 
 # Models large enough that a full-AdamW optimizer state does not fit even when
 # sharded (Qwen3.5-35B-A3B's optimizer state is ~420GB, exceeding 8x80GB with
@@ -115,7 +125,9 @@ def mock_input(
 
 
 def make_engine(model_type, backend, mb_spec, vpp_size=1, init_optimizer=False):
-    bridge_type = _MODEL_BRIDGE_OVERRIDES.get(model_type, "mbridge")
+    alloc_mode = ModelAllocation.from_str(backend)
+    bridge_type = _resolve_bridge_type(model_type, alloc_mode)
+    print(f"model_type={model_type} backend={backend} -> bridge_type={bridge_type}")
     config = TrainEngineConfig(
         backend=backend,
         experiment_name="test",
@@ -128,7 +140,6 @@ def make_engine(model_type, backend, mb_spec, vpp_size=1, init_optimizer=False):
             bridge_type=bridge_type,
         ),
     )
-    alloc_mode = ModelAllocation.from_str(backend)
     ft_spec = FinetuneSpec(total_train_epochs=1, dataset_size=128, train_batch_size=8)
     engine = MegatronEngine(config)
     engine.create_process_group(parallel_strategy=alloc_mode.parallel)

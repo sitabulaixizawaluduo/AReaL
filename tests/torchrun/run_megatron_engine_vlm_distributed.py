@@ -113,6 +113,26 @@ def mock_vlm_input(engine: "MegatronEngine", seed: int = 0) -> dict[str, Any]:
     }
 
 
+def _resolve_bridge_type(backend: str) -> str:
+    env_override = os.environ.get("AREAL_TEST_BRIDGE_TYPE")
+    if env_override:
+        return env_override
+    from transformers import AutoConfig
+
+    model_type = getattr(
+        AutoConfig.from_pretrained(VLM_MODEL_PATH, trust_remote_code=True),
+        "model_type",
+        "",
+    )
+    if str(model_type).startswith("qwen3_5"):
+        # Dual-bridge policy for the qwen3_5 family: megatron-bridge without
+        # CP (the long-validated baseline), mbridge when CP > 1 (the only
+        # bridge whose GDN supports CP on mcore 0.17).
+        cp_size = ModelAllocation.from_str(backend).parallel.context_parallel_size
+        return "mbridge" if cp_size > 1 else "megatron-bridge"
+    return "mbridge"
+
+
 def make_vlm_engine(
     backend: str,
     init_optimizer: bool = False,
@@ -127,7 +147,8 @@ def make_vlm_engine(
     coordination allocations can fail when other processes hold a few
     hundred MB on the same device.
     """
-    bridge_type = os.environ.get("AREAL_TEST_BRIDGE_TYPE", "mbridge")
+    bridge_type = _resolve_bridge_type(backend)
+    print(f"backend={backend} model={VLM_MODEL_PATH} -> bridge_type={bridge_type}")
     config = TrainEngineConfig(
         backend=backend,
         experiment_name="test-vlm",

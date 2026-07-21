@@ -503,6 +503,46 @@ def _construct_qwen3_5_param_to_load(
         )
         return _slice_generic_weight(mcore_param_shape, [full], tp_rank, tp_size)
 
+    if (
+        "mlp.experts.linear_fc1.weight" in mcore_weights_name
+        and len(hf_weights_safe_slice) == 1
+        and len(_get_shape(hf_weights_safe_slice[0])) == 3
+    ):
+        stacked = hf_weights_safe_slice[0]
+        local_idx = _parse_local_expert_idx(mcore_weights_name)
+        ep_rank = mpu.get_expert_model_parallel_rank()
+        ep_size = mpu.get_expert_model_parallel_world_size()
+        num_experts_per_rank = lang_config(hf_config).num_experts // ep_size
+        global_idx = local_idx + num_experts_per_rank * ep_rank
+        expert = stacked[global_idx]
+        if not isinstance(expert, torch.Tensor):
+            expert = expert[:]
+
+        gate, up = expert.chunk(2, dim=0)
+        gate = gate[
+            _get_tp_slice(_get_shape(gate), dim=0, tp_rank=tp_rank, tp_size=tp_size)
+        ]
+        up = up[_get_tp_slice(_get_shape(up), dim=0, tp_rank=tp_rank, tp_size=tp_size)]
+        return torch.cat([gate, up], dim=0).contiguous()
+
+    if (
+        "mlp.experts.linear_fc2.weight" in mcore_weights_name
+        and len(hf_weights_safe_slice) == 1
+        and len(_get_shape(hf_weights_safe_slice[0])) == 3
+    ):
+        stacked = hf_weights_safe_slice[0]
+        local_idx = _parse_local_expert_idx(mcore_weights_name)
+        ep_rank = mpu.get_expert_model_parallel_rank()
+        ep_size = mpu.get_expert_model_parallel_world_size()
+        num_experts_per_rank = lang_config(hf_config).num_experts // ep_size
+        global_idx = local_idx + num_experts_per_rank * ep_rank
+        expert = stacked[global_idx]
+        if not isinstance(expert, torch.Tensor):
+            expert = expert[:]
+        return expert[
+            _get_tp_slice(_get_shape(expert), dim=1, tp_rank=tp_rank, tp_size=tp_size)
+        ].contiguous()
+
     return None
 
 

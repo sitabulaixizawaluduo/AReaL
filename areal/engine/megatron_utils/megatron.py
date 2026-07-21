@@ -488,11 +488,55 @@ def convert_qwen3_5_moe_to_hf(
     layer_idx, rest = match.groups()
     prefix = f"model.language_model.layers.{layer_idx}"
 
+    def _normalize_qwen3_5_grouped_expert_layout(x: Tensor, fc_kind: str) -> Tensor:
+        """Normalize grouped expert tensor to HF layout.
+
+        HF ground truth for Qwen3.5-MoE:
+        - gate_up_proj: [E, 2*ffn, hidden]
+        - down_proj:    [E, hidden, ffn]
+
+        Megatron grouped runtime should match this already. The fallback transpose
+        below is only for legacy swapped layouts.
+        """
+        if x.ndim != 3:
+            return x
+        text_cfg = getattr(hf_config, "text_config", hf_config) if hf_config else None
+        hidden = getattr(text_cfg, "hidden_size", None)
+        ffn = getattr(text_cfg, "moe_intermediate_size", None)
+        if hidden is None or ffn is None:
+            return x
+
+        if fc_kind == "linear_fc1":
+            if x.shape[1:] == (2 * ffn, hidden):
+                return x
+            if x.shape[1:] == (hidden, 2 * ffn):
+                return x.transpose(1, 2).contiguous()
+            return x
+
+        if fc_kind == "linear_fc2":
+            if x.shape[1:] == (hidden, ffn):
+                return x
+            if x.shape[1:] == (ffn, hidden):
+                return x.transpose(1, 2).contiguous()
+            return x
+
+        return x
+
     # experts (grouped gemm fused-expert runtime format)
     if rest == "mlp.experts.linear_fc1":
-        return [(f"{prefix}.mlp.experts.gate_up_proj", param)]
+        return [
+            (
+                f"{prefix}.mlp.experts.gate_up_proj",
+                _normalize_qwen3_5_grouped_expert_layout(param, "linear_fc1"),
+            )
+        ]
     if rest == "mlp.experts.linear_fc2":
-        return [(f"{prefix}.mlp.experts.down_proj", param)]
+        return [
+            (
+                f"{prefix}.mlp.experts.down_proj",
+                _normalize_qwen3_5_grouped_expert_layout(param, "linear_fc2"),
+            )
+        ]
 
     # experts (ungrouped per-expert format)
     match = re.match(r"mlp\.experts\.(.+)\.weight(\d+)", rest)

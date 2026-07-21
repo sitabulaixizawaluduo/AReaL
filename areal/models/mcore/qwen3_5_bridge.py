@@ -29,6 +29,10 @@ def _get_text_config(hf_config):
     return hf_config.text_config if hasattr(hf_config, "text_config") else hf_config
 
 
+def _parse_expert_weight_idx(mcore_weights_name: str) -> int:
+    return int(mcore_weights_name.split(".weight")[-1])
+
+
 @register_model(["qwen3_5_moe"])
 class Qwen3_5MoeBridge(LLMBridge):
     """mbridge bridge for Qwen3.5-MoE text model path on top of a VL checkpoint."""
@@ -445,7 +449,7 @@ class Qwen3_5MoeBridge(LLMBridge):
         if "mlp.experts.linear_fc" in mcore_weights_name and len(hf_weights) == 1:
             w = hf_weights[0]
             if w.dim() == 3:
-                local_expert_id = int(mcore_weights_name.split("weight")[-1])
+                local_expert_id = _parse_expert_weight_idx(mcore_weights_name)
                 from megatron.core import mpu
 
                 ep_size = mpu.get_expert_model_parallel_world_size()
@@ -459,10 +463,51 @@ class Qwen3_5MoeBridge(LLMBridge):
 
         return super()._weight_to_mcore_format(mcore_weights_name, hf_weights)
 
+    def _stack_qwen3_5_grouped_expert_to_hf(
+        self,
+        mcore_weights_name: str,
+        hf_name: str,
+        mcore_weights: torch.Tensor,
+    ) -> tuple[list[str], list[torch.Tensor]]:
+        if not hasattr(self, "_qwen3_5_grouped_expert_buffers"):
+            self._qwen3_5_grouped_expert_buffers = {}
+
+        text_cfg = _get_text_config(self.hf_config)
+        num_experts = getattr(text_cfg, "num_experts", None)
+        if num_experts is None:
+            raise ValueError(
+                "Qwen3.5-MoE grouped expert export requires text_config.num_experts"
+            )
+
+        expert_idx = _parse_expert_weight_idx(mcore_weights_name)
+        key = (hf_name, str(mcore_weights.dtype), str(mcore_weights.device))
+        slots = self._qwen3_5_grouped_expert_buffers.setdefault(
+            key, [None] * num_experts
+        )
+        slots[expert_idx] = mcore_weights.contiguous()
+
+        if any(v is None for v in slots):
+            return [], []
+
+        stacked = torch.stack(slots, dim=0)
+        del self._qwen3_5_grouped_expert_buffers[key]
+        return [hf_name], [stacked]
+
     def _weight_to_hf_format(
         self, mcore_weights_name: str, mcore_weights: torch.Tensor
     ):
         hf_names = self._weight_name_mapping_mcore_to_hf(mcore_weights_name)
+
+        if (
+            len(hf_names) == 1
+            and "mlp.experts.linear_fc" in mcore_weights_name
+            and ".weight" in mcore_weights_name
+        ):
+            return self._stack_qwen3_5_grouped_expert_to_hf(
+                mcore_weights_name,
+                hf_names[0],
+                mcore_weights,
+            )
 
         if (
             mcore_weights_name.startswith("vision_model.blocks.")

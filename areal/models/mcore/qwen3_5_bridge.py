@@ -237,7 +237,9 @@ class Qwen3_5MoeBridge(LLMBridge):
             text_config_key="text_config"
             if hasattr(self.hf_config, "text_config")
             else None,
-            attention_backend=AttnBackend.fused,
+            attention_backend=AttnBackend[
+                os.environ.get("AREAL_ATTENTION_BACKEND", "fused")
+            ],
             layernorm_epsilon=text_config.rms_norm_eps,
             ffn_hidden_size=ffn_hidden_size,
             qk_layernorm=True,

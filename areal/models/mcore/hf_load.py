@@ -563,7 +563,15 @@ def _load_weight_with_bridge_worker(
             param_to_load.to_te_fp8_inplace(param)
         else:
             # NOTE: for megatron FP8 param, `param.copy_` will do quantization internally
-            param.copy_(param_to_load, non_blocking=True)
+            try:
+                param.copy_(param_to_load, non_blocking=True)
+            except RuntimeError as e:
+                raise RuntimeError(
+                    f"Failed to load '{local_name}' from HF weights "
+                    f"{hf_names}: mcore param shape {list(param.shape)}, "
+                    f"converted HF tensor shape {list(param_to_load.shape)}. "
+                    f"Original error: {e}"
+                ) from e
 
 
 def make_filename_bins(

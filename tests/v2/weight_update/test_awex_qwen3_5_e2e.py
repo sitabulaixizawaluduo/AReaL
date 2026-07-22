@@ -352,3 +352,29 @@ def test_awex_qwen3_5_moe_e2e_weight_update_ep(
         tag="qwen35_ep2",
         tmp_path_factory=tmp_path_factory,
     )
+
+
+@pytest.mark.parametrize(
+    "n_gpus,train_backend,infer_gpus,infer_tp",
+    [
+        (3, "megatron:d1c2", 1, 1),
+        (6, "megatron:d1t2c2", 2, 2),
+    ],
+    ids=["2t-cp2-1i-tp1", "4t-tp2cp2-2i-tp2"],
+)
+def test_awex_qwen3_5_moe_e2e_weight_update_cp(
+    n_gpus, train_backend, infer_gpus, infer_tp, tmp_path_factory
+):
+    """CP>1 on the train side: CP ranks hold weight replicas, so they all
+    report identical full tensors (dp_replicated) and awex must still build
+    a plan that updates every inference shard exactly once."""
+    if current_platform.device_count() < n_gpus:
+        pytest.skip(f"This test requires {n_gpus} GPUs")
+    _run_qwen3_5_awex_e2e(
+        n_gpus=n_gpus,
+        train_backend=train_backend,
+        infer_gpus=infer_gpus,
+        infer_tp=infer_tp,
+        tag=f"qwen35_cp_{train_backend.split(':')[1]}_itp{infer_tp}",
+        tmp_path_factory=tmp_path_factory,
+    )

@@ -79,6 +79,12 @@ def main():
         num_experts_per_tok=args.top_k,
         max_position_embeddings=4096,
         tie_word_embeddings=False,
+        # HF derives layer_types from this kwarg (default 4) but only
+        # serializes the derived list; sglang's Qwen3NextConfig-based
+        # layers_block_type property reads full_attention_interval directly
+        # from config.json (release checkpoints carry it), so the fixture
+        # must persist it explicitly or SGLang fails at model build.
+        full_attention_interval=4,
         # megatron-bridge derives params_dtype from the HF sub-config (the
         # engine's dtype setting is ignored on the megatron-bridge path). An
         # unset dtype falls back to fp32, for which no TE attention backend

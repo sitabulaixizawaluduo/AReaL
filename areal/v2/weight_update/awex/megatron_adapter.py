@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import gc
 import os
+import re
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -24,6 +25,7 @@ from awex.util.tensor_util import (
     group_tensors_by_shape_and_dtype,
 )
 
+from areal.engine.core.model import is_qwen_vl_model
 from areal.utils import logging
 from areal.v2.weight_update.awex import (
     awex_wu_use_group,
@@ -41,6 +43,36 @@ if TYPE_CHECKING:
     from areal.engine.megatron_engine import MegatronEngine
 
 logger = logging.getLogger("AwexMegatronAdapter")
+
+
+_QWEN_VL_VISUAL_QKV_RE = re.compile(
+    r"^(visual\.blocks\.\d+\.attn\.)qkv(\.(?:weight|bias))$"
+)
+
+
+def _split_qwen_vl_visual_qkv(
+    hf_name: str, tensor: torch.Tensor
+) -> list[tuple[str, torch.Tensor]] | None:
+    """Split mbridge's fused visual-tower QKV into HF's q/k/v_proj triplet.
+
+    Why: HF's Qwen VL modeling refactored the visual attention from a fused
+    ``qkv`` linear into separate ``q_proj``/``k_proj``/``v_proj``. mbridge
+    still exports the fused HF name, while SGLang/vLLM already expect the
+    split names — so awex's transfer plan rejects the mismatch. The vision
+    tower has no GQA, and mbridge lays the fused tensor out as HF grouped
+    ``[Q_all | K_all | V_all]``, so a plain ``chunk(3, dim=0)`` recovers the
+    three projections.
+    """
+    m = _QWEN_VL_VISUAL_QKV_RE.match(hf_name)
+    if m is None:
+        return None
+    prefix, suffix = m.group(1), m.group(2)
+    q, k, v = tensor.chunk(3, dim=0)
+    return [
+        (f"{prefix}q_proj{suffix}", q),
+        (f"{prefix}k_proj{suffix}", k),
+        (f"{prefix}v_proj{suffix}", v),
+    ]
 
 
 class AwexMegatronAdapter(AwexTrainingAdapter):
@@ -286,6 +318,7 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         tie_word_embeddings = getattr(
             self._engine.hf_config, "tie_word_embeddings", False
         )
+        split_visual_qkv = self._engine.is_vision_model and is_qwen_vl_model(model_name)
 
         for mcore_name, param in get_named_parameters(
             self._engine.model, num_moe_experts
@@ -308,7 +341,16 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             ):
                 if tie_word_embeddings and hf_name == "lm_head.weight":
                     continue
-                yield hf_name, tensor.detach()
+                tensor = tensor.detach()
+                split = (
+                    _split_qwen_vl_visual_qkv(hf_name, tensor)
+                    if split_visual_qkv
+                    else None
+                )
+                if split is None:
+                    yield hf_name, tensor
+                else:
+                    yield from split
 
     # ── Colocated weight transfer methods ─────────────────────────────────
 

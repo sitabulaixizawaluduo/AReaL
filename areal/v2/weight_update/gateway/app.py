@@ -167,6 +167,56 @@ def _merge_training_meta_by_name(meta_list: list[dict]) -> list[dict]:
     return list(by_name.values()) + overflow
 
 
+def _merge_infer_meta_by_name(meta_list: list[dict]) -> list[dict]:
+    """Merge serialized inference ParameterMeta entries by parameter name.
+
+    With inference TP > 1 each scheduler rank reports its own shard, so the
+    same parameter name appears ``tp_size`` times.  ``TransferPlanBuilder``
+    indexes parameters with ``{meta.name: meta}``, so all but the last shard
+    would silently be dropped and the remaining TP ranks would never receive
+    weights.  Merge the shards of one engine instance into a single replica,
+    deduplicating by ``global_rank``: multiple DP engine replicas report
+    identical instance-local metadata (the builder projects engine offsets
+    via ``num_infer_engines``), so per-engine duplicates must collapse.
+    """
+
+    def _data(obj):
+        return obj.get("data", obj) if isinstance(obj, dict) else obj
+
+    def _shard_rank(shard) -> Any:
+        d = _data(shard)
+        return d.get("global_rank") if isinstance(d, dict) else None
+
+    by_name: dict[str, dict] = {}
+    seen_ranks: dict[str, set] = {}
+    overflow: list[dict] = []
+    for pm in meta_list:
+        data = _data(pm)
+        name = data.get("name") if isinstance(data, dict) else None
+        if name is None:
+            logger.warning("Found inference parameter metadata with no name: %s", pm)
+            overflow.append(pm)
+            continue
+
+        new_shards = data.get("shards", [])
+        if name not in by_name:
+            by_name[name] = pm
+            seen_ranks[name] = {_shard_rank(s) for s in new_shards}
+            continue
+
+        fresh = [s for s in new_shards if _shard_rank(s) not in seen_ranks[name]]
+        if not fresh:
+            continue
+        seen_ranks[name].update(_shard_rank(s) for s in fresh)
+        existing_data = _data(by_name[name])
+        existing_data.setdefault("shards", []).extend(fresh)
+        ex_replicas = existing_data.get("replicas", [])
+        if ex_replicas:
+            ex_rep_data = _data(ex_replicas[0])
+            ex_rep_data.setdefault("shards", []).extend(fresh)
+    return list(by_name.values()) + overflow
+
+
 def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
     config = config or WeightUpdateConfig()
 
@@ -321,6 +371,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             else:
                 infer_params_meta.append(meta)
 
+        infer_params_meta = _merge_infer_meta_by_name(infer_params_meta)
         kv_store.put(pair_name, "training_params_meta", training_params_meta)
         kv_store.put(pair_name, "infer_params_meta", infer_params_meta)
 
@@ -457,6 +508,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             else:
                 infer_params_meta.append(meta)
 
+        infer_params_meta = _merge_infer_meta_by_name(infer_params_meta)
         kv_store.put(pair_name, "training_params_meta", training_params_meta)
         kv_store.put(pair_name, "infer_params_meta", infer_params_meta)
 

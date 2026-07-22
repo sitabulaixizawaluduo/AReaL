@@ -43,6 +43,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger("AwexMegatronAdapter")
 
 
+def _build_dtype_map(infer_meta) -> dict[str, torch.dtype]:
+    """Build ``name -> torch.dtype`` from the inference-side ParameterMeta list."""
+    dtype_map: dict[str, torch.dtype] = {}
+    for meta in infer_meta or []:
+        name = getattr(meta, "name", None)
+        dtype = getattr(meta, "dtype", None)
+        if name is None and isinstance(meta, dict):
+            name = meta.get("name")
+            dtype = meta.get("dtype")
+        if name is None or dtype is None:
+            continue
+        if isinstance(dtype, str):
+            dtype = getattr(torch, dtype.replace("torch.", ""), None)
+        if isinstance(dtype, torch.dtype):
+            dtype_map[str(name)] = dtype
+    return dtype_map
+
+
 class AwexMegatronAdapter(AwexTrainingAdapter):
     """Awex training adapter for MegatronEngine supporting DP, TP, and PP.
 
@@ -69,6 +87,10 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._colocate_admin_api_key: str = "areal-admin-key"
         self._colocate_http_client: httpx.Client | None = None
         self._colocate_timeout_s: float = 120.0
+        # name -> inference-declared dtype, built from infer meta at
+        # init_weight_update_group time; send tensors are cast to it so NCCL
+        # byte counts match on both ends (e.g. sglang keeps A_log in fp32).
+        self._infer_dtype_map: dict[str, torch.dtype] = {}
 
     @property
     def parallelism_strategy(self) -> dict:
@@ -165,6 +187,7 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._transfer_rank = transfer_rank
 
         infer_meta, train_meta = fetch_kv_metadata(kv_store_url, pair_name)
+        self._infer_dtype_map = _build_dtype_map(infer_meta)
 
         builder = TransferPlanBuilder(
             infer_world_size=infer_world_size,
@@ -195,6 +218,7 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             raise RuntimeError("Transfer rank is not initialized")
 
         params = self.get_local_shard_parameters()
+        params = self._cast_to_infer_dtypes(params)
         send_ops, _, _ = nccl_build_send_ops(
             params,
             self._transfer_plan,
@@ -270,11 +294,24 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
     def _iter_hf_params(self):
         """Yield (hf_name, tensor) for every parameter on this rank.
 
-        Uses get_named_parameters + all_gather_param + convert_to_hf to produce
-        HF-style per-expert names (e.g. experts.0.gate_proj.weight). The SGLang
-        adapter's _unfuse_params converts SGLang's fused w13/w2 format to the
-        same per-expert names, so both sides match for the transfer plan.
+        Two paths:
+
+        - Registry (default): get_named_parameters + all_gather_param +
+          convert_to_hf produce HF-style per-expert names (e.g.
+          experts.0.gate_proj.weight). Each rank naturally yields only its
+          own PP stage / EP experts.
+        - Bridge (Qwen3.5 hybrid): ``convert_to_hf`` has no converter for the
+          gated-deltanet architecture, so we delegate the mcore->HF
+          conversion to ``bridge.export_hf_weights`` (the same source the
+          xccl path uses) and re-apply PP/EP ownership manually, because the
+          bridge iterates the GLOBAL parameter set on every rank.
+
+        The SGLang adapter's _unfuse_params converts SGLang's fused formats
+        to the same names, so both sides match for the transfer plan.
         """
+        if self._use_bridge_export():
+            yield from self._iter_hf_params_via_bridge()
+            return
         from areal.engine.megatron_utils.megatron import (
             all_gather_param,
             convert_to_hf,
@@ -309,6 +346,117 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
                 if tie_word_embeddings and hf_name == "lm_head.weight":
                     continue
                 yield hf_name, tensor.detach()
+
+    # ── Bridge export path (Qwen3.5 hybrid) ───────────────────────────────
+
+    def _use_bridge_export(self) -> bool:
+        """Mirror megatron_engine's bridge-delegation gate, restricted to
+        model families without a convert_to_hf registry entry (Qwen3.5)."""
+        from areal.engine.core.model import is_qwen3_5_model
+
+        engine = self._engine
+        return (
+            is_qwen3_5_model(getattr(engine.hf_config, "model_type", ""))
+            and getattr(engine, "bridge_cls", None) == "megatron-bridge"
+            and getattr(engine.mcore_config, "use_bridge_for_update_weights", False)
+            and engine.bridge is not None
+            and not getattr(engine, "quantization_config", None)
+            and not engine.config.use_lora
+        )
+
+    def _iter_hf_params_via_bridge(self):
+        """Stream bridge-exported HF tensors, filtered by PP/EP ownership.
+
+        Every rank must run the FULL export loop (the bridge's TP/EP/PP
+        gathers are collectives); ownership only decides which tensors are
+        kept for reporting/sending.
+        """
+        from megatron.core import parallel_state as mpu
+
+        from areal.v2.weight_update.awex.qwen3_5 import (
+            TrainOwnership,
+            normalize_train_hf_name,
+            split_train_hf_param,
+            text_config,
+        )
+
+        engine = self._engine
+        hf_config = engine.hf_config
+        assert engine.bridge is not None  # guarded by _use_bridge_export
+        tie_word_embeddings = getattr(hf_config, "tie_word_embeddings", False)
+        ownership = TrainOwnership(
+            owned_layers=self._owned_layer_indices(),
+            is_pp_first=mpu.is_pipeline_first_stage(ignore_virtual=True),
+            is_pp_last=mpu.is_pipeline_last_stage(ignore_virtual=True),
+            ep_rank=mpu.get_expert_model_parallel_rank(),
+            ep_size=mpu.get_expert_model_parallel_world_size(),
+            num_experts=getattr(text_config(hf_config), "num_experts", None),
+        )
+
+        for raw_name, tensor in engine.bridge.export_hf_weights(
+            engine.model,
+            cpu=False,
+            show_progress=False,
+        ):
+            name = normalize_train_hf_name(raw_name)
+            if name is None:
+                continue
+            if tie_word_embeddings and name == "lm_head.weight":
+                continue
+            for common_name, part in split_train_hf_param(name, tensor, hf_config):
+                if not ownership.owns(common_name):
+                    continue
+                yield common_name, part.detach()
+
+    def _owned_layer_indices(self) -> set[int]:
+        """Global (0-based) transformer layer indices held by this PP rank.
+
+        Reads mcore's 1-based ``layer_number`` attribute from the local model
+        chunks, which is globally correct across PP/VPP.
+        """
+        from megatron.core import parallel_state as mpu
+
+        models = (
+            self._engine.model
+            if isinstance(self._engine.model, (list, tuple))
+            else [self._engine.model]
+        )
+        owned: set[int] = set()
+        for model in models:
+            if model is None:
+                continue
+            for module in model.modules():
+                layer_number = getattr(module, "layer_number", None)
+                if isinstance(layer_number, int):
+                    owned.add(layer_number - 1)
+        if not owned and mpu.get_pipeline_model_parallel_world_size() > 1:
+            raise RuntimeError(
+                "Could not derive PP layer ownership: no module exposes "
+                "'layer_number'. awex bridge export requires it under PP>1."
+            )
+        return owned
+
+    def _cast_to_infer_dtypes(
+        self, params: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Cast send tensors to the inference-declared dtypes.
+
+        NCCL P2P moves raw bytes; a dtype mismatch (e.g. sglang holds
+        ``A_log`` in fp32 while training exports bf16) desynchronizes
+        send/recv byte counts and manifests as a hang. The receiver's dtype
+        is authoritative because weights are written in place there.
+        """
+        if not self._infer_dtype_map:
+            return params
+        cast = 0
+        for name, tensor in params.items():
+            want = self._infer_dtype_map.get(name)
+            if want is not None and want != tensor.dtype:
+                params[name] = tensor.to(want)
+                cast += 1
+        if cast:
+            logger.info("Cast %d send tensors to inference-declared dtypes", cast)
+        return params
 
     # ── Colocated weight transfer methods ─────────────────────────────────
 

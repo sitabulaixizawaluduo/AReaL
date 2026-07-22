@@ -136,7 +136,25 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         for efficiency.  For MoE models, SGLang also fuses all routed experts
         into ``experts.w13_weight`` (gate+up) and ``experts.w2_weight`` (down).
         The training side keeps per-expert HF names, so we unfuse here to match.
+
+        Qwen3.5 hybrid models (gated deltanet + gated attention) have their
+        own fusion layout and are delegated to a dedicated mapping.
         """
+        if self._is_qwen3_5():
+            from areal.v2.weight_update.awex.qwen3_5 import unfuse_sglang_param
+
+            ctx = self._get_model_context()
+            if int(getattr(self._scheduler.server_args, "ep_size", 1)) != 1:
+                raise NotImplementedError(
+                    "awex qwen3.5 weight sync does not support inference-side "
+                    "expert parallelism (ep_size > 1)"
+                )
+            return unfuse_sglang_param(
+                name,
+                tensor,
+                self._get_model().config,
+                tp_size=int(ctx["tp_size"]),
+            )
         if "qkv_proj" in name:
             cfg = self._get_model().config
             num_heads = cfg.num_attention_heads
@@ -231,19 +249,45 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         model_context = self._get_model_context()
         return get_sglang_rank_info(model_context, engine_rank=0)
 
-    def _build_sharding_strategy(self, rank_info: RankInfo):
+    def _model_arch_name(self) -> str:
         model = self._get_model()
-        model_name = None
         model_config = getattr(model, "config", None)
         if model_config is not None:
             architectures = getattr(model_config, "architectures", None)
             if architectures and len(architectures) > 0:
-                model_name = architectures[0]
+                return architectures[0]
+        return type(model).__name__
 
-        if model_name is None:
-            model_name = type(model).__name__
+    def _is_qwen3_5(self) -> bool:
+        from areal.v2.weight_update.awex.qwen3_5 import (
+            QWEN3_5_MOE_ARCHITECTURES,
+            is_qwen3_5_moe_hf_config,
+        )
 
+        if self._model_arch_name() in QWEN3_5_MOE_ARCHITECTURES:
+            return True
+        model_config = getattr(self._get_model(), "config", None)
+        return model_config is not None and is_qwen3_5_moe_hf_config(model_config)
+
+    def _build_sharding_strategy(self, rank_info: RankInfo):
+        model_name = self._model_arch_name()
         infer_engine_config = self._scheduler.server_args
+
+        if self._is_qwen3_5():
+            from areal.v2.weight_update.awex.qwen3_5 import (
+                Qwen3_5MoeShardingStrategy,
+            )
+
+            return Qwen3_5MoeShardingStrategy(
+                engine_name="sglang",
+                enable_dp_attention=infer_engine_config.enable_dp_attention,
+                enable_dp_lm_head=infer_engine_config.enable_dp_lm_head,
+                moe_dense_tp_size=infer_engine_config.moe_dense_tp_size,
+                tp_size=rank_info.tp_size,
+                ep_size=infer_engine_config.ep_size,
+                ep_tp_size=rank_info.ep_tp_size,
+                rank_info=rank_info,
+            )
         return get_sglang_sharding_strategy(model_name, infer_engine_config, rank_info)
 
     def get_weight_metadata(self) -> list[ParameterMeta]:

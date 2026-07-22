@@ -157,6 +157,13 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         for hf_name, tensor in self._iter_hf_params():
             if required is not None and hf_name not in required:
                 continue
+            # Views that share a larger base storage (e.g. per-expert slices
+            # of the bridge's fused [E, 2I, H] export) would pin the whole
+            # base tensor for as long as the dict lives; clone them so the
+            # base can be freed as the export streams on.
+            storage_bytes = tensor.untyped_storage().size()
+            if storage_bytes != tensor.numel() * tensor.element_size():
+                tensor = tensor.clone()
             result[hf_name] = tensor
         return result
 
@@ -217,7 +224,21 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         if self._transfer_rank is None:
             raise RuntimeError("Transfer rank is not initialized")
 
-        params = self.get_local_shard_parameters()
+        # Materialize ONLY the params this rank actually sends. The transfer
+        # plan picks one sender per replica group, so the full ownership set
+        # (all-gathered FULL dense tensors + owned experts) can be several
+        # times larger than the send set -- holding it alongside the sharded
+        # mcore weights OOMs real-size checkpoints. All ranks still run the
+        # full export iteration (its gathers are collectives); non-required
+        # tensors are dropped as they stream by.
+        required = sorted(
+            {
+                op.send_shard_meta.name
+                for ops in self._transfer_plan.operations.values()
+                for op in ops
+            }
+        )
+        params = self.get_local_shard_parameters(required)
         params = self._cast_to_infer_dtypes(params)
         send_ops, _, _ = nccl_build_send_ops(
             params,
@@ -232,6 +253,9 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             use_group=awex_wu_use_group(),
         )
         dist.barrier(group=self._weights_update_group)
+        del send_ops, params
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def batch_isend_irecv(self, **kwargs) -> None:
         setup_kwargs = {k: v for k, v in kwargs.items() if k != "world_size"}

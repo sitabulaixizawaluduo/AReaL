@@ -139,11 +139,23 @@ def main():
 
     vocab = {"<|endoftext|>": 0, "<|pad|>": 1}
     vocab.update({f"<tok{i}>": i for i in range(2, VOCAB_SIZE)})
+    # SGLang's server warmup issues a chat-completion request and aborts
+    # startup when tokenizer.chat_template is missing. Content may arrive as
+    # a plain string or as VLM-style [{"type": "text", ...}] parts.
+    chat_template = (
+        "{% for message in messages %}"
+        "{% if message['content'] is string %}{{ message['content'] }}"
+        "{% else %}{% for part in message['content'] %}"
+        "{% if part['type'] == 'text' %}{{ part['text'] }}{% endif %}"
+        "{% endfor %}{% endif %}"
+        "{% endfor %}"
+    )
     tokenizer = PreTrainedTokenizerFast(
         tokenizer_object=Tokenizer(WordLevel(vocab, unk_token="<|endoftext|>")),
         eos_token="<|endoftext|>",
         pad_token="<|pad|>",
         unk_token="<|endoftext|>",
+        chat_template=chat_template,
     )
     processor = Qwen3VLProcessor(
         image_processor=Qwen2VLImageProcessorFast(
@@ -151,6 +163,7 @@ def main():
         ),
         tokenizer=tokenizer,
         video_processor=Qwen3VLVideoProcessor(),
+        chat_template=chat_template,
     )
     processor.save_pretrained(args.output)
     print(

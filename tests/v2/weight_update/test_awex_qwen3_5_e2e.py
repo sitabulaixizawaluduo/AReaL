@@ -73,16 +73,28 @@ def _attention_sample_names(model_path: str) -> list[str]:
     with open(os.path.join(model_path, "config.json")) as f:
         cfg = json.load(f)
     text_cfg = cfg.get("text_config", cfg)
-    block_types = text_cfg.get("layers_block_type", [])
+    names: list[str] = []
+    # Cover the LAST expert too: under EP it lives on the highest ep_rank,
+    # so ep_rank>0 ownership/offset bugs cannot hide behind expert-0 samples.
+    num_experts = text_cfg.get("num_experts")
+    if num_experts:
+        names += [
+            f"model.layers.0.mlp.experts.{num_experts - 1}.gate_proj.weight",
+            f"model.layers.0.mlp.experts.{num_experts - 1}.down_proj.weight",
+        ]
+    block_types = text_cfg.get("layer_types") or text_cfg.get(
+        "layers_block_type", []
+    )
     for idx, kind in enumerate(block_types):
         if kind == "attention" or kind == "full_attention":
-            return [
+            names += [
                 f"model.layers.{idx}.self_attn.q_proj.weight",
                 f"model.layers.{idx}.self_attn.k_proj.weight",
                 f"model.layers.{idx}.self_attn.o_proj.weight",
                 f"model.layers.{idx}.self_attn.q_norm.weight",
             ]
-    return []
+            break
+    return names
 
 
 def _validate_qwen3_5(

@@ -237,7 +237,7 @@ def _run_qwen3_5_awex_e2e(
         ),
         consumer_batch_size=8,
         max_head_offpolicyness=1024,
-        setup_timeout=600.0,
+        setup_timeout=float(os.environ.get("AREAL_E2E_SETUP_TIMEOUT", "600")),
         admin_api_key="test-admin",
     )
     inf_ctrl = RolloutControllerV2(config=inf_config, scheduler=scheduler)
@@ -247,9 +247,17 @@ def _run_qwen3_5_awex_e2e(
         experiment_name=f"test-awex-{tag}",
         trial_name="t0",
         path=model_path,
-        optimizer=OptimizerConfig(),
+        # Weight sync never touches optimizer state, and Megatron mixed
+        # precision costs ~14 bytes/param with Adam (bf16 weights + fp32
+        # master + m/v) -- prohibitive for real-size checkpoints on a few
+        # GPUs. Opt in via AREAL_E2E_WITH_OPTIMIZER=1 if needed.
+        optimizer=(
+            OptimizerConfig()
+            if os.environ.get("AREAL_E2E_WITH_OPTIMIZER", "0") == "1"
+            else None
+        ),
         _version="v2",
-        setup_timeout=600.0,
+        setup_timeout=float(os.environ.get("AREAL_E2E_SETUP_TIMEOUT", "600")),
         megatron=MegatronEngineConfig(
             bridge_type="megatron-bridge",
             use_bridge_for_update_weights=True,

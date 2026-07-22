@@ -109,16 +109,37 @@ def _validate_qwen3_5(
 
     from areal.v2.weight_update.awex.qwen3_5 import Qwen3_5MoeShardingStrategy
 
-    train_paths = []
-    for i, url in enumerate(train_worker_urls):
-        p = str(param_dir / f"qwen35_train_rank{i}.pt")
-        train_paths.append(p)
+    # get_parameters triggers bridge.export_hf_weights on the train side,
+    # which is a COLLECTIVE across all train ranks: every worker must enter
+    # it concurrently or the first one blocks forever waiting for peers.
+    import concurrent.futures
+
+    train_paths = [
+        str(param_dir / f"qwen35_train_rank{i}.pt")
+        for i in range(len(train_worker_urls))
+    ]
+
+    def _fetch_train(args):
+        i, url, p = args
         resp = httpx.post(
             f"{url}/awex/debug/get_parameters",
             json={"save_path": p, "names": names},
             timeout=300.0,
         )
         assert resp.status_code == 200, f"train get_parameters[{i}]: {resp.text}"
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(train_worker_urls)
+    ) as pool:
+        list(
+            pool.map(
+                _fetch_train,
+                [
+                    (i, url, p)
+                    for i, (url, p) in enumerate(zip(train_worker_urls, train_paths))
+                ],
+            )
+        )
 
     inf_path = str(param_dir / "qwen35_infer_rank0.pt")
     resp = httpx.post(

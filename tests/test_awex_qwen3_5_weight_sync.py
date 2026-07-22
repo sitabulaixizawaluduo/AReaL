@@ -397,6 +397,64 @@ def test_merge_infer_meta_by_name_merges_tp_and_dedupes_engines():
     assert replica_ranks == [0, 1]
 
 
+def test_merge_training_meta_splits_identical_copies_into_replicas():
+    from areal.v2.weight_update.gateway.app import _merge_training_meta_by_name
+
+    def shard(rank, offset, shape):
+        return {
+            "data": {
+                "global_rank": rank,
+                "global_offset": list(offset),
+                "shape": list(shape),
+            }
+        }
+
+    def meta(name, rank, offset, shape):
+        s = shard(rank, offset, shape)
+        return {
+            "data": {
+                "name": name,
+                "shards": [s],
+                "replicas": [{"data": {"shards": [s]}}],
+            }
+        }
+
+    # Megatron TP/CP peers: 4 identical FULL copies -> 4 separate replicas,
+    # so the plan builder picks exactly one sender per parameter.
+    merged = _merge_training_meta_by_name(
+        [meta("w", r, (0, 0), (8, 4)) for r in range(4)]
+    )
+    assert len(merged) == 1
+    replicas = merged[0]["data"]["replicas"]
+    assert len(replicas) == 4
+    assert all(len(rep["data"]["shards"]) == 1 for rep in replicas)
+
+    # FSDP workers: complementary slices -> ONE replica holding both shards.
+    merged = _merge_training_meta_by_name(
+        [
+            meta("w", 0, (0, 0), (4, 4)),
+            meta("w", 1, (4, 0), (4, 4)),
+        ]
+    )
+    assert len(merged) == 1
+    replicas = merged[0]["data"]["replicas"]
+    assert len(replicas) == 1
+    assert len(replicas[0]["data"]["shards"]) == 2
+
+    # Rotation is deterministic for a given name.
+    a = _merge_training_meta_by_name([meta("w", r, (0, 0), (8, 4)) for r in range(4)])
+    b = _merge_training_meta_by_name([meta("w", r, (0, 0), (8, 4)) for r in range(4)])
+    ranks_a = [
+        rep["data"]["shards"][0]["data"]["global_rank"]
+        for rep in a[0]["data"]["replicas"]
+    ]
+    ranks_b = [
+        rep["data"]["shards"][0]["data"]["global_rank"]
+        for rep in b[0]["data"]["replicas"]
+    ]
+    assert ranks_a == ranks_b
+
+
 def _shard_meta(name, tensor, rank, tp, stype, dim, num_shards):
     from awex.meta.weight_meta import ParameterShardMeta
 

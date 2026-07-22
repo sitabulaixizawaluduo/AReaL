@@ -134,36 +134,74 @@ def _get_own_ip() -> str:
 def _merge_training_meta_by_name(meta_list: list[dict]) -> list[dict]:
     """Merge serialized training ParameterMeta entries by parameter name.
 
-    Each FSDP worker reports metadata for its own local shard only.
-    With ``dp_size > 1`` the same parameter name appears once per worker,
-    each carrying a single shard.  The ``TransferPlanBuilder`` indexes
-    parameters with ``{meta.name: meta}``, so duplicates silently shadow
-    earlier entries.  We merge them here so the builder sees one
-    ``ParameterMeta`` per name with all shards in a single replica.
+    The ``TransferPlanBuilder`` indexes parameters with ``{meta.name: meta}``,
+    so per-worker duplicates silently shadow earlier entries and must be
+    merged into one ``ParameterMeta`` per name. Two shard relationships must
+    be distinguished:
+
+    - COMPLEMENTARY shards (FSDP: each worker holds a different slice) are
+      appended to the first replica so together they form one full copy.
+    - IDENTICAL copies (Megatron TP/CP peers each report the same
+      all-gathered FULL tensor) become SEPARATE replicas: the plan builder
+      assigns one training replica per inference replica, so folding copies
+      into one replica would make EVERY peer send the full tensor -- N x the
+      traffic, and at real checkpoint sizes the per-rank send set OOMs.
+
+    Replica order is rotated by a stable per-name hash so the chosen sender
+    (replica 0) spreads across ranks instead of piling on the first worker.
     """
+    import zlib
+
+    def _data(obj):
+        return obj.get("data", obj) if isinstance(obj, dict) else obj
+
+    def _shard_key(shard) -> tuple:
+        d = _data(shard)
+        return (
+            tuple(d.get("global_offset") or ()),
+            tuple(d.get("shape") or ()),
+        )
+
     by_name: dict[str, dict] = {}
+    primary_keys: dict[str, set] = {}
     overflow: list[dict] = []
     for pm in meta_list:
-        data = pm.get("data", pm) if isinstance(pm, dict) else pm
+        data = _data(pm)
         name = data.get("name") if isinstance(data, dict) else None
         if name is None:
             logger.warning("Found parameter metadata with no name: %s", pm)
             overflow.append(pm)
             continue
 
+        new_shards = data.get("shards", [])
         if name not in by_name:
             by_name[name] = pm
+            primary_keys[name] = {_shard_key(s) for s in new_shards}
+            continue
+
+        existing_data = _data(by_name[name])
+        existing_data.setdefault("shards", []).extend(new_shards)
+        ex_replicas = existing_data.setdefault("replicas", [])
+        new_replicas = data.get("replicas", [])
+        if not ex_replicas or not new_replicas:
+            continue
+
+        keys = [_shard_key(s) for s in new_shards]
+        if keys and all(k in primary_keys[name] for k in keys):
+            ex_replicas.extend(new_replicas)
         else:
-            existing_data = by_name[name].get("data", by_name[name])
-            existing_data.setdefault("shards", []).extend(data.get("shards", []))
-            ex_replicas = existing_data.get("replicas", [])
-            new_replicas = data.get("replicas", [])
-            if ex_replicas and new_replicas:
-                ex_rep_data = ex_replicas[0].get("data", ex_replicas[0])
-                new_rep_data = new_replicas[0].get("data", new_replicas[0])
-                ex_rep_data.setdefault("shards", []).extend(
-                    new_rep_data.get("shards", [])
-                )
+            primary_keys[name].update(keys)
+            ex_rep_data = _data(ex_replicas[0])
+            new_rep_data = _data(new_replicas[0])
+            ex_rep_data.setdefault("shards", []).extend(
+                new_rep_data.get("shards", [])
+            )
+
+    for name, pm in by_name.items():
+        replicas = _data(pm).get("replicas") or []
+        if len(replicas) > 1:
+            offset = zlib.crc32(name.encode()) % len(replicas)
+            _data(pm)["replicas"] = replicas[offset:] + replicas[:offset]
     return list(by_name.values()) + overflow
 
 

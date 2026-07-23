@@ -785,6 +785,13 @@ class WorkflowExecutor:
         self._tokenizer = None
         self._tokenizer_lock = threading.Lock()
 
+        # Lazy-loaded processor for VLM multi-modal augmentation. ``_processor``
+        # is a sentinel-free tri-state: ``None`` = not yet attempted, ``False`` =
+        # attempted and unavailable (text-only path), otherwise the processor.
+        self._processor: Any = None
+        self._processor_attempted = False
+        self._processor_lock = threading.Lock()
+
     def _resolve_dp_world_size(self):
         if not dist.is_initialized():
             return 1
@@ -815,6 +822,37 @@ class WorkflowExecutor:
 
             self._tokenizer = load_hf_tokenizer(tokenizer_path)
             return self._tokenizer
+
+    def _get_processor(self):
+        """Lazy-load an ``AutoProcessor`` if the checkpoint provides one.
+
+        Returns ``None`` for text-only models (``AutoProcessor.from_pretrained``
+        raises), so ``to_tensor_dict`` can skip the multi-modal branch cleanly.
+        The attempt is memoised so we don't retry on every trajectory.
+        """
+        if self._processor_attempted:
+            return self._processor or None
+
+        tokenizer_path = self.config.tokenizer_path
+        if not tokenizer_path:
+            self._processor_attempted = True
+            return None
+
+        with self._processor_lock:
+            if self._processor_attempted:
+                return self._processor or None
+            try:
+                from transformers import AutoProcessor
+
+                self._processor = AutoProcessor.from_pretrained(tokenizer_path)
+            except Exception:
+                logging.getLogger("WorkflowExecutor").info(
+                    "No AutoProcessor for %s; assuming text-only model",
+                    tokenizer_path,
+                )
+                self._processor = None
+            self._processor_attempted = True
+            return self._processor or None
 
     def _get_dump_dir(self, is_eval: bool) -> str | None:
         """Get the dump directory based on config and is_eval flag."""
@@ -1168,8 +1206,12 @@ class WorkflowExecutor:
                     isinstance(v, InteractionWithTokenLogpReward) for v in traj.values()
                 ):
                     if all(v.has_tensor_data for v in traj.values()):
+                        processor = self._get_processor()
                         traj = concat_padded_tensors(
-                            [v.to_tensor_dict() for v in traj.values()]
+                            [
+                                v.to_tensor_dict(processor=processor)
+                                for v in traj.values()
+                            ]
                         )
                     else:
                         traj = concat_string_interactions(traj)

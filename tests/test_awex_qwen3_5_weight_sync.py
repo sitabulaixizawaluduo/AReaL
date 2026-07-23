@@ -52,6 +52,11 @@ NUM_EXPERTS = 4
 MOE_INTER = 16
 SHARED_INTER = 16
 VOCAB = 64
+VIS_HIDDEN = 16
+VIS_HEADS = 2
+VIS_INTER = 32
+VIS_POS = 16
+VIS_PATCH_IN = 48  # in_channels * temporal_patch * patch^2 flattened for conv
 
 
 def make_cfg() -> SimpleNamespace:
@@ -118,6 +123,29 @@ def make_hf_state() -> dict[str, torch.Tensor]:
     state["model.embed_tokens.weight"] = _t(VOCAB, HIDDEN)
     state["model.norm.weight"] = _t(HIDDEN)
     state["lm_head.weight"] = _t(VOCAB, HIDDEN)
+
+    vb = "model.visual.blocks.0"
+    state[f"{vb}.attn.qkv.weight"] = _t(3 * VIS_HIDDEN, VIS_HIDDEN)
+    state[f"{vb}.attn.qkv.bias"] = _t(3 * VIS_HIDDEN)
+    state[f"{vb}.attn.proj.weight"] = _t(VIS_HIDDEN, VIS_HIDDEN)
+    state[f"{vb}.attn.proj.bias"] = _t(VIS_HIDDEN)
+    state[f"{vb}.mlp.linear_fc1.weight"] = _t(VIS_INTER, VIS_HIDDEN)
+    state[f"{vb}.mlp.linear_fc1.bias"] = _t(VIS_INTER)
+    state[f"{vb}.mlp.linear_fc2.weight"] = _t(VIS_HIDDEN, VIS_INTER)
+    state[f"{vb}.mlp.linear_fc2.bias"] = _t(VIS_HIDDEN)
+    state[f"{vb}.norm1.weight"] = _t(VIS_HIDDEN)
+    state[f"{vb}.norm1.bias"] = _t(VIS_HIDDEN)
+    state[f"{vb}.norm2.weight"] = _t(VIS_HIDDEN)
+    state[f"{vb}.norm2.bias"] = _t(VIS_HIDDEN)
+    state["model.visual.patch_embed.proj.weight"] = _t(VIS_HIDDEN, VIS_PATCH_IN)
+    state["model.visual.patch_embed.proj.bias"] = _t(VIS_HIDDEN)
+    state["model.visual.pos_embed.weight"] = _t(VIS_POS, VIS_HIDDEN)
+    state["model.visual.merger.norm.weight"] = _t(4 * VIS_HIDDEN)
+    state["model.visual.merger.norm.bias"] = _t(4 * VIS_HIDDEN)
+    state["model.visual.merger.linear_fc1.weight"] = _t(VIS_INTER, 4 * VIS_HIDDEN)
+    state["model.visual.merger.linear_fc1.bias"] = _t(VIS_INTER)
+    state["model.visual.merger.linear_fc2.weight"] = _t(HIDDEN, VIS_INTER)
+    state["model.visual.merger.linear_fc2.bias"] = _t(HIDDEN)
     return state
 
 
@@ -257,7 +285,58 @@ def make_sglang_state(
     out["lm_head.weight"] = _rows(
         state["lm_head.weight"], rank * (VOCAB // tp), VOCAB // tp
     )
-    out["visual.patch_embed.proj.weight"] = _t(8, 8)
+
+    vh_tp = VIS_HIDDEN // tp
+    vi_tp = VIS_INTER // tp
+    vb = "model.visual.blocks.0"
+    sgl_vb = "visual.blocks.0"
+    for suffix, width in (("weight", VIS_HIDDEN), ("bias", None)):
+        qkv = state[f"{vb}.attn.qkv.{suffix}"]
+        q_blk = _rows(qkv, 0, VIS_HIDDEN)
+        k_blk = _rows(qkv, VIS_HIDDEN, VIS_HIDDEN)
+        v_blk = _rows(qkv, 2 * VIS_HIDDEN, VIS_HIDDEN)
+        out[f"{sgl_vb}.attn.qkv_proj.{suffix}"] = torch.cat(
+            [
+                _rows(q_blk, rank * vh_tp, vh_tp),
+                _rows(k_blk, rank * vh_tp, vh_tp),
+                _rows(v_blk, rank * vh_tp, vh_tp),
+            ]
+        )
+    out[f"{sgl_vb}.attn.proj.weight"] = state[f"{vb}.attn.proj.weight"].narrow(
+        1, rank * vh_tp, vh_tp
+    )
+    out[f"{sgl_vb}.attn.proj.bias"] = state[f"{vb}.attn.proj.bias"]
+    out[f"{sgl_vb}.mlp.linear_fc1.weight"] = _rows(
+        state[f"{vb}.mlp.linear_fc1.weight"], rank * vi_tp, vi_tp
+    )
+    out[f"{sgl_vb}.mlp.linear_fc1.bias"] = _rows(
+        state[f"{vb}.mlp.linear_fc1.bias"], rank * vi_tp, vi_tp
+    )
+    out[f"{sgl_vb}.mlp.linear_fc2.weight"] = state[
+        f"{vb}.mlp.linear_fc2.weight"
+    ].narrow(1, rank * vi_tp, vi_tp)
+    out[f"{sgl_vb}.mlp.linear_fc2.bias"] = state[f"{vb}.mlp.linear_fc2.bias"]
+    for leaf in ("norm1.weight", "norm1.bias", "norm2.weight", "norm2.bias"):
+        out[f"{sgl_vb}.{leaf}"] = state[f"{vb}.{leaf}"]
+    out["visual.patch_embed.proj.weight"] = state[
+        "model.visual.patch_embed.proj.weight"
+    ]
+    out["visual.patch_embed.proj.bias"] = state["model.visual.patch_embed.proj.bias"]
+    out["visual.pos_embed.weight"] = _rows(
+        state["model.visual.pos_embed.weight"], rank * (VIS_POS // tp), VIS_POS // tp
+    )
+    out["visual.merger.norm.weight"] = state["model.visual.merger.norm.weight"]
+    out["visual.merger.norm.bias"] = state["model.visual.merger.norm.bias"]
+    out["visual.merger.linear_fc1.weight"] = _rows(
+        state["model.visual.merger.linear_fc1.weight"], rank * vi_tp, vi_tp
+    )
+    out["visual.merger.linear_fc1.bias"] = _rows(
+        state["model.visual.merger.linear_fc1.bias"], rank * vi_tp, vi_tp
+    )
+    out["visual.merger.linear_fc2.weight"] = state[
+        "model.visual.merger.linear_fc2.weight"
+    ].narrow(1, rank * vi_tp, vi_tp)
+    out["visual.merger.linear_fc2.bias"] = state["model.visual.merger.linear_fc2.bias"]
     return out
 
 
@@ -304,20 +383,32 @@ def test_unfuse_matches_train_split_and_sharding_declaration(tp):
     assert seen == set(train_common.keys())
 
 
-def test_unfuse_skips_visual_params():
+def test_unfuse_maps_visual_qkv_and_passes_through_rest():
     cfg = make_cfg()
-    assert (
-        unfuse_sglang_param("visual.blocks.0.attn.qkv_proj.weight", _t(4, 4), cfg, 1)
-        == []
-    )
+    qkv = _t(3 * VIS_HIDDEN, VIS_HIDDEN)
+    parts = unfuse_sglang_param("visual.blocks.0.attn.qkv_proj.weight", qkv, cfg, 1)
+    assert [n for n, _ in parts] == [
+        "model.visual.blocks.0.attn.qkv_q.weight",
+        "model.visual.blocks.0.attn.qkv_k.weight",
+        "model.visual.blocks.0.attn.qkv_v.weight",
+    ]
+    torch.testing.assert_close(torch.cat([t for _, t in parts]), qkv, rtol=0, atol=0)
+    pos = _t(VIS_POS, VIS_HIDDEN)
+    passthrough = unfuse_sglang_param("visual.pos_embed.weight", pos, cfg, 1)
+    assert [n for n, _ in passthrough] == ["model.visual.pos_embed.weight"]
+    torch.testing.assert_close(passthrough[0][1], pos, rtol=0, atol=0)
+    assert unfuse_sglang_param("model.mtp.layers.0.foo", _t(4, 4), cfg, 1) == []
 
 
-def test_normalize_train_hf_name_strips_vl_prefix_and_skips_visual():
+def test_normalize_train_hf_name_strips_vl_prefix_and_keeps_visual():
     assert (
         normalize_train_hf_name("model.language_model.layers.0.mlp.gate.weight")
         == "model.layers.0.mlp.gate.weight"
     )
-    assert normalize_train_hf_name("model.visual.patch_embed.proj.weight") is None
+    assert (
+        normalize_train_hf_name("model.visual.patch_embed.proj.weight")
+        == "model.visual.patch_embed.proj.weight"
+    )
     assert normalize_train_hf_name("mtp.layers.0.foo") is None
     assert normalize_train_hf_name("lm_head.weight") == "lm_head.weight"
 

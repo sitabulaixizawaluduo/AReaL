@@ -29,6 +29,16 @@ synthetic names on BOTH sides:
    ``mlp.experts.{e}.gate_proj/up_proj/down_proj.weight``.  Per-expert
    splitting keeps TP shards contiguous (a fused ``gate_up`` TP shard would
    be two disjoint slices) and gives EP a natural per-expert ownership unit.
+4. ``visual.blocks.N.attn.qkv.{weight,bias}`` (HF fused ``[3E, E]``) ->
+   ``attn.qkv_q/qkv_k/qkv_v``.  SGLang's ``VisionAttention`` uses
+   ``QKVParallelLinear`` (per-head TP split of each equal-width q/k/v
+   block), so a rank's fused rows map to 3 disjoint HF slices.  Block
+   widths are equal (self-attention), so splits derive from tensor shape.
+
+The vision tower participates in training on this branch (bridge exports
+``model.visual.*`` and checkpoints show it updating), so it is synced like
+any other module.  SGLang strips the ``model.`` prefix for vision params and
+renames ``attn.qkv -> attn.qkv_proj``; the unfuse below reverses both.
 
 Kept as-is (contiguous under TP by construction):
 
@@ -41,9 +51,7 @@ Kept as-is (contiguous under TP by construction):
 
 Skipped on BOTH sides (documented limitation):
 
-- ``model.visual.*``: RL fine-tuning on this branch keeps the vision tower
-  frozen; SGLang loads it from the base checkpoint at server start.
-- MTP / nextn speculative weights.
+- MTP / nextn speculative weights and rotary inv_freq buffers.
 """
 
 from __future__ import annotations
@@ -101,11 +109,13 @@ class _GdnDims:
 def normalize_train_hf_name(name: str) -> str | None:
     """Map a megatron-bridge exported HF name into the common name space.
 
-    Returns ``None`` for parameters excluded from weight sync (vision tower,
-    MTP, rotary buffers).
+    Returns ``None`` for parameters excluded from weight sync (MTP, rotary
+    buffers).
     """
-    if "visual" in name or "mtp" in name or "rotary_emb.inv_freq" in name:
+    if "mtp" in name or "rotary_emb.inv_freq" in name:
         return None
+    if "visual" in name:
+        return name
     if "language_model" in name:
         name = name.replace("model.language_model.", "model.")
     return name
@@ -125,6 +135,19 @@ def split_train_hf_param(
     Tensors are yielded as views where possible; callers own contiguity.
     """
     cfg = text_config(hf_config)
+
+    if ".visual." in name and ".attn.qkv." in name:
+        third = tensor.shape[0] // 3
+        q, k, v = torch.split(tensor, [third, third, third], dim=0)
+        suffix = name.rsplit(".", 1)[1]
+        base = name[: -len(f"qkv.{suffix}")]
+        yield f"{base}qkv_q.{suffix}", q
+        yield f"{base}qkv_k.{suffix}", k
+        yield f"{base}qkv_v.{suffix}", v
+        return
+    if ".visual." in name:
+        yield name, tensor
+        return
 
     if name.endswith("linear_attn.in_proj_qkv.weight"):
         gdn = _GdnDims(cfg)
@@ -220,6 +243,8 @@ class TrainOwnership:
                     per_rank = self.num_experts // self.ep_size
                     return int(em.group(1)) // per_rank == self.ep_rank
             return True
+        if common_name.startswith("model.visual."):
+            return self.is_pp_first
         if common_name == "model.embed_tokens.weight":
             return self.is_pp_first
         if common_name in ("model.norm.weight", "lm_head.weight"):
@@ -253,10 +278,23 @@ def unfuse_sglang_param(
     """
     cfg = text_config(hf_config)
 
-    if name.startswith("visual."):
-        return []
     if ".mtp" in name or "rotary_emb" in name:
         return []
+
+    # --- vision tower (runtime names lack the ``model.`` prefix) ----------
+    if name.startswith("visual."):
+        common = "model." + name
+        if ".attn.qkv_proj." in common:
+            third = tensor.shape[0] // 3
+            q, k, v = torch.split(tensor, [third, third, third], dim=0)
+            suffix = common.rsplit(".", 1)[1]
+            base = common[: -len(f"qkv_proj.{suffix}")]
+            return [
+                (f"{base}qkv_q.{suffix}", q),
+                (f"{base}qkv_k.{suffix}", k),
+                (f"{base}qkv_v.{suffix}", v),
+            ]
+        return [(common, tensor)]
 
     # --- full attention (module attrs live directly on the layer) --------
     if ".qkv_proj.weight" in name:
@@ -360,6 +398,11 @@ def unfuse_sglang_param(
 # ---------------------------------------------------------------------------
 
 # Suffix -> (sharded, dim). Matched against the COMMON (post-unfuse) name.
+# Vision rules mirror sglang's qwen3_vl.py wiring: VisionAttention.qkv_proj
+# (QKVParallelLinear, per-head dim0) split into qkv_q/k/v; attn.proj and
+# linear_fc2 RowParallel (dim1, bias replicated); linear_fc1 ColumnParallel
+# (dim0 incl. bias); pos_embed VocabParallelEmbedding (dim0); patch_embed
+# (Conv3d) and layernorms replicated.
 _REPLICATED_SUFFIXES = (
     "input_layernorm.weight",
     "post_attention_layernorm.weight",
@@ -369,6 +412,16 @@ _REPLICATED_SUFFIXES = (
     ".mlp.gate.weight",
     ".mlp.shared_expert_gate.weight",
     "model.norm.weight",
+    ".norm1.weight",
+    ".norm1.bias",
+    ".norm2.weight",
+    ".norm2.bias",
+    ".merger.norm.weight",
+    ".merger.norm.bias",
+    ".attn.proj.bias",
+    ".linear_fc2.bias",
+    ".patch_embed.proj.weight",
+    ".patch_embed.proj.bias",
 )
 
 _DIM0_SUFFIXES = (
@@ -390,12 +443,23 @@ _DIM0_SUFFIXES = (
     ".up_proj.weight",
     "model.embed_tokens.weight",
     "lm_head.weight",
+    ".attn.qkv_q.weight",
+    ".attn.qkv_q.bias",
+    ".attn.qkv_k.weight",
+    ".attn.qkv_k.bias",
+    ".attn.qkv_v.weight",
+    ".attn.qkv_v.bias",
+    ".linear_fc1.weight",
+    ".linear_fc1.bias",
+    "visual.pos_embed.weight",
 )
 
 _DIM1_SUFFIXES = (
     ".self_attn.o_proj.weight",
     ".linear_attn.out_proj.weight",
     ".down_proj.weight",  # experts.{e}. and shared_expert.
+    ".attn.proj.weight",
+    ".linear_fc2.weight",
 )
 
 

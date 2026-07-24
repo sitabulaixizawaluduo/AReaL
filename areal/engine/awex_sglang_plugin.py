@@ -219,27 +219,56 @@ class AwexSchedulerPlugin:
         scheduler = self._scheduler
         plugin = self
 
-        _orig_log_decode_stats = scheduler.log_decode_stats
-        _orig_log_decode_stats_every_iteration = (
-            scheduler.log_decode_stats_every_iteration
+        def _resolve_scheduler_method(*candidate_names: str) -> tuple[str | None, Any]:
+            for candidate_name in candidate_names:
+                candidate = getattr(scheduler, candidate_name, None)
+                if callable(candidate):
+                    return candidate_name, candidate
+            return None, None
+
+        decode_stats_name, decode_stats_method = _resolve_scheduler_method(
+            "report_decode_stats", "log_decode_stats"
+        )
+        decode_stats_every_iter_name, decode_stats_every_iter_method = (
+            _resolve_scheduler_method(
+                "report_decode_stats_every_iteration",
+                "log_decode_stats_every_iteration",
+            )
         )
 
-        def _tracked_log_decode_stats(*args, **kwargs):
-            scheduler._areal_awex_last_decode_stats_ct = getattr(
-                scheduler, "forward_ct_decode", None
-            )
-            return _orig_log_decode_stats(*args, **kwargs)
+        if decode_stats_method is not None:
+            assert decode_stats_name is not None
 
-        def _tracked_log_decode_stats_every_iteration(*args, **kwargs):
-            scheduler._areal_awex_last_decode_stats_every_iter_ct = getattr(
-                scheduler, "forward_ct_decode", None
-            )
-            return _orig_log_decode_stats_every_iteration(*args, **kwargs)
+            def _tracked_decode_stats(*args, **kwargs):
+                scheduler._areal_awex_last_decode_stats_ct = getattr(
+                    scheduler, "forward_ct_decode", None
+                )
+                return decode_stats_method(*args, **kwargs)
 
-        scheduler.log_decode_stats = _tracked_log_decode_stats
-        scheduler.log_decode_stats_every_iteration = (
-            _tracked_log_decode_stats_every_iteration
-        )
+            setattr(scheduler, decode_stats_name, _tracked_decode_stats)
+        else:
+            logger.warning(
+                "[AWEX] scheduler has no decode-stats hook: expected one of report_decode_stats/log_decode_stats"
+            )
+
+        if decode_stats_every_iter_method is not None:
+            assert decode_stats_every_iter_name is not None
+
+            def _tracked_decode_stats_every_iteration(*args, **kwargs):
+                scheduler._areal_awex_last_decode_stats_every_iter_ct = getattr(
+                    scheduler, "forward_ct_decode", None
+                )
+                return decode_stats_every_iter_method(*args, **kwargs)
+
+            setattr(
+                scheduler,
+                decode_stats_every_iter_name,
+                _tracked_decode_stats_every_iteration,
+            )
+        else:
+            logger.warning(
+                "[AWEX] scheduler has no per-iteration decode-stats hook: expected one of report_decode_stats_every_iteration/log_decode_stats_every_iteration"
+            )
 
         def _maybe_restore_decode_metrics(stage, batch, result):
             if os.environ.get("AREAL_AWEX_FORCE_SGLANG_METRICS", "1") != "1":
@@ -262,23 +291,29 @@ class AwexSchedulerPlugin:
             should_log_decode = current_ct is not None and current_ct % interval == 0
 
             if (
-                should_log_decode
+                decode_stats_name is not None
+                and should_log_decode
                 and getattr(scheduler, "_areal_awex_last_decode_stats_ct", None)
                 != current_ct
             ):
                 can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
                 logger.debug(
-                    f"[AWEX-METRICS] restoring native log_decode_stats "
+                    f"[AWEX-METRICS] restoring native {decode_stats_name} "
                     f"gpu_id={getattr(scheduler, 'gpu_id', '?')} "
                     f"forward_ct_decode={current_ct}",
                 )
-                scheduler.log_decode_stats(can_run_cuda_graph, running_batch=batch)
+                getattr(scheduler, decode_stats_name)(
+                    can_run_cuda_graph, running_batch=batch
+                )
 
             if (
-                getattr(scheduler, "_areal_awex_last_decode_stats_every_iter_ct", None)
+                decode_stats_every_iter_name is not None
+                and getattr(
+                    scheduler, "_areal_awex_last_decode_stats_every_iter_ct", None
+                )
                 != current_ct
             ):
-                scheduler.log_decode_stats_every_iteration(
+                getattr(scheduler, decode_stats_every_iter_name)(
                     batch,
                     num_accepted_tokens=getattr(result, "num_accepted_tokens", 0),
                 )

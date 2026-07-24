@@ -1056,12 +1056,20 @@ class SGlangToHFWeightConverterQwen3_5Moe(SGlangToHFWeightConverter):
                 name.removeprefix(self._HF_VISION_PREFIX), parameter
             )
 
+        if name.startswith("visual."):
+            return self._convert_vision_param(name.removeprefix("visual."), parameter)
+
         if name.startswith("model.layers."):
             return self._convert_language_param(name.removeprefix("model."), parameter)
 
+        if name.startswith("model."):
+            return self._convert_language_param(name.removeprefix("model."), parameter)
+
         raise NotImplementedError(
-            "Unsupported Qwen3.5 SGLang parameter outside model.language_model./"
-            f"model.visual.: {name}"
+            "Unsupported Qwen3.5 SGLang parameter. Accepted prefixes: "
+            "runtime {lm_head., model., visual.}; "
+            "checkpoint aliases {model.language_model., model.visual., model.layers., model.lm_head.}. "
+            f"Got: {name}"
         )
 
     def _convert_language_param(

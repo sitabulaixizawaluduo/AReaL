@@ -688,3 +688,72 @@ def test_qwen3_5_sharding_strategy_rejects_attn_tp_model_tp_mismatch_when_dp_att
         infer.get_sharding_strategy(
             "model.language_model.layers.0.self_attn.q_proj.weight"
         )
+
+
+def test_converter_runtime_visual_prefix_is_accepted_for_patch_embed_weight():
+    """Runtime visual.* prefix must dispatch to vision conversion."""
+    # Arrange
+    converter = _make_infer_converter()
+    parameter = torch.arange(0, 6, dtype=torch.float32).view(2, 3)
+
+    # Act
+    converted = converter.convert_param("visual.patch_embed.proj.weight", parameter)
+
+    # Assert
+    assert len(converted) == 1
+    assert converted[0][0] == "model.visual.patch_embed.proj.weight"
+    torch.testing.assert_close(converted[0][1], parameter, rtol=0.0, atol=0.0)
+
+
+def test_converter_runtime_model_prefix_accepts_embed_norm_and_layers_parameters():
+    """Runtime model.* language names must support embed/norm/layers dispatch."""
+    # Arrange
+    converter = _make_infer_converter()
+    embed = torch.arange(0, 12, dtype=torch.float32).view(3, 4)
+    norm = torch.arange(0, 4, dtype=torch.float32)
+    layer_norm = torch.arange(0, 4, dtype=torch.float32)
+
+    # Act
+    embed_converted = converter.convert_param("model.embed_tokens.weight", embed)
+    norm_converted = converter.convert_param("model.norm.weight", norm)
+    layer_converted = converter.convert_param(
+        "model.layers.0.input_layernorm.weight", layer_norm
+    )
+
+    # Assert
+    assert embed_converted[0][0] == "model.language_model.embed_tokens.weight"
+    assert norm_converted[0][0] == "model.language_model.norm.weight"
+    assert (
+        layer_converted[0][0] == "model.language_model.layers.0.input_layernorm.weight"
+    )
+    torch.testing.assert_close(embed_converted[0][1], embed, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(norm_converted[0][1], norm, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(layer_converted[0][1], layer_norm, rtol=0.0, atol=0.0)
+
+
+def test_converter_checkpoint_alias_prefixes_remain_compatible():
+    """Checkpoint-style aliases must remain accepted after runtime prefix expansion."""
+    # Arrange
+    converter = _make_infer_converter()
+    embed = torch.arange(0, 12, dtype=torch.float32).view(3, 4)
+    vision = torch.arange(0, 6, dtype=torch.float32).view(2, 3)
+    layer_norm = torch.arange(0, 4, dtype=torch.float32)
+    lm_head = torch.arange(0, 6, dtype=torch.float32).view(2, 3)
+
+    # Act
+    language_alias = converter.convert_param(
+        "model.language_model.embed_tokens.weight", embed
+    )
+    vision_alias = converter.convert_param(
+        "model.visual.patch_embed.proj.weight", vision
+    )
+    layer_alias = converter.convert_param(
+        "model.layers.0.input_layernorm.weight", layer_norm
+    )
+    lm_head_alias = converter.convert_param("model.lm_head.weight", lm_head)
+
+    # Assert
+    assert language_alias[0][0] == "model.language_model.embed_tokens.weight"
+    assert vision_alias[0][0] == "model.visual.patch_embed.proj.weight"
+    assert layer_alias[0][0] == "model.language_model.layers.0.input_layernorm.weight"
+    assert lm_head_alias[0][0] == "lm_head.weight"

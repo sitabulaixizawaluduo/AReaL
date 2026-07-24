@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import os
 from collections import deque
 from types import SimpleNamespace
+from typing import Any, cast
 
+from areal.engine import awex_sglang_plugin as awex_sglang_plugin_module
 from areal.engine.awex_sglang_plugin import AwexSchedulerPlugin
 
 
@@ -24,6 +27,9 @@ class _BaseScheduler:
         self.current_scheduler_metrics_enabled = True
         self.server_args = SimpleNamespace(decode_log_interval=1)
         self._engine_paused = False
+        self.running_batch: list[object] = []
+        self.waiting_queue: list[object] = []
+        self.chunked_req = None
         self.last_batch = None
         self.is_generation = False
         self.result_queue = deque()
@@ -60,6 +66,15 @@ class _BaseScheduler:
 
     def event_loop_normal(self):
         raise _StopLoop
+
+    def is_fully_idle(self) -> bool:
+        return (
+            len(self.running_batch) == 0
+            and len(self.waiting_queue) == 0
+            and len(self.result_queue) == 0
+            and self.chunked_req is None
+            and self.last_batch is None
+        )
 
 
 class _ReportScheduler(_BaseScheduler):
@@ -122,6 +137,35 @@ class _PausedDrainScheduler(_NoStatsScheduler):
             )
             self._seeded_paused_result = True
         return []
+
+
+class _PausedRunningBatchDrainScheduler(_NoStatsScheduler):
+    def __init__(self) -> None:
+        super().__init__()
+        self._engine_paused = True
+        self.running_batch = [object()]
+        self.last_batch = object()
+        self._abort_batch_drained = False
+
+    def get_next_batch_to_run(self):
+        if not self._abort_batch_drained:
+            self._abort_batch_drained = True
+            return _Batch()
+        return None
+
+    def run_batch(self, batch):
+        self.running_batch = []
+        return super().run_batch(batch)
+
+
+class _NeverIdleScheduler(_NoStatsScheduler):
+    def __init__(self) -> None:
+        super().__init__()
+        self._engine_paused = True
+        self.running_batch = [object()]
+
+    def is_fully_idle(self) -> bool:
+        return False
 
 
 def test_patch_event_loop_report_api_wraps_and_tracks_decode_hooks():
@@ -212,10 +256,10 @@ def test_patch_event_loop_missing_all_stats_hooks_does_not_crash_binding_or_loop
     assert scheduler.process_batch_result_calls == 1
 
 
-def test_patch_event_loop_paused_branch_drains_result_queue_before_awex_queue_processing():
-    """Paused overlap branch must drain local overlap state before processing AWEX queue."""
+def test_patch_event_loop_paused_branch_drains_running_batch_to_idle_before_awex_queue():
+    """Paused overlap branch must run bounded drain steps until local idle before AWEX queue poll."""
     # Arrange
-    scheduler = _PausedDrainScheduler()
+    scheduler = _PausedRunningBatchDrainScheduler()
     plugin = AwexSchedulerPlugin(scheduler)
 
     def _one_shot_process_awex_queue() -> None:
@@ -236,3 +280,44 @@ def test_patch_event_loop_paused_branch_drains_result_queue_before_awex_queue_pr
     assert scheduler.process_awex_queue_calls == 1
     assert len(scheduler.result_queue) == 0
     assert scheduler.last_batch is None
+    assert scheduler.is_fully_idle()
+
+
+def test_patch_event_loop_paused_branch_warns_on_drain_cap_and_still_processes_awex_queue():
+    """Paused overlap branch must warn on cap-hit non-idle state and still call AWEX queue processing."""
+    # Arrange
+    scheduler = _NeverIdleScheduler()
+    os.environ["AWEX_PAUSED_MAX_DRAIN_STEPS"] = "2"
+    plugin = AwexSchedulerPlugin(scheduler)
+
+    warning_messages: list[str] = []
+    original_warning = awex_sglang_plugin_module.logger.warning
+
+    def _capture_warning(message, *args):
+        rendered = message % args if args else str(message)
+        warning_messages.append(rendered)
+
+    def _one_shot_process_awex_queue() -> None:
+        scheduler.process_awex_queue_calls += 1
+        raise _StopLoop
+
+    cast(Any, awex_sglang_plugin_module.logger).warning = _capture_warning
+    plugin.process_awex_queue = _one_shot_process_awex_queue
+
+    # Act
+    try:
+        plugin._patch_event_loop()
+        try:
+            scheduler.event_loop_overlap()
+        except _StopLoop:
+            pass
+    finally:
+        cast(Any, awex_sglang_plugin_module.logger).warning = original_warning
+        del os.environ["AWEX_PAUSED_MAX_DRAIN_STEPS"]
+
+    # Assert
+    assert scheduler.process_awex_queue_calls == 1
+    assert any(
+        "paused overlap drain reached cap without full idle" in msg
+        for msg in warning_messages
+    )

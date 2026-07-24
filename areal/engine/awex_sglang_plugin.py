@@ -48,6 +48,17 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
+def _int_env(name: str, default: int) -> int:
+    value = os.environ.get(name, "")
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %d", name, value, default)
+        return default
+
+
 class AwexSchedulerPlugin:
     """Binds awex weight-receive to a SGLang Scheduler instance.
 
@@ -63,6 +74,9 @@ class AwexSchedulerPlugin:
         self._version = 0
         self._paused_poll_interval_s = max(
             0.0, _float_env("AWEX_PAUSED_POLL_INTERVAL_S", 0.01)
+        )
+        self._paused_max_drain_steps = max(
+            1, _int_env("AWEX_PAUSED_MAX_DRAIN_STEPS", 64)
         )
 
     def bind(self) -> None:
@@ -219,6 +233,38 @@ class AwexSchedulerPlugin:
         scheduler = self._scheduler
         plugin = self
 
+        def _is_scheduler_fully_idle() -> bool:
+            is_fully_idle_fn = getattr(scheduler, "is_fully_idle", None)
+            if callable(is_fully_idle_fn):
+                return bool(is_fully_idle_fn())
+            return True
+
+        def _state_metric(value: Any) -> int:
+            if value is None:
+                return 0
+            try:
+                return len(value)
+            except TypeError:
+                return int(bool(value))
+
+        def _non_idle_state_dump() -> dict[str, int]:
+            state: dict[str, int] = {
+                "running_batch": _state_metric(
+                    getattr(scheduler, "running_batch", None)
+                ),
+                "waiting_queue": _state_metric(
+                    getattr(scheduler, "waiting_queue", None)
+                ),
+                "result_queue": _state_metric(getattr(scheduler, "result_queue", None)),
+                "chunked_req": int(getattr(scheduler, "chunked_req", None) is not None),
+            }
+            for optional_name in ("grammar_queue", "prefill_queue", "dllm", "pp"):
+                if hasattr(scheduler, optional_name):
+                    state[optional_name] = _state_metric(
+                        getattr(scheduler, optional_name, None)
+                    )
+            return {key: value for key, value in state.items() if value}
+
         def _resolve_scheduler_method(*candidate_names: str) -> tuple[str | None, Any]:
             for candidate_name in candidate_names:
                 candidate = getattr(scheduler, candidate_name, None)
@@ -336,6 +382,36 @@ class AwexSchedulerPlugin:
                     "after_process_batch_result", tmp_batch, tmp_result
                 )
 
+            def drain_paused_scheduler_state() -> None:
+                drain_steps = 0
+                while (
+                    not _is_scheduler_fully_idle()
+                    and drain_steps < plugin._paused_max_drain_steps
+                ):
+                    drain_steps += 1
+                    while scheduler.result_queue:
+                        pop_and_process()
+                    if _is_scheduler_fully_idle():
+                        break
+                    batch = scheduler.get_next_batch_to_run()
+                    scheduler.cur_batch = batch
+                    if batch:
+                        result = scheduler.run_batch(batch)
+                        scheduler.result_queue.append((batch.copy(), result))
+                    scheduler.last_batch = batch
+
+                while scheduler.result_queue:
+                    pop_and_process()
+                scheduler.last_batch = None
+
+                if not _is_scheduler_fully_idle():
+                    logger.warning(
+                        "[AWEX] paused overlap drain reached cap without full idle "
+                        "(cap=%s, non_idle=%s)",
+                        plugin._paused_max_drain_steps,
+                        _non_idle_state_dump(),
+                    )
+
             logger.info(
                 f"[AWEX] _patched_overlap STARTING (gpu_id={getattr(scheduler, 'gpu_id', '?')})",
             )
@@ -374,9 +450,7 @@ class AwexSchedulerPlugin:
                             f"(gpu_id={getattr(scheduler, 'gpu_id', '?')}, loop_count={_loop_count})",
                         )
                         _paused_reported = True
-                    while scheduler.result_queue:
-                        pop_and_process()
-                    scheduler.last_batch = None
+                    drain_paused_scheduler_state()
                     plugin.process_awex_queue()
                     time.sleep(plugin._paused_poll_interval_s)
                     continue
@@ -416,6 +490,48 @@ class AwexSchedulerPlugin:
         _orig_normal = scheduler.event_loop_normal
 
         def _patched_normal():
+            from collections import deque
+
+            if not hasattr(scheduler, "result_queue"):
+                scheduler.result_queue = deque()
+
+            def pop_and_process():
+                tmp_batch, tmp_result = scheduler.result_queue.popleft()
+                scheduler.process_batch_result(tmp_batch, tmp_result)
+                _maybe_restore_decode_metrics(
+                    "after_process_batch_result", tmp_batch, tmp_result
+                )
+
+            def drain_paused_scheduler_state() -> None:
+                drain_steps = 0
+                while (
+                    not _is_scheduler_fully_idle()
+                    and drain_steps < plugin._paused_max_drain_steps
+                ):
+                    drain_steps += 1
+                    while scheduler.result_queue:
+                        pop_and_process()
+                    if _is_scheduler_fully_idle():
+                        break
+                    batch = scheduler.get_next_batch_to_run()
+                    scheduler.cur_batch = batch
+                    if batch:
+                        result = scheduler.run_batch(batch)
+                        scheduler.result_queue.append((batch.copy(), result))
+                    scheduler.last_batch = batch
+
+                while scheduler.result_queue:
+                    pop_and_process()
+                scheduler.last_batch = None
+
+                if not _is_scheduler_fully_idle():
+                    logger.warning(
+                        "[AWEX] paused normal drain reached cap without full idle "
+                        "(cap=%s, non_idle=%s)",
+                        plugin._paused_max_drain_steps,
+                        _non_idle_state_dump(),
+                    )
+
             logger.info(
                 f"[AWEX] _patched_normal STARTING (gpu_id={getattr(scheduler, 'gpu_id', '?')})",
             )
@@ -423,6 +539,7 @@ class AwexSchedulerPlugin:
                 recv_reqs = scheduler.recv_requests()
                 scheduler.process_input_requests(recv_reqs)
                 if scheduler._engine_paused:
+                    drain_paused_scheduler_state()
                     plugin.process_awex_queue()
                     time.sleep(plugin._paused_poll_interval_s)
                     continue

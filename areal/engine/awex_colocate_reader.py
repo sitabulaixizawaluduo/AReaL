@@ -95,11 +95,20 @@ def _ensure_awex_models_registered() -> None:
     try:
         from awex.models import registry as _reg
 
+        from areal.engine.awex_qwen3_5 import ensure_awex_qwen3_5_registered
+
         _reg.import_model_configs.cache_clear()
         _reg.ModelRegistry.models = _reg.import_model_configs()
+        # Must run after import_model_configs()/ModelRegistry reset; otherwise
+        # the custom entry is erased by the reset assignment above.
+        ensure_awex_qwen3_5_registered()
         missing = [
             m
-            for m in ("BailingMoeV2_5ForCausalLM", "BailingMoeV2ForCausalLM")
+            for m in (
+                "BailingMoeV2_5ForCausalLM",
+                "BailingMoeV2ForCausalLM",
+                "Qwen3_5MoeForConditionalGeneration",
+            )
             if m not in _reg.ModelRegistry.models
         ]
         if missing:

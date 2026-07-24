@@ -131,7 +131,13 @@ class AwexMegatronAdapter:
         from awex.sharding.param_sharding import get_rank_info_extractor
         from awex.util.common import get_ip_address
 
+        from areal.engine.awex_qwen3_5 import ensure_awex_qwen3_5_registered
+
         rank = dist.get_rank()
+
+        # Register custom Qwen3.5 AWEX model config before any metadata/converter
+        # resolver path touches awex ModelRegistry.
+        ensure_awex_qwen3_5_registered()
 
         self._rank_info = get_rank_info_extractor("mcore")()
         training_world_size = self._rank_info.world_size

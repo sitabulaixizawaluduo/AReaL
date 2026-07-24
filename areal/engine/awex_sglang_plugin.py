@@ -374,9 +374,14 @@ class AwexSchedulerPlugin:
                             f"(gpu_id={getattr(scheduler, 'gpu_id', '?')}, loop_count={_loop_count})",
                         )
                         _paused_reported = True
+                    while scheduler.result_queue:
+                        pop_and_process()
+                    scheduler.last_batch = None
                     plugin.process_awex_queue()
                     time.sleep(plugin._paused_poll_interval_s)
                     continue
+
+                _paused_reported = False
 
                 _loop_count += 1
                 batch = scheduler.get_next_batch_to_run()

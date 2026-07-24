@@ -1269,45 +1269,6 @@ class SGlangToHFWeightConverterQwen3_5Moe(SGlangToHFWeightConverter):
 
         raise NotImplementedError(f"Unsupported Qwen3.5 MLP parameter: {name}")
 
-    def _vision_head_layout(self) -> tuple[int, int]:
-        full_cfg = self.full_model_config
-        vision_cfg = getattr(full_cfg, "vision_config", None)
-        if vision_cfg is None:
-            raise ValueError(
-                "Qwen3.5 SGLang conversion requires full_model_config.vision_config"
-            )
-
-        num_heads = self._cfg_get(vision_cfg, "num_heads", None)
-        if not isinstance(num_heads, int) or num_heads <= 0:
-            raise ValueError(
-                "Qwen3.5 vision conversion requires integer vision_config.num_heads"
-            )
-
-        head_dim = self._cfg_get(vision_cfg, "head_dim", None)
-        if not isinstance(head_dim, int) or head_dim <= 0:
-            hidden_size = self._cfg_get(vision_cfg, "hidden_size", None)
-            if not isinstance(hidden_size, int) or hidden_size <= 0:
-                raise ValueError(
-                    "Qwen3.5 vision conversion requires vision_config.hidden_size"
-                )
-            if hidden_size % num_heads != 0:
-                raise ValueError(
-                    "vision_config.hidden_size must be divisible by num_heads: "
-                    f"hidden_size={hidden_size}, num_heads={num_heads}"
-                )
-            head_dim = hidden_size // num_heads
-
-        tp_size = int(getattr(self.rank_info, "tp_size", 0) or self.tp_size or 1)
-        if tp_size <= 0:
-            raise ValueError(f"Invalid TP size for vision conversion: {tp_size}")
-        if num_heads % tp_size != 0:
-            raise ValueError(
-                "Qwen3.5 vision conversion requires num_heads % TP == 0: "
-                f"num_heads={num_heads}, tp={tp_size}"
-            )
-        local_heads = num_heads // tp_size
-        return local_heads, head_dim
-
     def _split_vision_qkv_consecutive(
         self, name: str, parameter: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1316,15 +1277,17 @@ class SGlangToHFWeightConverterQwen3_5Moe(SGlangToHFWeightConverter):
                 f"Expected rank-1/2 tensor for vision attn.qkv in {name}, got shape={tuple(parameter.shape)}"
             )
 
-        local_heads, head_dim = self._vision_head_layout()
-        local_rows = local_heads * head_dim
-        expected_rows = 3 * local_rows
-        if parameter.shape[0] != expected_rows:
+        # SGLang vision attention uses non-GQA consecutive local layout [Q;K;V],
+        # so each TP rank has equal-sized contiguous Q/K/V chunks independent of
+        # vision_config fields. A shape-based 3-way narrow split is exact.
+        total_rows = parameter.shape[0]
+        if total_rows % 3 != 0:
             raise ValueError(
                 "Malformed SGLang vision attn.qkv_proj tensor for local consecutive [Q;K;V] layout: "
-                f"name={name}, shape={tuple(parameter.shape)}, expected_dim0={expected_rows}, "
-                f"local_heads={local_heads}, head_dim={head_dim}"
+                f"name={name}, shape={tuple(parameter.shape)}; expected dim0 divisible by 3"
             )
+
+        local_rows = total_rows // 3
 
         q = parameter.narrow(0, 0, local_rows)
         k = parameter.narrow(0, local_rows, local_rows)

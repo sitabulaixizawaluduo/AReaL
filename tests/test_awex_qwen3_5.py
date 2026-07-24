@@ -140,6 +140,14 @@ def _make_infer_converter(
     return converter
 
 
+def _make_infer_converter_without_vision_config() -> (
+    SGlangToHFWeightConverterQwen3_5Moe
+):
+    converter = _make_infer_converter()
+    setattr(converter, "full_model_config", SimpleNamespace())
+    return converter
+
+
 def _build_mcore_q_gate_k_v_interleaved(
     *,
     q_block: torch.Tensor,
@@ -385,6 +393,80 @@ def test_converter_vision_qkv_equivalent_layouts_return_same_protocol_values():
     assert set(infer_out) == expected_names
     for name in expected_names:
         torch.testing.assert_close(train_out[name], infer_out[name], rtol=0.0, atol=0.0)
+
+
+def test_converter_vision_qkv_split_works_without_vision_config_for_weight_and_bias():
+    """Inference vision qkv split must work without full_model_config.vision_config."""
+    # Arrange
+    infer_converter = _make_infer_converter_without_vision_config()
+    q_weight = torch.arange(0, 8, dtype=torch.float32).view(4, 2)
+    k_weight = torch.arange(100, 108, dtype=torch.float32).view(4, 2)
+    v_weight = torch.arange(200, 208, dtype=torch.float32).view(4, 2)
+    packed_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
+
+    q_bias = torch.arange(0, 4, dtype=torch.float32)
+    k_bias = torch.arange(100, 104, dtype=torch.float32)
+    v_bias = torch.arange(200, 204, dtype=torch.float32)
+    packed_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)
+
+    # Act
+    converted_weight = _as_dict(
+        infer_converter.convert_param(
+            "visual.blocks.0.attn.qkv_proj.weight", packed_weight
+        )
+    )
+    converted_bias = _as_dict(
+        infer_converter.convert_param("visual.blocks.0.attn.qkv_proj.bias", packed_bias)
+    )
+
+    # Assert
+    torch.testing.assert_close(
+        converted_weight["model.visual.blocks.0.attn.q_proj.weight"],
+        q_weight,
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        converted_weight["model.visual.blocks.0.attn.k_proj.weight"],
+        k_weight,
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        converted_weight["model.visual.blocks.0.attn.v_proj.weight"],
+        v_weight,
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        converted_bias["model.visual.blocks.0.attn.q_proj.bias"],
+        q_bias,
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        converted_bias["model.visual.blocks.0.attn.k_proj.bias"],
+        k_bias,
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        converted_bias["model.visual.blocks.0.attn.v_proj.bias"],
+        v_bias,
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+def test_converter_vision_qkv_split_raises_when_dim0_not_divisible_by_three():
+    """Inference vision qkv split must reject malformed dim0 that is not divisible by 3."""
+    # Arrange
+    infer_converter = _make_infer_converter_without_vision_config()
+    malformed = torch.zeros(10, 2, dtype=torch.float32)
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="divisible by 3"):
+        infer_converter.convert_param("visual.blocks.0.attn.qkv_proj.weight", malformed)
 
 
 def test_converter_routed_moe_train_ep_local_and_infer_bulk_return_same_global_expert_values():

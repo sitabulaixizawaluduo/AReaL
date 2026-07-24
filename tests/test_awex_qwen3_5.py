@@ -260,9 +260,9 @@ def test_converter_attention_gate_field_prefers_attn_output_gate_and_falls_back_
     assert output_gate_official is False
     assert output_gate_fallback is False
     assert output_gate_default is True
-    assert q_rows_default == 8
-    assert q_rows_official == 4
-    assert q_rows_fallback == 4
+    assert q_rows_default == 16
+    assert q_rows_official == 8
+    assert q_rows_fallback == 8
 
 
 def test_converter_gdn_and_out_norm_equivalent_layouts_return_same_protocol_values():

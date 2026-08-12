@@ -8,7 +8,7 @@ from dataclasses import MISSING as dataclass_missing
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar
 
 import uvloop
 import yaml
@@ -1061,6 +1061,20 @@ class MegatronEngineConfig:
         },
     )
 
+    vlm_input_layout: Literal["padded", "packed"] = field(
+        default="padded",
+        metadata={
+            "help": (
+                "Input layout for the language-model decoder of supported VLMs. "
+                "'padded' preserves the existing BSHD path. 'packed' keeps the "
+                "per-sample BSHD view for vision embedding merge and mRoPE, then "
+                "lets the bridge model pack decoder inputs to THD. Packed VLM "
+                "input currently supports CP=1 only."
+            ),
+            "choices": ["padded", "packed"],
+        },
+    )
+
     use_mbridge_save: bool = field(
         default=False,
         metadata={
@@ -1097,6 +1111,11 @@ class MegatronEngineConfig:
     )
 
     def __post_init__(self) -> None:
+        if self.vlm_input_layout not in ("padded", "packed"):
+            raise ValueError(
+                "vlm_input_layout must be either 'padded' or 'packed', got "
+                f"{self.vlm_input_layout!r}"
+            )
         if self.lm_head_loss_chunk_size < 0:
             raise ValueError(
                 "lm_head_loss_chunk_size must be non-negative, got "

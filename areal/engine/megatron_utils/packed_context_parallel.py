@@ -309,12 +309,50 @@ def extract_vision_from_multi_modal(
     _drop_multi_modal_payload(mb)
 
 
+def _reconstruct_padded_vlm_inputs(
+    input_ids: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build the per-sample BSHD view required before model-owned THD packing."""
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    max_seqlen = int(seq_lens.max().item())
+    if input_ids.dtype != torch.long:
+        input_ids = input_ids.to(torch.long)
+    attention_mask = (
+        torch.arange(max_seqlen, device=input_ids.device)[None, :] < seq_lens[:, None]
+    )
+    padded_input_ids = torch.zeros(
+        seq_lens.shape[0],
+        max_seqlen,
+        dtype=torch.long,
+        device=input_ids.device,
+    )
+    padded_input_ids[attention_mask] = input_ids
+    return padded_input_ids, attention_mask
+
+
+def _build_thd_packed_seq_params(cu_seqlens: torch.Tensor) -> PackedSeqParams:
+    """Build THD metadata for sequences already aligned by AReaL."""
+    input_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    max_seqlen = int(input_lens.max().item())
+    return PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        max_seqlen_q=max_seqlen,
+        cu_seqlens_kv=cu_seqlens,
+        max_seqlen_kv=max_seqlen,
+        cu_seqlens_q_padded=cu_seqlens,
+        cu_seqlens_kv_padded=cu_seqlens,
+    )
+
+
 def packed_context_parallel_forward(
     model: torch.nn.Module,
     input_: dict[str, Any],
     gather_cp_output: bool = True,
     is_vision_model: bool = False,
     use_padded_seq: bool = False,
+    use_model_packed_seq: bool = False,
     fp32_output: bool | None = None,
     return_hidden_states: bool = False,
 ):
@@ -342,14 +380,34 @@ def packed_context_parallel_forward(
     #   branch too.
     # - Architectures whose attention/SSM kernels reject packed sequences
     #   (use_padded_seq, e.g. Qwen3.5 GDN) must run on [B, S] padded input.
-    needs_padded_form = is_vision_model or use_padded_seq
+    # - Supported VLM bridge models consume that same [B, S] view for vision
+    #   fusion and mRoPE, then use PackedSeqParams to run the decoder in THD.
+    needs_padded_form = (is_vision_model or use_padded_seq) and not use_model_packed_seq
 
     # Track shape metadata so the output can be repacked back to packed
     # [total_len, ...] form on the last PP stage.
     padded_repack_info = None
 
+    if use_model_packed_seq and cu_seqlens is None:
+        raise ValueError("Model-owned packed VLM input requires cu_seqlens.")
+
     if cu_seqlens is not None:
-        if not needs_padded_form:
+        if use_model_packed_seq:
+            if attention_mask is not None or tree_triton_data is not None:
+                raise ValueError(
+                    "Attention mask and tree attention are not supported with "
+                    "model-owned packed VLM input."
+                )
+            if mpu.get_context_parallel_world_size() != 1:
+                raise NotImplementedError(
+                    "Model-owned packed VLM input currently requires CP=1."
+                )
+            input_ids, attention_mask = _reconstruct_padded_vlm_inputs(
+                input_ids, cu_seqlens
+            )
+            packed_seq_params = _build_thd_packed_seq_params(cu_seqlens)
+            position_ids = None
+        elif not needs_padded_form:
             if attention_mask is not None or tree_triton_data is not None:
                 raise ValueError(
                     "Attention mask should be None when using packed sequences."
@@ -362,36 +420,21 @@ def packed_context_parallel_forward(
             # VLM and BSHD-only models expect [B, S] padded input. Reconstruct
             # padded 2D tensors from packed 1D via boolean masking — avoids
             # per-sample Python loop and GPU-CPU sync.
-            batch_size = cu_seqlens.shape[0] - 1
             seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
             max_seqlen = int(seq_lens.max().item())
-            # int64 for input_ids: mbridge's get_rope_index uses input_ids.dtype
-            # for position_ids, and some kernels (_index_put_impl_) require int64.
-            # Upcast to torch.long so the scatter `input_ids_2d[mask] = input_ids`
-            # below has matching source/dest dtypes (data pipeline may emit int32).
-            if input_ids.dtype != torch.long:
-                input_ids = input_ids.to(torch.long)
-            attention_mask = (
-                torch.arange(max_seqlen, device=input_ids.device)[None, :]
-                < seq_lens[:, None]
+            input_ids, attention_mask = _reconstruct_padded_vlm_inputs(
+                input_ids, cu_seqlens
             )
-            input_ids_2d = torch.zeros(
-                batch_size, max_seqlen, dtype=torch.long, device=input_ids.device
-            )
-            input_ids_2d[attention_mask] = input_ids
-            input_ids = input_ids_2d
             padded_repack_info = (cu_seqlens, seq_lens, max_seqlen)
 
-    # Every VLM forward is mask-free (attention_mask=None): the model
-    # computes (m)RoPE positions internally, each batch slot holds one
-    # sequence with trailing padding so causal attention yields correct
-    # outputs at non-padding positions, and padding outputs are discarded
-    # during repack. The one exception is the padded BSHD text forward of
-    # use_padded_seq models, which consumes the dense 2D mask so attention
-    # layers skip padding. The wrapper-packed path carries no mask either
-    # way (enforced above); tree data passes through untouched.
+    # Padded VLM forwards remain mask-free and discard padding during output
+    # repack. Model-owned packing instead consumes the 2D validity mask to
+    # compute per-sample mRoPE and pack after multimodal fusion. Padded BSHD
+    # text forwards also consume the dense mask so attention skips padding.
     dense_mask_text_forward = use_padded_seq and not has_vision_inputs
-    if is_vision_model and not dense_mask_text_forward:
+    if use_model_packed_seq:
+        final_attention_mask = attention_mask
+    elif is_vision_model and not dense_mask_text_forward:
         final_attention_mask = None
     else:
         final_attention_mask = (

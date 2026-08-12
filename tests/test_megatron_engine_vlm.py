@@ -203,6 +203,79 @@ class TestExtractVisionFromMultiModal:
 
 
 class TestPackedContextParallelForward:
+    def test_model_owned_packing_preserves_sample_boundaries(self, monkeypatch):
+        """VLMs should receive BSHD fusion inputs plus THD decoder metadata."""
+        from areal.engine.megatron_utils import packed_context_parallel
+
+        model = MagicMock(return_value=torch.arange(10).reshape(1, 5, 2))
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "is_pipeline_last_stage",
+            lambda **_kwargs: True,
+        )
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "get_context_parallel_world_size",
+            lambda: 1,
+        )
+        cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
+
+        output = packed_context_parallel.packed_context_parallel_forward(
+            model,
+            {
+                "input_ids": torch.tensor([10, 11, 12, 20, 21], dtype=torch.int32),
+                "cu_seqlens": cu_seqlens,
+                "pixel_values": torch.ones(2, 4),
+            },
+            is_vision_model=True,
+            use_model_packed_seq=True,
+        )
+
+        model_inputs = model.call_args.kwargs
+        torch.testing.assert_close(
+            model_inputs["input_ids"],
+            torch.tensor([[10, 11, 12], [20, 21, 0]], dtype=torch.long),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            model_inputs["attention_mask"],
+            torch.tensor([[True, True, True], [True, True, False]]),
+            rtol=0,
+            atol=0,
+        )
+        assert model_inputs["position_ids"] is None
+        packed_seq_params = model_inputs["packed_seq_params"]
+        assert packed_seq_params.qkv_format == "thd"
+        assert packed_seq_params.max_seqlen_q == 3
+        torch.testing.assert_close(
+            packed_seq_params.cu_seqlens_q, cu_seqlens, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            output, torch.arange(10).reshape(5, 2), rtol=0, atol=0
+        )
+
+    def test_model_owned_packing_rejects_context_parallel(self, monkeypatch):
+        """The first packed VLM implementation is intentionally limited to CP=1."""
+        from areal.engine.megatron_utils import packed_context_parallel
+
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "get_context_parallel_world_size",
+            lambda: 2,
+        )
+
+        with pytest.raises(NotImplementedError, match="requires CP=1"):
+            packed_context_parallel.packed_context_parallel_forward(
+                MagicMock(),
+                {
+                    "input_ids": torch.tensor([10, 11, 20]),
+                    "cu_seqlens": torch.tensor([0, 2, 3], dtype=torch.int32),
+                },
+                is_vision_model=True,
+                use_model_packed_seq=True,
+            )
+
     def test_hidden_state_mode_bypasses_post_process_and_restores_model(self):
         from areal.engine.megatron_utils import packed_context_parallel
 
@@ -577,6 +650,54 @@ class TestVisionModelDetection:
         from areal.engine.core.model import is_valid_vision_model
 
         assert is_valid_vision_model("llama") is False
+
+
+class TestPackedVisionModelSupport:
+    @pytest.mark.parametrize(
+        ("model_type", "bridge_type", "expected"),
+        [
+            ("qwen2_5_vl", "mbridge", True),
+            ("qwen3_vl", "mbridge", True),
+            ("qwen3_vl_moe", "mbridge", True),
+            ("qwen3_vl", "megatron-bridge", True),
+            ("qwen3_vl_moe", "megatron-bridge", True),
+            ("qwen2_5_vl", "megatron-bridge", False),
+            ("qwen3_5", "mbridge", False),
+            ("gemma3", "mbridge", False),
+        ],
+    )
+    def test_support_follows_model_bridge_contract(
+        self, model_type, bridge_type, expected
+    ):
+        from areal.engine.core.model import supports_model_packed_vlm
+
+        assert supports_model_packed_vlm(model_type, bridge_type) is expected
+
+    def test_validation_rejects_unsupported_model_bridge_pair(self):
+        from areal.engine.core.model import validate_model_packed_vlm
+
+        with pytest.raises(ValueError, match="Qwen2.5-VL/Qwen3-VL with mbridge"):
+            validate_model_packed_vlm("qwen2_5_vl", "megatron-bridge", 1)
+
+    def test_validation_rejects_context_parallel(self):
+        from areal.engine.core.model import validate_model_packed_vlm
+
+        with pytest.raises(NotImplementedError, match="context_parallel_size=1"):
+            validate_model_packed_vlm("qwen3_vl", "mbridge", 2)
+
+    def test_config_defaults_to_padded_layout(self):
+        from areal.api.cli_args import MegatronEngineConfig
+
+        assert MegatronEngineConfig().vlm_input_layout == "padded"
+        assert MegatronEngineConfig(vlm_input_layout="packed").vlm_input_layout == (
+            "packed"
+        )
+
+    def test_config_rejects_unknown_layout(self):
+        from areal.api.cli_args import MegatronEngineConfig
+
+        with pytest.raises(ValueError, match="vlm_input_layout must be"):
+            MegatronEngineConfig(vlm_input_layout="unknown")
 
 
 class TestConvertQwen25VLToHF:

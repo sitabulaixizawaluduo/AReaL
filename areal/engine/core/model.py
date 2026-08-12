@@ -45,6 +45,37 @@ def is_qwen_vl_model(model_type: str) -> bool:
     return is_qwen2_vl_model(model_type) or is_qwen3_vl_model(model_type)
 
 
+_MODEL_PACKED_VLM_SUPPORT = {
+    "mbridge": frozenset(("qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe")),
+    "megatron-bridge": frozenset(("qwen3_vl", "qwen3_vl_moe")),
+}
+
+
+def supports_model_packed_vlm(model_type: str, bridge_type: str) -> bool:
+    """Whether a bridge VLM can pack BSHD inputs after multimodal fusion."""
+    return model_type in _MODEL_PACKED_VLM_SUPPORT.get(bridge_type, ())
+
+
+def validate_model_packed_vlm(
+    model_type: str,
+    bridge_type: str,
+    context_parallel_size: int,
+) -> None:
+    """Validate the model-owned VLM packing contract."""
+    if not supports_model_packed_vlm(model_type, bridge_type):
+        raise ValueError(
+            "Packed VLM input is not supported for "
+            f"model_type={model_type!r} with bridge_type={bridge_type!r}. "
+            "Supported combinations are Qwen2.5-VL/Qwen3-VL with mbridge "
+            "and Qwen3-VL with megatron-bridge."
+        )
+    if context_parallel_size != 1:
+        raise NotImplementedError(
+            "Packed VLM input currently requires context_parallel_size=1, got "
+            f"{context_parallel_size}."
+        )
+
+
 def lang_config(hf_config):
     """Return the language-model side of a (possibly nested) HF config.
 

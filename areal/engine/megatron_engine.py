@@ -63,6 +63,7 @@ from areal.engine.core.model import (
     is_valid_vision_model,
     lang_config,
     requires_padded_seq,
+    validate_model_packed_vlm,
 )
 from areal.engine.megatron_utils import megatron_bridge_patches  # noqa: F401
 from areal.engine.megatron_utils.checkpointer import MegatronCheckpointManager
@@ -352,6 +353,7 @@ class MegatronEngine(TrainEngine):
         self.bridge_cls: str = getattr(self.mcore_config, "bridge_type", "mbridge")
         self.bridge_lora: MegatronBridgeLoRA | None = None
         self.is_vision_model: bool = False
+        self.use_model_packed_seq: bool = False
         self.processor = None
 
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
@@ -513,6 +515,18 @@ class MegatronEngine(TrainEngine):
             # the padded BSHD forward. Derived from model type rather than a
             # config flag so the layout can't be mis-set.
             self.use_padded_seq = requires_padded_seq(self.hf_config.model_type)
+            self.use_model_packed_seq = self.mcore_config.vlm_input_layout == "packed"
+            if self.use_model_packed_seq:
+                validate_model_packed_vlm(
+                    self.hf_config.model_type,
+                    self.bridge_cls,
+                    self.parallel_strategy.context_parallel_size,
+                )
+                self.logger.info(
+                    "Using model-owned packed THD decoder input for "
+                    f"model_type={self.hf_config.model_type}, "
+                    f"bridge_type={self.bridge_cls}."
+                )
             if self.is_vision_model:
                 if self.parallel_strategy.context_parallel_size > 1:
                     raise NotImplementedError(
@@ -1179,6 +1193,7 @@ class MegatronEngine(TrainEngine):
                 gather_cp_output=not cp_local,
                 is_vision_model=self.is_vision_model,
                 use_padded_seq=self.use_padded_seq,
+                use_model_packed_seq=self.use_model_packed_seq,
                 fp32_output=_float16_wrapper_fp32_output(
                     self.mcore_config.enable_chunked_logits,
                     self.dtype,

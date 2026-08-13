@@ -89,6 +89,14 @@ def _get_text_config(config):
     return getattr(config, "text_config", config)
 
 
+def _get_awex_infer_hf_config(model):
+    """Build AWEX's flat config while preserving the actual runtime architecture."""
+    hf_config = simple_hf_config(_get_text_config(model.config))
+    if not getattr(hf_config, "architectures", None):
+        hf_config.architectures = [type(model).__name__]
+    return hf_config
+
+
 def _ensure_awex_models_registered() -> None:
     """Rebuild AWEX's registry, then install AReaL compatibility entries.
 
@@ -389,11 +397,12 @@ class AwexColocateReader:
         self.get_weight_metadata()
 
         par = self.get_parallelism()
+        awex_hf_config = _get_awex_infer_hf_config(self._get_model())
         infer_conf = {
             "engine_name": "sglang",
             "infer_atten_tp_size": par["tp_size"],
             "infer_world_size": infer_world_size,
-            "hf_config": simple_hf_config(_get_text_config(self._get_model().config)),
+            "hf_config": awex_hf_config,
             # AWEX's native reader publishes router_dtype so the train-side
             # converter casts mlp.gate.weight to the dtype the inference
             # engine actually holds (fp32 for BailingMoe). Omitting it makes

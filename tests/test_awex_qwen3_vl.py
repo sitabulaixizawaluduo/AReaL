@@ -120,13 +120,33 @@ def test_register_qwen3_vl_awex_models_is_idempotent():
 
 
 def test_colocate_reader_uses_nested_text_config_for_awex_metadata():
-    from areal.engine.awex.colocate_reader import _get_text_config
+    from areal.engine.awex.colocate_reader import (
+        _get_awex_infer_hf_config,
+        _get_text_config,
+    )
 
-    text_config = SimpleNamespace(num_hidden_layers=28, router_dtype="fp32")
+    class TextConfig:
+        num_hidden_layers = 28
+        router_dtype = "fp32"
+
+        def to_dict(self):
+            return {
+                "num_hidden_layers": self.num_hidden_layers,
+                "router_dtype": self.router_dtype,
+                "architectures": None,
+            }
+
+    text_config = TextConfig()
     vl_config = SimpleNamespace(text_config=text_config)
+
+    class Qwen3VLForConditionalGeneration:
+        config = vl_config
 
     assert _get_text_config(vl_config) is text_config
     assert _get_text_config(text_config) is text_config
+    awex_config = _get_awex_infer_hf_config(Qwen3VLForConditionalGeneration())
+    assert awex_config.num_hidden_layers == 28
+    assert awex_config.architectures == ["Qwen3VLForConditionalGeneration"]
 
 
 def test_colocate_writer_exposes_text_depth_without_losing_vl_config():

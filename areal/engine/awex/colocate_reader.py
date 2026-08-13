@@ -307,7 +307,7 @@ class AwexColocateReader:
                 info["rank_info"] = RankInfo(**ri)
 
         resolver = _SingleInstanceMetaResolver(
-            self._get_model().config,
+            _get_text_config(self._get_model().config),
             "sglang",
             self._scheduler.server_args,
             raw_meta_list,
@@ -403,7 +403,11 @@ class AwexColocateReader:
             # papers over any such mismatch generically, but keep the
             # semantic path whole so new models behave identically to native
             # awex.
-            "router_dtype": getattr(self._get_model().config, "router_dtype", "bf16"),
+            "router_dtype": getattr(
+                _get_text_config(self._get_model().config),
+                "router_dtype",
+                "bf16",
+            ),
         }
         self._infer_conf = infer_conf
 

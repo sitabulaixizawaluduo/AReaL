@@ -119,6 +119,16 @@ def test_register_qwen3_vl_awex_models_is_idempotent():
     ]() is Qwen3VLMoeMcoreToHFWeightConverter
 
 
+def test_colocate_reader_uses_nested_text_config_for_awex_metadata():
+    from areal.engine.awex.colocate_reader import _get_text_config
+
+    text_config = SimpleNamespace(num_hidden_layers=28, router_dtype="fp32")
+    vl_config = SimpleNamespace(text_config=text_config)
+
+    assert _get_text_config(vl_config) is text_config
+    assert _get_text_config(text_config) is text_config
+
+
 def test_dense_language_qkv_has_train_infer_parity(
     vl_config, tf_config, rank_info, infer_engine_config
 ):

@@ -38,7 +38,7 @@ def vl_config(text_config):
     return SimpleNamespace(
         architectures=["Qwen3VLForConditionalGeneration"],
         text_config=text_config,
-        vision_config=SimpleNamespace(num_heads=2),
+        vision_config=SimpleNamespace(num_heads=2, hidden_size=4),
     )
 
 
@@ -211,8 +211,12 @@ def test_dense_language_qkv_has_train_infer_parity(
 
 
 def test_vision_qkv_has_train_infer_parity(
-    vl_config, tf_config, rank_info, infer_engine_config
+    vl_config, tf_config, rank_info, infer_engine_config, monkeypatch
 ):
+    monkeypatch.setattr(
+        "awex.converter.mcore_converter.get_full_tensor",
+        lambda parameter, dim=0: parameter,
+    )
     train_converter = Qwen3VLMcoreToHFWeightConverter(
         vl_config,
         rank_info,
@@ -240,6 +244,42 @@ def test_vision_qkv_has_train_infer_parity(
         train_params[0][1], infer_params[0][1], rtol=0, atol=0
     )
     assert not torch.equal(train_params[0][1], mcore_qkv)
+
+
+@pytest.mark.parametrize("kind", ["weight", "bias"])
+def test_vision_qkv_tp2_conversion_matches_sglang_rank_layout(
+    kind, vl_config, tf_config, rank_info, monkeypatch
+):
+    monkeypatch.setattr(
+        "awex.converter.mcore_converter.get_full_tensor",
+        lambda parameter, dim=0: parameter,
+    )
+    converter = Qwen3VLMcoreToHFWeightConverter(
+        vl_config,
+        rank_info,
+        {"infer_atten_tp_size": 2},
+        tf_config,
+    )
+    tail_shape = (4,) if kind == "weight" else ()
+    q = [torch.full((2, *tail_shape), 10 + head) for head in range(2)]
+    k = [torch.full((2, *tail_shape), 20 + head) for head in range(2)]
+    v = [torch.full((2, *tail_shape), 30 + head) for head in range(2)]
+    mcore_qkv = torch.cat(
+        [torch.cat((q[head], k[head], v[head]), dim=0) for head in range(2)],
+        dim=0,
+    )
+
+    [(name, packed_qkv)] = converter.convert_param(
+        "module.module.vision_model.decoder.layers.1."
+        f"self_attention.linear_qkv.{kind}",
+        mcore_qkv,
+    )
+    rank_shards = torch.chunk(packed_qkv, 2, dim=0)
+
+    assert name == f"model.visual.blocks.1.attn.qkv.{kind}"
+    for rank, rank_shard in enumerate(rank_shards):
+        expected = torch.cat((q[rank], k[rank], v[rank]), dim=0)
+        torch.testing.assert_close(rank_shard, expected, rtol=0, atol=0)
 
 
 def test_dense_mlp_has_train_infer_parity(

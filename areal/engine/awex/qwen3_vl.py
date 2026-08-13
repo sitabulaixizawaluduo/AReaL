@@ -12,6 +12,7 @@ without changing AWEX globally unless the v1 colocate path is initialized.
 from __future__ import annotations
 
 import re
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -144,6 +145,10 @@ class _Qwen3VLMcoreToHFWeightConverter:
     """Delegate Megatron conversion to AReaL's mbridge-aligned VL mapping."""
 
     model_name = "qwen3_vl"
+    _vision_qkv_pattern = re.compile(
+        r"vision_model\.decoder\.layers\.(\d+)\."
+        r"self_attention\.linear_qkv\.(weight|bias)"
+    )
 
     def __init__(self, hf_config, rank_info, infer_conf, tf_config):
         self.hf_config = hf_config
@@ -178,6 +183,45 @@ class _Qwen3VLMcoreToHFWeightConverter:
         )
         return f"{name[: match.start(2)]}{global_expert_id}"
 
+    def _convert_vision_qkv(
+        self, name: str, parameter: torch.Tensor
+    ) -> list[tuple[str, torch.Tensor]] | None:
+        match = self._vision_qkv_pattern.fullmatch(name)
+        if match is None:
+            return None
+
+        from awex.converter.mcore_converter import (
+            convert_qkv_weight_along_tp_attention,
+        )
+
+        vision_config = _config_value(self.hf_config, "vision_config")
+        num_heads = _config_value(vision_config, "num_heads")
+        hidden_size = _config_value(vision_config, "hidden_size")
+        if num_heads is None or hidden_size is None:
+            raise ValueError(
+                "hf_config.vision_config.num_heads and hidden_size are required "
+                "for Qwen3-VL vision QKV conversion"
+            )
+
+        # SGLang stores fused QKV per TP rank as [Q_rank, K_rank, V_rank].
+        # Repack Megatron's head-interleaved tensor into rank-major blocks before
+        # AWEX applies its ordinary dim-0 transfer-plan sharding.
+        vision_tf_config = SimpleNamespace(
+            hidden_size=int(hidden_size),
+            num_attention_heads=int(num_heads),
+            num_query_groups=int(num_heads),
+            kv_channels=int(hidden_size) // int(num_heads),
+        )
+        packed = convert_qkv_weight_along_tp_attention(
+            parameter,
+            max(1, int(self.infer_conf.get("infer_atten_tp_size", 1))),
+            vision_tf_config,
+            train_tp_rank=int(self.rank_info.attn_tp_rank),
+            train_tp_size=max(1, int(self.rank_info.attn_tp_size)),
+        )
+        layer_number, kind = match.groups()
+        return [(f"model.visual.blocks.{layer_number}.attn.qkv.{kind}", packed)]
+
     @torch.no_grad()
     def convert_param(
         self, name: str, parameter: torch.Tensor, vp_stage: int | None = None
@@ -188,6 +232,10 @@ class _Qwen3VLMcoreToHFWeightConverter:
 
         while name.startswith("module."):
             name = name[len("module.") :]
+
+        vision_qkv = self._convert_vision_qkv(name, parameter)
+        if vision_qkv is not None:
+            return vision_qkv
 
         # Only the language decoder is pipeline-partitioned. Vision block ids
         # are global and must never be remapped through the language PP table.

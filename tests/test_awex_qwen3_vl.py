@@ -11,6 +11,7 @@ param_sharding = pytest.importorskip("awex.sharding.param_sharding")
 
 ShardingType = param_sharding.ShardingType
 
+from awex.models.qwen3_moe import SGlangToHFWeightConverterQwen3Moe  # noqa: E402
 from areal.engine.awex.qwen3_vl import (  # noqa: E402
     QWEN3_VL_ARCHITECTURES,
     Qwen3VLMcoreToHFWeightConverter,
@@ -117,6 +118,14 @@ def test_register_qwen3_vl_awex_models_is_idempotent():
     assert first_entries["Qwen3VLMoeForConditionalGeneration"][
         "mcore_converter"
     ]() is Qwen3VLMoeMcoreToHFWeightConverter
+
+
+def test_qwen3_vl_infer_converter_reuses_awex_qwen3_converter():
+    """Qwen3-VL inference conversion extends rather than duplicates Qwen3."""
+    assert issubclass(
+        Qwen3VLSGlangToHFWeightConverter,
+        SGlangToHFWeightConverterQwen3Moe,
+    )
 
 
 def test_colocate_reader_uses_nested_text_config_for_awex_metadata():

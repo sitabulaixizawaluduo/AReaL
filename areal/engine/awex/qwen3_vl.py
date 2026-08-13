@@ -15,7 +15,7 @@ import re
 from typing import Any
 
 import torch
-from awex.converter.sglang_converter import SGlangToHFWeightConverter
+from awex.models.qwen3_moe import SGlangToHFWeightConverterQwen3Moe
 from awex.sharding.param_sharding import (
     ShardingStrategy,
     ShardingType,
@@ -110,24 +110,14 @@ class Qwen3VLShardingStrategy(ShardingStrategy):
         return ShardingType.NO_SHARDING, sharding_dim, 1
 
 
-class Qwen3VLSGlangToHFWeightConverter(SGlangToHFWeightConverter):
-    """Normalize SGLang Qwen3-VL language and vision parameter names."""
+class Qwen3VLSGlangToHFWeightConverter(SGlangToHFWeightConverterQwen3Moe):
+    """Reuse AWEX Qwen3 text conversion and add Qwen3-VL namespaces."""
 
     def __init__(self, model_config, infer_engine_config, rank_info):
         self.vl_model_config = model_config
         super().__init__(
             get_qwen3_vl_text_config(model_config), infer_engine_config, rank_info
         )
-
-    def _fuse_qkv(self, name: str) -> bool:
-        return False
-
-    def _convert_layer_norm_param(
-        self, name: str, parameter: torch.Tensor, layer_number: str
-    ):
-        if "q_norm" in name or "k_norm" in name:
-            return [(name, parameter)]
-        return super()._convert_layer_norm_param(name, parameter, layer_number)
 
     @torch.no_grad()
     def convert_param(self, name: str, parameter: torch.Tensor):

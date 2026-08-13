@@ -84,19 +84,28 @@ from areal.utils.logging import getLogger  # noqa: E402
 logger = getLogger("AwexColocateReader")
 
 
+def _get_text_config(config):
+    """Return Qwen3-VL's nested text config, or a plain model config unchanged."""
+    return getattr(config, "text_config", config)
+
+
 def _ensure_awex_models_registered() -> None:
-    """Rebuild awex's model registry in case it cached a failed auto-import.
+    """Rebuild AWEX's registry, then install AReaL compatibility entries.
 
     ``import_model_configs`` is ``lru_cache``-d and ``ModelRegistry`` is built
     once at module load. If anything imported the registry before our hook_mode
     patch took effect, the BailingMoe converter would be silently missing. Clear
-    the cache and rebuild now that the patch is in place.
+    the cache and rebuild now that the patch is in place. Qwen3-VL support is an
+    AReaL-side backport for AWEX 0.8 and must be restored after every rebuild.
     """
     try:
         from awex.models import registry as _reg
 
         _reg.import_model_configs.cache_clear()
         _reg.ModelRegistry.models = _reg.import_model_configs()
+        from areal.engine.awex.qwen3_vl import register_qwen3_vl_awex_models
+
+        register_qwen3_vl_awex_models()
         missing = [
             m
             for m in ("BailingMoeV2_5ForCausalLM", "BailingMoeV2ForCausalLM")
@@ -384,7 +393,7 @@ class AwexColocateReader:
             "engine_name": "sglang",
             "infer_atten_tp_size": par["tp_size"],
             "infer_world_size": infer_world_size,
-            "hf_config": simple_hf_config(self._get_model().config),
+            "hf_config": simple_hf_config(_get_text_config(self._get_model().config)),
             # AWEX's native reader publishes router_dtype so the train-side
             # converter casts mlp.gate.weight to the dtype the inference
             # engine actually holds (fp32 for BailingMoe). Omitting it makes

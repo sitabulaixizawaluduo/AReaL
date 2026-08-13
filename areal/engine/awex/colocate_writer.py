@@ -147,6 +147,10 @@ class AwexMegatronAdapter:
         if self._initialized:
             return
 
+        from areal.engine.awex.qwen3_vl import register_qwen3_vl_awex_models
+
+        register_qwen3_vl_awex_models()
+
         from awex.models.registry import get_train_weights_converter
         from awex.sharding.param_sharding import get_rank_info_extractor
         from awex.util.common import get_ip_address

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import gc
 import os
+from copy import copy
 from typing import TYPE_CHECKING
 
 import torch
@@ -34,6 +35,25 @@ if TYPE_CHECKING:
 from areal.utils.logging import getLogger
 
 logger = getLogger("AwexColocate")
+
+
+def _get_awex_train_hf_config(hf_config):
+    """Expose text depth at the level expected by AWEX's train resolver.
+
+    Qwen3-VL keeps ``num_hidden_layers`` under ``text_config``, while AWEX 0.8
+    reads it directly from the composite config in ``ParamMetaResolver``. Keep
+    the composite config (the converter still needs ``architectures`` and
+    ``vision_config``), but avoid mutating the engine-owned instance.
+    """
+    if hasattr(hf_config, "num_hidden_layers"):
+        return hf_config
+    text_config = getattr(hf_config, "text_config", None)
+    if text_config is None or not hasattr(text_config, "num_hidden_layers"):
+        return hf_config
+
+    awex_config = copy(hf_config)
+    awex_config.num_hidden_layers = text_config.num_hidden_layers
+    return awex_config
 
 
 def resolve_physical_gpu_id(relative_gpu_id: int) -> int:
@@ -194,7 +214,8 @@ class AwexMegatronAdapter:
 
             infer_conf["hf_config"] = SimpleNamespace(**infer_conf["hf_config"])
 
-        meta_resolver = McoreParamMetaResolver(shim, self._engine.hf_config, infer_conf)
+        awex_hf_config = _get_awex_train_hf_config(self._engine.hf_config)
+        meta_resolver = McoreParamMetaResolver(shim, awex_hf_config, infer_conf)
         parameters_meta = meta_resolver.get_parameters_meta()
         logger.info(
             "Collected training parameters metadata: %d params", len(parameters_meta)

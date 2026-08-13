@@ -129,6 +129,27 @@ def test_colocate_reader_uses_nested_text_config_for_awex_metadata():
     assert _get_text_config(text_config) is text_config
 
 
+def test_colocate_writer_exposes_text_depth_without_losing_vl_config():
+    from areal.engine.awex.colocate_writer import _get_awex_train_hf_config
+
+    text_config = SimpleNamespace(num_hidden_layers=28)
+    vision_config = SimpleNamespace(num_heads=16)
+    vl_config = SimpleNamespace(
+        architectures=["Qwen3VLForConditionalGeneration"],
+        text_config=text_config,
+        vision_config=vision_config,
+    )
+
+    awex_config = _get_awex_train_hf_config(vl_config)
+
+    assert awex_config is not vl_config
+    assert not hasattr(vl_config, "num_hidden_layers")
+    assert awex_config.num_hidden_layers == 28
+    assert awex_config.architectures == ["Qwen3VLForConditionalGeneration"]
+    assert awex_config.text_config is text_config
+    assert awex_config.vision_config is vision_config
+
+
 def test_dense_language_qkv_has_train_infer_parity(
     vl_config, tf_config, rank_info, infer_engine_config
 ):

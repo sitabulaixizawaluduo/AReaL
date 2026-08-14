@@ -1,60 +1,50 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""CPU unit tests for Qwen3-VL support in the v1 AWEX colocate path."""
+"""Integration contracts for native AWEX Qwen3-VL colocate support."""
 
 from types import SimpleNamespace
 
 import pytest
-import torch
 
-param_sharding = pytest.importorskip("awex.sharding.param_sharding")
+qwen3_vl = pytest.importorskip(
+    "awex.models.qwen3_vl",
+    reason="requires an AWEX release with native Qwen3-VL support",
+)
 
-ShardingType = param_sharding.ShardingType
+from awex.models.registry import (  # noqa: E402
+    ModelRegistry,
+    get_infer_weights_converter,
+    get_sharding_strategy,
+)
 
-from awex.models.qwen3_moe import SGlangToHFWeightConverterQwen3Moe  # noqa: E402
-from areal.engine.awex.qwen3_vl import (  # noqa: E402
-    QWEN3_VL_ARCHITECTURES,
-    Qwen3VLMcoreToHFWeightConverter,
-    Qwen3VLMoeMcoreToHFWeightConverter,
-    Qwen3VLSGlangToHFWeightConverter,
-    Qwen3VLShardingStrategy,
-    register_qwen3_vl_awex_models,
+from areal.engine.awex.colocate_reader import (  # noqa: E402
+    _get_awex_infer_hf_config,
+    _get_router_dtype,
 )
 
 
-@pytest.fixture
-def text_config():
-    return SimpleNamespace(
-        hidden_size=8,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        num_experts=4,
-        tie_word_embeddings=False,
-    )
+class _CompositeVLConfig:
+    def __init__(self, architectures=None, router_dtype="fp32"):
+        self.architectures = architectures
+        self.text_config = SimpleNamespace(
+            num_hidden_layers=28,
+            hidden_size=8,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            router_dtype=router_dtype,
+        )
+        self.vision_config = SimpleNamespace(num_heads=2, hidden_size=4)
+
+    def to_dict(self):
+        return {
+            "architectures": self.architectures,
+            "model_type": "qwen3_vl",
+            "text_config": vars(self.text_config),
+            "vision_config": vars(self.vision_config),
+        }
 
 
-@pytest.fixture
-def vl_config(text_config):
-    return SimpleNamespace(
-        architectures=["Qwen3VLForConditionalGeneration"],
-        text_config=text_config,
-        vision_config=SimpleNamespace(num_heads=2, hidden_size=4),
-    )
-
-
-@pytest.fixture
-def tf_config():
-    return SimpleNamespace(
-        hidden_size=8,
-        num_attention_heads=4,
-        num_query_groups=2,
-        kv_channels=2,
-        num_layers=2,
-    )
-
-
-@pytest.fixture
-def rank_info():
+def _rank_info():
     return SimpleNamespace(
         tp_rank=0,
         tp_size=1,
@@ -69,431 +59,77 @@ def rank_info():
     )
 
 
-@pytest.fixture
-def infer_engine_config():
-    return SimpleNamespace(
-        tp_size=1,
-        ep_size=1,
-        device_backend="cpu",
+def _infer_engine_config():
+    return SimpleNamespace(tp_size=1, ep_size=1, device_backend="cpu")
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    ["Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration"],
+)
+def test_awex_registry_provides_native_qwen3_vl_entries(architecture):
+    entry = ModelRegistry.models[architecture]
+
+    assert entry["sglang_converter"] is qwen3_vl.Qwen3VLSGlangToHFWeightConverter
+    assert entry["sharding_strategy"] is qwen3_vl.Qwen3VLShardingStrategy
+    assert get_sharding_strategy(architecture) is qwen3_vl.Qwen3VLShardingStrategy
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    ["Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration"],
+)
+def test_colocate_infer_converter_receives_composite_vl_config(architecture):
+    config = _CompositeVLConfig(architectures=[architecture])
+
+    converter = get_infer_weights_converter(
+        "sglang",
+        architecture,
+        config,
+        _rank_info(),
+        _infer_engine_config(),
     )
 
-
-def _train_converter(cls, vl_config, rank_info, tf_config):
-    return cls(
-        vl_config,
-        rank_info,
-        {"infer_atten_tp_size": 1},
-        tf_config,
-    )
+    assert isinstance(converter, qwen3_vl.Qwen3VLSGlangToHFWeightConverter)
+    assert converter.vl_model_config is config
+    assert converter.model_config is config.text_config
 
 
-def _infer_converter(vl_config, rank_info, infer_engine_config):
-    return Qwen3VLSGlangToHFWeightConverter(
-        vl_config, infer_engine_config, rank_info
-    )
-
-
-def test_register_qwen3_vl_awex_models_is_idempotent():
-    from awex.models.registry import ModelRegistry
-
-    register_qwen3_vl_awex_models()
-    first_entries = {
-        architecture: ModelRegistry.models[architecture]
-        for architecture in QWEN3_VL_ARCHITECTURES
-    }
-
-    register_qwen3_vl_awex_models()
-
-    assert {
-        architecture: ModelRegistry.models[architecture]
-        for architecture in QWEN3_VL_ARCHITECTURES
-    } == first_entries
-    assert all(
-        entry["sglang_converter"] is Qwen3VLSGlangToHFWeightConverter
-        for entry in first_entries.values()
-    )
-    assert first_entries["Qwen3VLForConditionalGeneration"][
-        "mcore_converter"
-    ]() is Qwen3VLMcoreToHFWeightConverter
-    assert first_entries["Qwen3VLMoeForConditionalGeneration"][
-        "mcore_converter"
-    ]() is Qwen3VLMoeMcoreToHFWeightConverter
-
-
-def test_qwen3_vl_infer_converter_reuses_awex_qwen3_converter():
-    """Qwen3-VL inference conversion extends rather than duplicates Qwen3."""
-    assert issubclass(
-        Qwen3VLSGlangToHFWeightConverter,
-        SGlangToHFWeightConverterQwen3Moe,
-    )
-
-
-def test_colocate_reader_uses_nested_text_config_for_awex_metadata():
-    from areal.engine.awex.colocate_reader import (
-        _get_awex_infer_hf_config,
-        _get_text_config,
-    )
-
-    class TextConfig:
-        num_hidden_layers = 28
-        router_dtype = "fp32"
-
-        def to_dict(self):
-            return {
-                "num_hidden_layers": self.num_hidden_layers,
-                "router_dtype": self.router_dtype,
-                "architectures": None,
-            }
-
-    text_config = TextConfig()
-    vl_config = SimpleNamespace(text_config=text_config)
+def test_colocate_reader_serializes_complete_vl_config():
+    config = _CompositeVLConfig(architectures=["Qwen3VLForConditionalGeneration"])
 
     class Qwen3VLForConditionalGeneration:
-        config = vl_config
+        pass
 
-    assert _get_text_config(vl_config) is text_config
-    assert _get_text_config(text_config) is text_config
-    awex_config = _get_awex_infer_hf_config(Qwen3VLForConditionalGeneration())
-    assert awex_config.num_hidden_layers == 28
+    model = Qwen3VLForConditionalGeneration()
+    model.config = config
+
+    awex_config = _get_awex_infer_hf_config(model)
+
     assert awex_config.architectures == ["Qwen3VLForConditionalGeneration"]
+    assert awex_config.model_type == "qwen3_vl"
+    assert awex_config.text_config["num_hidden_layers"] == 28
+    assert awex_config.vision_config == {"num_heads": 2, "hidden_size": 4}
 
 
-def test_colocate_writer_exposes_text_depth_without_losing_vl_config():
-    from areal.engine.awex.colocate_writer import _get_awex_train_hf_config
+def test_colocate_reader_fills_missing_runtime_architecture():
+    config = _CompositeVLConfig(architectures=None)
 
-    text_config = SimpleNamespace(num_hidden_layers=28)
-    vision_config = SimpleNamespace(num_heads=16)
-    vl_config = SimpleNamespace(
-        architectures=["Qwen3VLForConditionalGeneration"],
-        text_config=text_config,
-        vision_config=vision_config,
-    )
+    class Qwen3VLForConditionalGeneration:
+        pass
 
-    awex_config = _get_awex_train_hf_config(vl_config)
+    model = Qwen3VLForConditionalGeneration()
+    model.config = config
 
-    assert awex_config is not vl_config
-    assert not hasattr(vl_config, "num_hidden_layers")
-    assert awex_config.num_hidden_layers == 28
+    awex_config = _get_awex_infer_hf_config(model)
+
     assert awex_config.architectures == ["Qwen3VLForConditionalGeneration"]
-    assert awex_config.text_config is text_config
-    assert awex_config.vision_config is vision_config
+    assert awex_config.text_config["num_hidden_layers"] == 28
+    assert awex_config.vision_config["num_heads"] == 2
 
 
-def test_dense_language_qkv_has_train_infer_parity(
-    vl_config, tf_config, rank_info, infer_engine_config
-):
-    train_converter = _train_converter(
-        Qwen3VLMcoreToHFWeightConverter, vl_config, rank_info, tf_config
-    )
-    infer_converter = _infer_converter(vl_config, rank_info, infer_engine_config)
-    mcore_qkv = torch.arange(16 * 8, dtype=torch.float32).reshape(16, 8)
+def test_colocate_reader_reads_router_dtype_from_text_config():
+    config = _CompositeVLConfig(router_dtype="fp32")
 
-    train_params = train_converter.convert_param(
-        "module.module.language_model.decoder.layers.0."
-        "self_attention.linear_qkv.weight",
-        mcore_qkv,
-    )
-    sglang_qkv = torch.cat([param for _, param in train_params], dim=0)
-    infer_params = infer_converter.convert_param(
-        "model.layers.0.self_attn.qkv_proj.weight", sglang_qkv
-    )
-
-    assert [name for name, _ in train_params] == [
-        "model.language_model.layers.0.self_attn.q_proj.weight",
-        "model.language_model.layers.0.self_attn.k_proj.weight",
-        "model.language_model.layers.0.self_attn.v_proj.weight",
-    ]
-    assert [name for name, _ in infer_params] == [
-        name for name, _ in train_params
-    ]
-    for (_, train_param), (_, infer_param) in zip(train_params, infer_params):
-        torch.testing.assert_close(train_param, infer_param, rtol=0, atol=0)
-
-
-def test_vision_qkv_has_train_infer_parity(
-    vl_config, tf_config, rank_info, infer_engine_config, monkeypatch
-):
-    monkeypatch.setattr(
-        "awex.converter.mcore_converter.get_full_tensor",
-        lambda parameter, dim=0: parameter,
-    )
-    train_converter = Qwen3VLMcoreToHFWeightConverter(
-        vl_config,
-        rank_info,
-        {
-            "infer_atten_tp_size": 1,
-            "train_pp_stage_layer_id_map": {(0, 0): {0: 0}},
-        },
-        tf_config,
-    )
-    infer_converter = _infer_converter(vl_config, rank_info, infer_engine_config)
-    mcore_qkv = torch.arange(12 * 4, dtype=torch.float32).reshape(12, 4)
-
-    train_params = train_converter.convert_param(
-        "module.module.vision_model.decoder.layers.1."
-        "self_attention.linear_qkv.weight",
-        mcore_qkv,
-    )
-    infer_params = infer_converter.convert_param(
-        "visual.blocks.1.attn.qkv_proj.weight", train_params[0][1]
-    )
-
-    assert train_params[0][0] == "model.visual.blocks.1.attn.qkv.weight"
-    assert infer_params[0][0] == train_params[0][0]
-    torch.testing.assert_close(
-        train_params[0][1], infer_params[0][1], rtol=0, atol=0
-    )
-    assert not torch.equal(train_params[0][1], mcore_qkv)
-
-
-@pytest.mark.parametrize("kind", ["weight", "bias"])
-def test_vision_qkv_tp2_conversion_matches_sglang_rank_layout(
-    kind, vl_config, tf_config, rank_info, monkeypatch
-):
-    monkeypatch.setattr(
-        "awex.converter.mcore_converter.get_full_tensor",
-        lambda parameter, dim=0: parameter,
-    )
-    converter = Qwen3VLMcoreToHFWeightConverter(
-        vl_config,
-        rank_info,
-        {"infer_atten_tp_size": 2},
-        tf_config,
-    )
-    tail_shape = (4,) if kind == "weight" else ()
-    q = [torch.full((2, *tail_shape), 10 + head) for head in range(2)]
-    k = [torch.full((2, *tail_shape), 20 + head) for head in range(2)]
-    v = [torch.full((2, *tail_shape), 30 + head) for head in range(2)]
-    mcore_qkv = torch.cat(
-        [torch.cat((q[head], k[head], v[head]), dim=0) for head in range(2)],
-        dim=0,
-    )
-
-    [(name, packed_qkv)] = converter.convert_param(
-        "module.module.vision_model.decoder.layers.1."
-        f"self_attention.linear_qkv.{kind}",
-        mcore_qkv,
-    )
-    rank_shards = torch.chunk(packed_qkv, 2, dim=0)
-
-    assert name == f"model.visual.blocks.1.attn.qkv.{kind}"
-    for rank, rank_shard in enumerate(rank_shards):
-        expected = torch.cat((q[rank], k[rank], v[rank]), dim=0)
-        torch.testing.assert_close(rank_shard, expected, rtol=0, atol=0)
-
-
-def test_dense_mlp_has_train_infer_parity(
-    vl_config, tf_config, rank_info, infer_engine_config
-):
-    train_converter = _train_converter(
-        Qwen3VLMcoreToHFWeightConverter, vl_config, rank_info, tf_config
-    )
-    infer_converter = _infer_converter(vl_config, rank_info, infer_engine_config)
-    mcore_fc1 = torch.arange(12 * 8, dtype=torch.float32).reshape(12, 8)
-
-    train_params = train_converter.convert_param(
-        "module.module.language_model.decoder.layers.0.mlp.linear_fc1.weight",
-        mcore_fc1,
-    )
-    infer_params = infer_converter.convert_param(
-        "model.layers.0.mlp.gate_up_proj.weight", mcore_fc1
-    )
-
-    assert [name for name, _ in train_params] == [
-        "model.language_model.layers.0.mlp.gate_proj.weight",
-        "model.language_model.layers.0.mlp.up_proj.weight",
-    ]
-    assert [name for name, _ in infer_params] == [
-        name for name, _ in train_params
-    ]
-    for (_, train_param), (_, infer_param) in zip(train_params, infer_params):
-        torch.testing.assert_close(train_param, infer_param, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize(
-    ("mcore_name", "sglang_name", "canonical_name"),
-    [
-        (
-            "module.module.vision_model.merger.linear_fc1.weight",
-            "visual.merger.linear_fc1.weight",
-            "model.visual.merger.linear_fc1.weight",
-        ),
-        (
-            "module.module.vision_model.decoder.deepstack_merger_list.2."
-            "patch_norm.weight",
-            "visual.deepstack_merger_list.2.norm.weight",
-            "model.visual.deepstack_merger_list.2.norm.weight",
-        ),
-    ],
-)
-def test_vision_merger_names_have_train_infer_parity(
-    mcore_name,
-    sglang_name,
-    canonical_name,
-    vl_config,
-    tf_config,
-    rank_info,
-    infer_engine_config,
-):
-    train_converter = _train_converter(
-        Qwen3VLMcoreToHFWeightConverter, vl_config, rank_info, tf_config
-    )
-    infer_converter = _infer_converter(vl_config, rank_info, infer_engine_config)
-    parameter = torch.arange(8, dtype=torch.float32)
-
-    train_params = train_converter.convert_param(mcore_name, parameter)
-    infer_params = infer_converter.convert_param(sglang_name, parameter)
-
-    assert [name for name, _ in train_params] == [canonical_name]
-    assert [name for name, _ in infer_params] == [canonical_name]
-    torch.testing.assert_close(train_params[0][1], parameter, rtol=0, atol=0)
-    torch.testing.assert_close(infer_params[0][1], parameter, rtol=0, atol=0)
-
-
-def test_moe_expert_has_train_infer_parity(
-    vl_config, tf_config, rank_info, infer_engine_config
-):
-    train_converter = _train_converter(
-        Qwen3VLMoeMcoreToHFWeightConverter, vl_config, rank_info, tf_config
-    )
-    infer_converter = _infer_converter(vl_config, rank_info, infer_engine_config)
-    expert_fc1 = torch.arange(12 * 8, dtype=torch.float32).reshape(12, 8)
-
-    train_params = train_converter.convert_param(
-        "module.module.language_model.decoder.layers.1."
-        "mlp.experts.linear_fc1.weight0",
-        expert_fc1,
-    )
-    sglang_w13 = expert_fc1.unsqueeze(0)
-    infer_params = infer_converter.convert_param(
-        "model.layers.1.mlp.experts.w13_weight", sglang_w13
-    )
-
-    assert [name for name, _ in train_params] == [
-        "model.language_model.layers.1.mlp.experts.0.gate_proj.weight",
-        "model.language_model.layers.1.mlp.experts.0.up_proj.weight",
-    ]
-    assert [name for name, _ in infer_params] == [
-        name for name, _ in train_params
-    ]
-    for (_, train_param), (_, infer_param) in zip(train_params, infer_params):
-        torch.testing.assert_close(train_param, infer_param, rtol=0, atol=0)
-
-
-def test_moe_training_converter_offsets_local_expert_id(
-    vl_config, tf_config, rank_info
-):
-    rank_info.ep_size = 2
-    rank_info.ep_rank = 1
-    converter = _train_converter(
-        Qwen3VLMoeMcoreToHFWeightConverter, vl_config, rank_info, tf_config
-    )
-
-    converted = converter.convert_param(
-        "module.module.language_model.decoder.layers.0."
-        "mlp.experts.linear_fc2.weight0",
-        torch.ones(8, 6),
-    )
-
-    assert converted[0][0] == (
-        "model.language_model.layers.0.mlp.experts.2.down_proj.weight"
-    )
-
-
-def test_moe_router_uses_sglang_router_dtype(vl_config, tf_config, rank_info):
-    converter = Qwen3VLMoeMcoreToHFWeightConverter(
-        vl_config,
-        rank_info,
-        {"infer_atten_tp_size": 1, "router_dtype": "fp32"},
-        tf_config,
-    )
-
-    converted = converter.convert_param(
-        "module.module.language_model.decoder.layers.0.mlp.router.weight",
-        torch.ones(4, 8, dtype=torch.bfloat16),
-    )
-
-    assert converted[0][0] == "model.language_model.layers.0.mlp.gate.weight"
-    assert converted[0][1].dtype is torch.float32
-
-
-def test_tied_embedding_alias_has_train_infer_parity(
-    vl_config, tf_config, rank_info, infer_engine_config
-):
-    vl_config.text_config.tie_word_embeddings = True
-    train_converter = _train_converter(
-        Qwen3VLMcoreToHFWeightConverter, vl_config, rank_info, tf_config
-    )
-    infer_converter = _infer_converter(vl_config, rank_info, infer_engine_config)
-    embedding = torch.arange(32, dtype=torch.float32).reshape(4, 8)
-
-    train_params = train_converter.convert_param(
-        "module.module.language_model.embedding.word_embeddings.weight", embedding
-    )
-    infer_params = infer_converter.convert_param(
-        "model.embed_tokens.weight", embedding
-    )
-
-    expected_names = ["model.language_model.embed_tokens.weight", "lm_head.weight"]
-    assert [name for name, _ in train_params] == expected_names
-    assert [name for name, _ in infer_params] == expected_names
-
-
-@pytest.mark.parametrize(
-    ("name", "expected_type", "expected_dim"),
-    [
-        ("model.visual.patch_embed.proj.weight", ShardingType.NO_SHARDING, 0),
-        ("model.visual.blocks.0.attn.qkv.weight", ShardingType.TP_SHARDING, 0),
-        ("model.visual.blocks.0.attn.proj.weight", ShardingType.TP_SHARDING, 1),
-        (
-            "model.visual.deepstack_merger_list.0.linear_fc1.weight",
-            ShardingType.TP_SHARDING,
-            0,
-        ),
-        (
-            "model.visual.deepstack_merger_list.0.linear_fc2.weight",
-            ShardingType.TP_SHARDING,
-            1,
-        ),
-        (
-            "model.visual.deepstack_merger_list.0.linear_fc2.bias",
-            ShardingType.NO_SHARDING,
-            0,
-        ),
-    ],
-)
-def test_vision_sharding_strategy_matches_sglang_layout(
-    name, expected_type, expected_dim, rank_info
-):
-    rank_info.tp_size = 2
-    rank_info.attn_tp_size = 2
-    strategy = Qwen3VLShardingStrategy(
-        engine_name="sglang",
-        enable_dp_attention=False,
-        enable_dp_lm_head=False,
-        moe_dense_tp_size=2,
-        tp_size=2,
-        ep_size=1,
-        ep_tp_size=1,
-        rank_info=rank_info,
-        device_backend="cpu",
-    )
-
-    sharding_type, sharding_dim, num_shards = strategy.get_sharding_strategy(name)
-
-    assert sharding_type is expected_type
-    assert sharding_dim == expected_dim
-    assert num_shards == (2 if expected_type is ShardingType.TP_SHARDING else 1)
-
-
-def test_unknown_megatron_vision_parameter_fails_fast(
-    vl_config, tf_config, rank_info
-):
-    converter = _train_converter(
-        Qwen3VLMcoreToHFWeightConverter, vl_config, rank_info, tf_config
-    )
-
-    with pytest.raises(ValueError, match="Unknown Qwen3-VL parameter"):
-        converter.convert_param(
-            "module.module.vision_model.unknown.weight", torch.ones(2)
-        )
+    assert _get_router_dtype(config) == "fp32"
+    assert _get_router_dtype(SimpleNamespace(router_dtype="bf16")) == "bf16"

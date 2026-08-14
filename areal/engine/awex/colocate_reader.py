@@ -256,9 +256,7 @@ class _PhysicalDeviceNCCLWorkerWeightsReader(NCCLWorkerWeightsReader):
 
         ip_address = get_ip_address()
         key_suffix = f"_{ip_address}_{self.physical_device_id}_{step_id}"
-        self.meta_server_client.put_object(
-            f"weights_update_finished{key_suffix}", True
-        )
+        self.meta_server_client.put_object(f"weights_update_finished{key_suffix}", True)
         runtime_device_id = device_util.current_device()
         dist.barrier(
             group=self.weights_update_group,
@@ -272,48 +270,52 @@ class _PhysicalDeviceNCCLWorkerWeightsReader(NCCLWorkerWeightsReader):
         gc.collect()
         if device_util.get_device_type() == "cuda":
             torch.cuda.empty_cache()
-        self.meta_server_client.get_object_then_delete(
-            f"write_finished{key_suffix}"
-        )
+        self.meta_server_client.get_object_then_delete(f"write_finished{key_suffix}")
         logger.info(
             "Finished updating weights in colocate mode for rank %d",
             self.transfer_rank,
         )
 
 
-def _get_text_config(config):
-    """Return Qwen3-VL's nested text config, or a plain model config unchanged."""
-    return getattr(config, "text_config", config)
+def _get_router_dtype(config):
+    """Read router dtype from a flat or multimodal Hugging Face config."""
+    router_dtype = getattr(config, "router_dtype", None)
+    if router_dtype is not None:
+        return router_dtype
+    text_config = getattr(config, "text_config", config)
+    return getattr(text_config, "router_dtype", "bf16")
 
 
 def _get_awex_infer_hf_config(model):
-    """Build AWEX's flat config while preserving the actual runtime architecture."""
-    hf_config = simple_hf_config(_get_text_config(model.config))
+    """Serialize the complete runtime config for AWEX metadata exchange."""
+    hf_config = simple_hf_config(model.config)
     if not getattr(hf_config, "architectures", None):
         hf_config.architectures = [type(model).__name__]
     return hf_config
 
 
 def _ensure_awex_models_registered() -> None:
-    """Rebuild AWEX's registry, then install AReaL compatibility entries.
+    """Rebuild AWEX's registry after installing the hook-mode compatibility patch.
 
     ``import_model_configs`` is ``lru_cache``-d and ``ModelRegistry`` is built
     once at module load. If anything imported the registry before our hook_mode
     patch took effect, the BailingMoe converter would be silently missing. Clear
-    the cache and rebuild now that the patch is in place. Qwen3-VL support is an
-    AReaL-side backport for AWEX 0.8 and must be restored after every rebuild.
+    the cache and rebuild now that the patch is in place. Model-specific entries,
+    including Qwen3-VL, are discovered from AWEX's own ``awex.models`` package.
     """
     try:
         from awex.models import registry as _reg
 
         _reg.import_model_configs.cache_clear()
         _reg.ModelRegistry.models = _reg.import_model_configs()
-        from areal.engine.awex.qwen3_vl import register_qwen3_vl_awex_models
-
-        register_qwen3_vl_awex_models()
         missing = [
             m
-            for m in ("BailingMoeV2_5ForCausalLM", "BailingMoeV2ForCausalLM")
+            for m in (
+                "BailingMoeV2_5ForCausalLM",
+                "BailingMoeV2ForCausalLM",
+                "Qwen3VLForConditionalGeneration",
+                "Qwen3VLMoeForConditionalGeneration",
+            )
             if m not in _reg.ModelRegistry.models
         ]
         if missing:
@@ -512,7 +514,7 @@ class AwexColocateReader:
                 info["rank_info"] = RankInfo(**ri)
 
         resolver = _SingleInstanceMetaResolver(
-            _get_text_config(self._get_model().config),
+            self._get_model().config,
             "sglang",
             self._scheduler.server_args,
             raw_meta_list,
@@ -609,11 +611,7 @@ class AwexColocateReader:
             # papers over any such mismatch generically, but keep the
             # semantic path whole so new models behave identically to native
             # awex.
-            "router_dtype": getattr(
-                _get_text_config(self._get_model().config),
-                "router_dtype",
-                "bf16",
-            ),
+            "router_dtype": _get_router_dtype(self._get_model().config),
         }
         self._infer_conf = infer_conf
 

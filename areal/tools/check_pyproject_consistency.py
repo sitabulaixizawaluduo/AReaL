@@ -31,7 +31,19 @@ from typing import Any
 # versions of torch / torchao / etc.
 ESCAPABLE_PACKAGES: frozenset[str] = frozenset(
     {
+        "cuda-python",
+        "cuda-tile",
+        "flash-attn-4",
+        "flashinfer-cubin",
+        "flashinfer-python",
+        "humming-kernels",
+        "kernels",
+        "megatron-bridge",
+        "megatron-core",
+        "mistral-common",
+        "nvidia-cutlass-dsl",
         "torch",
+        "torch-memory-saver",
         "torchao",
         "torchaudio",
         "torchvision",
@@ -190,12 +202,17 @@ class _Checker:
                 )
                 continue
 
-            # Filter out backend-specific self-references before comparing.
+            # Filter out backend-specific self-references and packages before
+            # comparing the shared part of each extra.
             filtered_a = sorted(
-                d for d in extras_a[extra] if not _is_backend_selfref(d)
+                d
+                for d in extras_a[extra]
+                if not _is_backend_selfref(d) and not _is_escapable(_parse_dep_name(d))
             )
             filtered_b = sorted(
-                d for d in extras_b[extra] if not _is_backend_selfref(d)
+                d
+                for d in extras_b[extra]
+                if not _is_backend_selfref(d) and not _is_escapable(_parse_dep_name(d))
             )
             if filtered_a != filtered_b:
                 self._err(

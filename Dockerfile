@@ -6,10 +6,17 @@
 #   docker build -t areal-runtime:dev-sglang .                          # default (sglang)
 #   docker build --build-arg VARIANT=vllm -t areal-runtime:dev-vllm .    # vllm variant
 
+# Inference backend selector: sglang (default) or vllm. Keep the vLLM image
+# rooted in its existing SGLang runtime while the default image moves to the
+# official full SGLang 0.5.18 CUDA 12.9 image.
+ARG VARIANT=sglang
+
 # ============================================================
 # BUILDER STAGE: compile C++ extensions and install all deps
 # ============================================================
-FROM lmsysorg/sglang:v0.5.10.post1-runtime AS builder
+FROM lmsysorg/sglang:v0.5.18-cu129 AS builder-base-sglang
+FROM lmsysorg/sglang:v0.5.10.post1-runtime AS builder-base-vllm
+FROM builder-base-${VARIANT} AS builder
 
 # Inference backend selector: sglang (default) or vllm
 ARG VARIANT=sglang
@@ -57,9 +64,9 @@ ENV CUDA_HOME=/usr/local/cuda
 ##############################################################
 
 # Create venv and install torch with CUDA support
-# Version is variant-specific: sglang pins 2.9.1, vllm pins 2.10.0
+# Version is variant-specific: sglang pins 2.13.0, vllm pins 2.10.0
 RUN uv venv $VIRTUAL_ENV \
-    && if [ "$VARIANT" = "vllm" ]; then TORCH_VER="2.10.0"; else TORCH_VER="2.9.1"; fi \
+    && if [ "$VARIANT" = "vllm" ]; then TORCH_VER="2.10.0"; else TORCH_VER="2.13.0"; fi \
     && uv pip install --index-url https://download.pytorch.org/whl/cu129 \
     "torch==${TORCH_VER}+cu129" "torchaudio" "torchvision"
 
@@ -120,10 +127,13 @@ RUN git clone https://github.com/Dao-AILab/causal-conv1d -b v1.6.0 /causal-conv1
 # flash-attn 2: download pre-built wheel, strip local version, repack & install
 RUN set -ex \
     && FA_VER="2.8.3" \
-    && FA_RELEASE="v0.7.16" \
-    && if [ "$VARIANT" = "vllm" ]; then TORCH_TAG="torch2.10"; else TORCH_TAG="torch2.9"; fi \
+    && if [ "$VARIANT" = "vllm" ]; then \
+         FA_RELEASE="v0.7.16"; TORCH_TAG="torch2.10"; CUDA_TAG="cu128"; \
+       else \
+         FA_RELEASE="v0.9.47"; TORCH_TAG="torch2.13"; CUDA_TAG="cu126"; \
+       fi \
     && PY_TAG=$(python3 -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')") \
-    && LOCAL="+cu128${TORCH_TAG}" \
+    && LOCAL="+${CUDA_TAG}${TORCH_TAG}" \
     && WHL="flash_attn-${FA_VER}${LOCAL}-${PY_TAG}-${PY_TAG}-linux_x86_64.whl" \
     && URL="https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/${FA_RELEASE}/${WHL}" \
     && WORK="/tmp/flash-attn-repack" \
@@ -141,10 +151,13 @@ RUN set -ex \
 # flash-attn-3: install pre-built wheel (C extension only) + Python interface from source
 RUN set -ex \
     && FA3_VER="3.0.0" \
-    && FA3_RELEASE="v0.8.2" \
     && FA3_SRC_TAG="v2.8.3" \
-    && if [ "$VARIANT" = "vllm" ]; then TORCH_TAG="torch2.10"; else TORCH_TAG="torch2.9"; fi \
-    && LOCAL="+cu128${TORCH_TAG}gite2743ab" \
+    && if [ "$VARIANT" = "vllm" ]; then \
+         FA3_RELEASE="v0.8.2"; TORCH_TAG="torch2.10"; CUDA_TAG="cu128"; \
+       else \
+         FA3_RELEASE="v0.9.47"; TORCH_TAG="torch2.13"; CUDA_TAG="cu126"; \
+       fi \
+    && LOCAL="+${CUDA_TAG}${TORCH_TAG}gite2743ab" \
     && WHL="flash_attn_3-${FA3_VER}${LOCAL}-cp39-abi3-linux_x86_64.whl" \
     && URL="https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/${FA3_RELEASE}/${WHL}" \
     && curl -fSL --retry 3 -o "/tmp/${WHL}" "$URL" \
@@ -186,7 +199,9 @@ RUN uv pip install --no-cache-dir -U setuptools nvidia-ml-py
 # RUNTIME STAGE: lean final image (no build tools, no source
 # checkouts, no intermediate compilation artifacts)
 # ============================================================
-FROM lmsysorg/sglang:v0.5.10.post1-runtime
+FROM lmsysorg/sglang:v0.5.18-cu129 AS runtime-base-sglang
+FROM lmsysorg/sglang:v0.5.10.post1-runtime AS runtime-base-vllm
+FROM runtime-base-${VARIANT} AS runtime
 
 ARG VARIANT=sglang
 

@@ -1,0 +1,213 @@
+# Candidate topology. Override resource fields for your allocated hardware.
+experiment_name: pacman-grpo
+trial_name: ${oc.env:PACMAN_TRIAL,trial0}
+artifact_root: ${oc.env:PACMAN_ARTIFACT_ROOT}
+run_artifact_root: ${artifact_root}/runs/${experiment_name}/${trial_name}
+split_manifest: ${oc.env:PACMAN_SPLIT_MANIFEST}
+pacman_python_root: ${oc.env:MAAPACMAN_PACMAN_ROOT}
+worker_base_dir: ${oc.env:PACMAN_WORKER_BASE_DIR}
+ghost_reward_target: 4
+context_safety_margin: 256
+environment_max_steps: 512
+seed: 1
+total_train_epochs: 2
+total_train_steps: null
+enable_offload: false
+tokenizer_path: ${actor.path}
+critic: null
+teacher: null
+cluster:
+  n_nodes: ${oc.env:PACMAN_N_NODES,1}
+  n_gpus_per_node: ${oc.env:PACMAN_GPUS_PER_NODE,1}
+  fileroot: ${oc.env:PACMAN_FILEROOT}
+  name_resolve:
+    type: nfs
+    nfs_record_root: ${cluster.fileroot}/name_resolve
+scheduler:
+  type: ${oc.env:PACMAN_SCHEDULER,local}
+gconfig:
+  n_samples: 12
+  reward_normalization: true
+  min_new_tokens: 0
+  max_new_tokens: 64
+  max_tokens: 32768
+  greedy: false
+  temperature: 0.7
+  top_p: 1.0
+  drop_incomplete_group: true
+eval_gconfig:
+  n_samples: 1
+  reward_normalization: false
+  min_new_tokens: 0
+  max_new_tokens: 64
+  max_tokens: 32768
+  greedy: false
+  temperature: 0.7
+  top_p: 1.0
+actor:
+  backend: ${oc.env:PACMAN_ACTOR_BACKEND,megatron:d1p1t1c1e1}
+  path: ${oc.env:PACMAN_MODEL_PATH,Qwen/Qwen3.5-4B}
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  optimizer_dtype: float32
+  attn_impl: flash_attention_2
+  offload: false
+  mb_spec:
+    max_tokens_per_mb: ${gconfig.max_tokens}
+    n_mbs_divisor: 1
+  optimizer:
+    type: adam
+    lr: 5.0e-7
+    weight_decay: 0.0
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1.0e-8
+    lr_scheduler_type: constant
+    warmup_steps_proportion: 0.0
+    gradient_clipping: 1.0
+  temperature: ${gconfig.temperature}
+  eps_clip: 0.05
+  kl_ctl: 0.01
+  kl_logprob_source: proximal
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  reward_clip: 20.0
+  ppo_n_minibatches: 1
+  recompute_logprob: true
+  use_decoupled_loss: true
+  prox_logp_method: recompute
+  min_usable_group_size: ${gconfig.n_samples}
+  rejection_sampling:
+    level: sequence
+    action: mask
+    metric: ratio
+    agg: sum
+    lower: 0.8
+    upper: 1.25
+  adv_norm: null
+  reward_norm: null
+  discount: 1.0
+  gae_lambda: 1.0
+  mask_no_eos_with_zero: false
+  weight_update_mode: awex
+  max_new_tokens: ${gconfig.max_new_tokens}
+  megatron:
+    bridge_type: megatron-bridge
+    enable_mtp: false
+    main_params_dtype: float32
+    exp_avg_dtype: float32
+    exp_avg_sq_dtype: float32
+  scheduling_strategy:
+    type: separation
+  scheduling_spec:
+    - task_type: worker
+      gpu: 1
+      cpu: 8
+      mem: 64
+      port_count: 2
+      image: ${oc.env:PACMAN_WORKER_IMAGE,null}
+      cmd: ${oc.env:PACMAN_WORKER_PYTHON,python3} -m areal.infra.rpc.rpc_server
+      additional_bash_cmds:
+        - source "${artifact_root}/environment.sh"
+      env_vars:
+        TMS_INIT_ENABLE: "0"
+        TMS_INIT_ENABLE_CPU_BACKUP: "0"
+        SGLANG_RETURN_ORIGINAL_LOGPROB: "0"
+        PYTORCH_ALLOC_CONF: expandable_segments:True
+rollout:
+  backend: ${oc.env:PACMAN_ROLLOUT_BACKEND,sglang:d1p1t1}
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  max_concurrent_rollouts: 96
+  max_head_offpolicyness: 0
+  consumer_batch_size: ${train_dataset.batch_size}
+  dump_to_file: true
+  agent:
+    mode: inline
+    export_style: concat
+    chat_template_type: concat
+    engine_max_tokens: ${gconfig.max_tokens}
+    turn_discount: 1.0
+  scheduling_strategy:
+    type: colocation
+    target: actor
+    fork: true
+  scheduling_spec: ${actor.scheduling_spec}
+ref:
+  backend: ${actor.backend}
+  path: ${actor.path}
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  init_from_scratch: false
+  disable_dropout: true
+  dtype: bfloat16
+  optimizer_dtype: float32
+  attn_impl: flash_attention_2
+  optimizer: null
+  temperature: ${gconfig.temperature}
+  mb_spec: ${actor.mb_spec}
+  megatron: ${actor.megatron}
+  scheduling_strategy:
+    type: colocation
+    target: actor
+    fork: true
+  scheduling_spec: ${actor.scheduling_spec}
+sglang:
+  model_path: ${actor.path}
+  random_seed: ${seed}
+  dtype: bfloat16
+  context_length: ${gconfig.max_tokens}
+  max_running_requests: 12
+  mem_fraction_static: 0.6
+  enable_multimodal: true
+  skip_tokenizer_init: true
+  enable_memory_saver: true
+  disable_cuda_graph: true
+train_dataset:
+  path: ${split_manifest}
+  batch_size: 8
+  shuffle: true
+  num_workers: 0
+  max_length: ${gconfig.max_tokens}
+valid_dataset:
+  path: ${split_manifest}
+  batch_size: 8
+  shuffle: false
+  num_workers: 0
+  max_length: ${gconfig.max_tokens}
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_steps: 1
+  freq_epochs: null
+  freq_secs: null
+recover:
+  mode: auto
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_steps: 1
+  freq_epochs: null
+  freq_secs: null
+  no_save_optim: false
+  no_load_optim: false
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_steps: null
+  freq_epochs: 1
+  freq_secs: null
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled

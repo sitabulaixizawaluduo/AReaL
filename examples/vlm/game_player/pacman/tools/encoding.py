@@ -34,8 +34,7 @@ Use a separate reasoning channel only for private reasoning; keep final content 
 
 ACTION_REQUEST = "Choose from the current screenshot. Return exactly <answer>MOVE X</answer> with X in U,D,L,R."
 RESET_ACTION_REQUEST = "Reset frame: U/D are walls. Return exactly <answer>MOVE L</answer> or <answer>MOVE R</answer>."
-STANDALONE_BLOCKED_ACTION_RULE = "A blocked move consumes a step; the next hint reports it so choose another direction."
-PROXY_BLOCKED_ACTION_RULE = "A blocked training move ends the episode with zero reward."
+BLOCKED_ACTION_RULE = "A blocked move consumes a step; the next hint reports it so choose another direction."
 _PROMPT_CROP_TILES = 13
 _TILE_PIXELS = 16
 
@@ -126,25 +125,22 @@ class PacmanPolicyCodec:
         *,
         generation_seed: int,
         proxy_session: bool = True,
+        planner_assisted: bool = True,
         event_observer: Callable[[dict[str, Any]], None] | None = None,
     ):
         self.owner = owner
         self.event_observer = event_observer
         self.generation_seed, self.proxy_session = generation_seed, proxy_session
-        blocked_action_rule = (
-            PROXY_BLOCKED_ACTION_RULE
-            if proxy_session
-            else STANDALONE_BLOCKED_ACTION_RULE
-        )
         self.messages: list[dict[str, Any]] = [
-            {"role": "system", "content": f"{SYSTEM_PROMPT}\n{blocked_action_rule}"}
+            {"role": "system", "content": f"{SYSTEM_PROMPT}\n{BLOCKED_ACTION_RULE}"}
         ]
         if proxy_session and owner.gconfig.max_tokens is None:
             raise ValueError("Training proxy sessions require max_tokens")
         self._previous_visual_cell: tuple[int, int] | None = None
         self._previous_parsed_action: str | None = None
         self._visual_actions = VisualActionSpace()
-        self._visual_planner = None if proxy_session else StandaloneVisualPlanner()
+        self.planner_assisted = planner_assisted
+        self._visual_planner = StandaloneVisualPlanner() if planner_assisted else None
 
     @staticmethod
     def _detect_pacman_visual_cell(image: Any) -> tuple[int, int] | None:
@@ -165,13 +161,17 @@ class PacmanPolicyCodec:
         image = observation.value
         visual_cell = self._detect_pacman_visual_cell(image)
         visual_blocked_action = (
-            not self.proxy_session
-            and visual_cell is not None
+            visual_cell is not None
             and visual_cell == self._previous_visual_cell
             and self._previous_parsed_action is not None
         )
         visual_plan = (
-            self._visual_planner.plan(image)
+            self._visual_planner.plan(
+                image,
+                blocked_action=self._previous_parsed_action
+                if visual_blocked_action
+                else None,
+            )
             if self._visual_planner is not None
             else None
         )
@@ -313,6 +313,11 @@ class PacmanPolicyCodec:
             ),
             "previous_parsed_action": self._previous_parsed_action,
             "visual_blocked_action_detected": visual_blocked_action,
+            "planner_assisted": self.planner_assisted,
+            "planner_source": "rgb_pixels_only" if visual_plan is not None else None,
+            "planner_recommended_action": (
+                visual_plan.action if visual_plan is not None else None
+            ),
             "visual_plan": visual_plan.as_evidence()
             if visual_plan is not None
             else None,
@@ -343,8 +348,7 @@ class PacmanPolicyCodec:
         except EpisodeStop:
             pass
         else:
-            if not self.proxy_session:
-                assert self._visual_planner is not None
+            if self._visual_planner is not None:
                 self._visual_planner.record_model_action(action)
             self._previous_visual_cell = visual_cell
             self._previous_parsed_action = action

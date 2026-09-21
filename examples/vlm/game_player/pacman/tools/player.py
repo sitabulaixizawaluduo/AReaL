@@ -40,5 +40,8 @@ class PacmanPlayer(GamePlayer):
         options: dict[str, Any],
     ):
         self.model, self.options = model, dict(options)
+        self.options.setdefault("planner_assisted", True)
+        if not isinstance(self.options["planner_assisted"], bool):
+            raise TypeError("planner_assisted must be a boolean")
         self.gconfig = GenerationSettings(**generation)
         super().__init__(PacmanSessionFactory(self))

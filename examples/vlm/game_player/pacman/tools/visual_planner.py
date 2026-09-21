@@ -557,7 +557,9 @@ class StandaloneVisualPlanner:
             scored.append((clearance, distance_score, degree, -reversal, action))
         return max(scored)[-1]
 
-    def plan(self, image: Any) -> VisualPlan | None:
+    def plan(
+        self, image: Any, *, blocked_action: str | None = None
+    ) -> VisualPlan | None:
         """Return guidance only when all required screenshot extraction is clear."""
         rgb = np.asarray(image)
         if rgb.ndim != 3 or rgb.shape[2] < 3:
@@ -576,6 +578,10 @@ class StandaloneVisualPlanner:
         if self.level.is_wall(player, actor="pacman"):
             return None
         open_actions = self._open_actions(player)
+        if blocked_action is not None:
+            open_actions = tuple(
+                action for action in open_actions if action != blocked_action
+            )
         if not open_actions:
             return None
         ghosts, normal_ghosts, vulnerable_ghosts = self._ghosts(rgb, player)

@@ -110,7 +110,7 @@ def test_visual_planner_fails_closed_when_gate_or_actor_is_ambiguous():
     assert StandaloneVisualPlanner().plan(image) is None
 
 
-def test_visual_plan_hint_and_evidence_are_standalone_only():
+def test_visual_plan_hint_and_evidence_match_proxy_and_standalone():
     plan = VisualPlan(
         action="R",
         strategy="COLLECT",
@@ -126,7 +126,7 @@ def test_visual_plan_hint_and_evidence_are_standalone_only():
 
     def generate(request):
         requests.append(deepcopy(request))
-        content = "<answer>MOVE R</answer>"
+        content = "<answer>MOVE L</answer>"
         return SimpleNamespace(
             id="completion",
             choices=[
@@ -153,19 +153,70 @@ def test_visual_plan_hint_and_evidence_are_standalone_only():
             generation_seed=1,
             proxy_session=proxy_session,
         )
-        if not proxy_session:
-            codec._visual_planner = SimpleNamespace(
-                plan=lambda pixels: plan,
-                record_model_action=lambda action: None,
-            )
+        codec._visual_planner = SimpleNamespace(
+            plan=lambda pixels, **kwargs: plan,
+            record_model_action=lambda action: None,
+        )
         decision = codec.decide(Observation(image), None, generate, 0)
         prompt = requests[-1]["messages"][-1]["content"][0]["text"]
-        if proxy_session:
-            assert "Pixel-derived visual plan" not in prompt
-            assert decision.evidence["visual_plan"] is None
-        else:
-            assert "recommend=R mode=C" in prompt
-            assert decision.evidence["visual_plan"]["source"] == "rgb_pixels_only"
+        assert "recommend=R mode=C" in prompt
+        assert decision.evidence["visual_plan"]["source"] == "rgb_pixels_only"
+        assert decision.evidence["planner_assisted"] is True
+        assert decision.evidence["planner_recommended_action"] == "R"
+
+
+@pytest.mark.parametrize("proxy_session", [False, True])
+def test_visual_planner_can_be_disabled_without_changing_model_action(proxy_session):
+    generation = {"reasoning": False}
+    if proxy_session:
+        generation["max_tokens"] = 1024
+    codec = PacmanPolicyCodec(
+        PacmanPlayer("server-model", generation, {"planner_assisted": False}),
+        generation_seed=1,
+        proxy_session=proxy_session,
+        planner_assisted=False,
+    )
+    requests = []
+
+    def generate(request):
+        requests.append(deepcopy(request))
+        content = "<answer>MOVE L</answer>"
+        return SimpleNamespace(
+            id="completion",
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(
+                        content=content,
+                        model_dump=lambda **kwargs: {
+                            "role": "assistant",
+                            "content": content,
+                        },
+                    ),
+                )
+            ],
+        )
+
+    decision = codec.decide(
+        Observation(_synthetic_visual_level_frame()), None, generate, 0
+    )
+
+    prompt = requests[0]["messages"][-1]["content"][0]["text"]
+    assert "Pixel plan:" not in prompt
+    assert decision.evidence["planner_assisted"] is False
+    assert decision.evidence["visual_plan"] is None
+    assert PacmanHarness.parse(decision) == "L"
+
+
+def test_visual_planner_excludes_the_previous_visually_blocked_action():
+    image = _synthetic_visual_level_frame()
+    planner = StandaloneVisualPlanner()
+
+    plan = planner.plan(image, blocked_action="R")
+
+    assert plan is not None
+    assert plan.action == "L"
+    assert plan.open_actions == ("L",)
 
 
 def test_prompt_crop_preserves_tile_resolution_and_black_pads_edges():
@@ -340,7 +391,7 @@ def test_visual_available_actions_include_horizontal_portal_entry():
 
 
 @pytest.mark.parametrize("proxy_session", [False, True])
-def test_visual_blocked_feedback_is_standalone_only(proxy_session):
+def test_visual_blocked_feedback_matches_proxy_and_standalone(proxy_session):
     generation = {"reasoning": False}
     if proxy_session:
         generation["max_tokens"] = 1024
@@ -348,6 +399,27 @@ def test_visual_blocked_feedback_is_standalone_only(proxy_session):
         PacmanPlayer("server-model", generation, {}),
         generation_seed=1,
         proxy_session=proxy_session,
+    )
+    planner_calls = []
+    alternate_plan = VisualPlan(
+        action="L",
+        strategy="COLLECT",
+        pacman_cell=(2, 2),
+        open_actions=("L",),
+        normal_ghost_cells=(),
+        vulnerable_ghost_cells=(),
+        visible_normal_pellets=1,
+        visible_power_pellets=0,
+        planner="visual_safety_fallback",
+    )
+
+    def plan(pixels, *, blocked_action=None):
+        planner_calls.append(blocked_action)
+        return alternate_plan
+
+    codec._visual_planner = SimpleNamespace(
+        plan=plan,
+        record_model_action=lambda action: None,
     )
     image = np.zeros((100, 100, 3), dtype=np.uint8)
     image[30:42, 40:52] = (255, 220, 0)
@@ -378,13 +450,11 @@ def test_visual_blocked_feedback_is_standalone_only(proxy_session):
         Observation(image, {"legal_actions": ["L"]}), None, generate, 1
     )
     request_text = requests[1]["messages"][-1]["content"][0]["text"]
-    if proxy_session:
-        assert "did not move Pacman" not in request_text
-        assert not decision.evidence["visual_blocked_action_detected"]
-    else:
-        assert "Previous MOVE R did not move Pacman; R is blocked." in request_text
-        assert decision.evidence["visual_blocked_action_detected"]
-        assert decision.evidence["previous_parsed_action"] == "R"
+    assert "Previous MOVE R did not move Pacman; R is blocked." in request_text
+    assert "recommend=L" in request_text
+    assert planner_calls == [None, "R"]
+    assert decision.evidence["visual_blocked_action_detected"]
+    assert decision.evidence["previous_parsed_action"] == "R"
 
 
 def test_standalone_reasoning_flag_defaults_on_and_can_be_disabled():

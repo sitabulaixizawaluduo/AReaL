@@ -1,8 +1,20 @@
 """Example-only configuration for free-generation Pacman GRPO."""
 
+import math
 from dataclasses import dataclass
 
+from examples.vlm.game_player.pacman.tools.rewards import (
+    DEFAULT_STEP_EFFICIENCY_PENALTY_WEIGHT,
+)
+
 from areal.api.cli_args import GRPOConfig
+
+
+def validate_step_efficiency_penalty_weight(value: float) -> None:
+    if not math.isfinite(value) or not 0 <= value <= 0.1:
+        raise ValueError(
+            "step_efficiency_penalty_weight must be finite and in [0, 0.1]"
+        )
 
 
 @dataclass
@@ -14,7 +26,7 @@ class PacmanConfig(GRPOConfig):
     worker_base_dir: str = ""
     environment_max_steps: int = 512
     ghost_reward_target: int = 4
-    context_safety_margin: int = 256
+    step_efficiency_penalty_weight: float = DEFAULT_STEP_EFFICIENCY_PENALTY_WEIGHT
     require_recovery: bool = False
 
     def __post_init__(self):
@@ -27,8 +39,7 @@ class PacmanConfig(GRPOConfig):
             raise ValueError(
                 "Game step budget and ghost_reward_target must be positive"
             )
-        if self.context_safety_margin < 0:
-            raise ValueError("context_safety_margin must be nonnegative")
+        validate_step_efficiency_penalty_weight(self.step_efficiency_penalty_weight)
         if self.critic is not None or self.teacher is not None:
             raise ValueError("This recipe uses critic-free GRPO without a teacher")
         if self.actor.reward_norm is not None or self.actor.adv_norm is not None:
@@ -94,8 +105,7 @@ class PacmanConfig(GRPOConfig):
                 )
             if (
                 generation.max_new_tokens < 2
-                or generation.max_tokens
-                <= generation.max_new_tokens + self.context_safety_margin
+                or generation.max_tokens <= generation.max_new_tokens
             ):
                 raise ValueError(
                     "Generation and context budgets must support complete multi-token answers"
@@ -108,7 +118,7 @@ class PacmanConfig(GRPOConfig):
             "trial_name": self.trial_name,
             "environment_max_steps": self.environment_max_steps,
             "ghost_reward_target": self.ghost_reward_target,
-            "context_safety_margin": self.context_safety_margin,
+            "step_efficiency_penalty_weight": self.step_efficiency_penalty_weight,
             "pacman_python_root": self.pacman_python_root,
             "worker_base_dir": self.worker_base_dir,
         }

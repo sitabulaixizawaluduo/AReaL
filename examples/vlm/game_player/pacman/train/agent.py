@@ -12,7 +12,6 @@ from examples.vlm.game_player.protocols import EpisodeContext
 from areal.api.cli_args import GenerationHyperparameters
 from areal.infra import workflow_context
 from areal.utils import stats_tracker
-from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 
 
 class PacmanAgent:
@@ -26,18 +25,13 @@ class PacmanAgent:
         self,
         *,
         gconfig: GenerationHyperparameters,
-        tokenizer: str,
+        model: str,
         options: dict[str, Any],
     ):
         if gconfig.greedy:
             raise ValueError("Pacman training requires sampled generation")
-        # Use the same loader as the native proxy so the independent codec's
-        # expanded image/context budget check sees the same processor settings.
-        processor, hf_tokenizer = load_hf_processor_and_tokenizer(tokenizer)
-        if processor is None:
-            raise ValueError("Pacman training requires a multimodal processor")
         self.player = PacmanPlayer(
-            model=tokenizer,
+            model=model,
             generation={
                 "temperature": gconfig.temperature,
                 "top_p": gconfig.top_p,
@@ -46,8 +40,6 @@ class PacmanAgent:
                 "seed": gconfig.seed,
             },
             options=dict(options),
-            processor=processor,
-            tokenizer=hf_tokenizer,
         )
 
     @staticmethod
@@ -95,9 +87,8 @@ class PacmanAgent:
             pacman_death_count=summary["death_count"],
             pacman_invalid_format=summary["invalid_format"],
             pacman_invalid_action=summary["invalid_action"],
-            pacman_safe_advice_match_rate=summary["safe_advice_match_rate"],
         )
-        # A context budget stop before the first request has no token evidence.
+        # A terminal initial game state has no model completion to train.
         # Returning {} lets the native proxy reject the empty export normally.
         if not result.record.decisions:
             return {}

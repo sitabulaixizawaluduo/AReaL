@@ -49,12 +49,12 @@ def main(args: list[str]) -> None:
     dev_data = Dataset.from_list(splits.rows("dev"))
     kwargs = dict(
         gconfig=config.gconfig,
-        tokenizer=config.tokenizer_path,
+        model=config.actor.path,
         options=config.workflow_options(),
     )
     eval_kwargs = dict(
         gconfig=config.eval_gconfig,
-        tokenizer=config.tokenizer_path,
+        model=config.actor.path,
         options={**config.workflow_options(), "is_eval": True},
     )
     with PPOTrainer(

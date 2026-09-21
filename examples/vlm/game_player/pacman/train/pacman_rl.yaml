@@ -1,3 +1,5 @@
+# Pure-vision policy: original screenshots + fixed MOVE U/D/L/R request.
+# Full append-only conversation, native concat export; no planner options/hints.
 # Candidate topology. Override resource fields for your allocated hardware.
 experiment_name: pacman-grpo
 trial_name: ${oc.env:PACMAN_TRIAL,trial0}
@@ -7,7 +9,7 @@ split_manifest: ${oc.env:PACMAN_SPLIT_MANIFEST}
 pacman_python_root: ${oc.env:MAAPACMAN_PACMAN_ROOT}
 worker_base_dir: ${oc.env:PACMAN_WORKER_BASE_DIR}
 ghost_reward_target: 4
-context_safety_margin: 256
+step_efficiency_penalty_weight: 0.05
 environment_max_steps: 512
 seed: 1
 total_train_epochs: 2
@@ -30,7 +32,7 @@ gconfig:
   reward_normalization: true
   min_new_tokens: 0
   max_new_tokens: 64
-  max_tokens: 32768
+  max_tokens: 131072
   greedy: false
   temperature: 0.7
   top_p: 1.0
@@ -40,7 +42,7 @@ eval_gconfig:
   reward_normalization: false
   min_new_tokens: 0
   max_new_tokens: 64
-  max_tokens: 32768
+  max_tokens: 131072
   greedy: false
   temperature: 0.7
   top_p: 1.0

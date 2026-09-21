@@ -1,55 +1,56 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Advisory safe options; the model may execute any physically legal direction."""
+"""Parse executable moves separately from strict response serialization."""
 
-from typing import Any
+import re
+
+from examples.vlm.game_player.protocols import Decision, EpisodeStop
 
 
 class PacmanHarness:
-    def __init__(self, planner: Any = None):
-        from maapacman.planner import EdwardPlanner
+    def __init__(self) -> None:
+        self._all_strict = True
+        self.format_decisions = 0
 
-        self.planner = planner if planner is not None else EdwardPlanner()
-        self.refusal_triggers = 0
+    @property
+    def all_strict(self) -> bool:
+        """Whether every observed model decision used the exact visible format."""
+        return self.format_decisions > 0 and self._all_strict
 
-    def candidates(self, state: dict[str, Any]) -> tuple[Any, ...]:
-        from maapacman.planner import EdwardSafetyRefusal
+    def record_format(self, decision: Decision) -> None:
+        """Account for one authoritative execution attempt exactly once."""
+        self.format_decisions += 1
+        self._all_strict = self._all_strict and bool(
+            decision.evidence.get("strict_format_valid", False)
+        )
 
-        try:
-            return self.planner.advertised_candidates(state)
-        except EdwardSafetyRefusal:
-            self.refusal_triggers += 1
-            return ()
-
-    def observe_transition(self, info: dict[str, Any], state: dict[str, Any]) -> None:
-        for event in info["logic_frame_events"]:
-            if event["event_type"] in {"normal_pellet_eaten", "power_pellet_eaten"}:
-                self.planner.observe({"pacman_position": event["pacman_position"]})
-        self.planner.observe(state)
-
-    def continue_option(
-        self,
-        option: Any,
-        previous: dict[str, Any],
-        info: dict[str, Any],
-        state: dict[str, Any],
-        remaining_moves: int,
-    ) -> tuple[str | None, str]:
-        from maapacman.planner import EdwardSafetyRefusal
-
-        events = {event["event_type"] for event in info["logic_frame_events"]}
-        if (
-            info.get("respawned")
-            or (int(previous["edible_ticks"]) > 0) != (int(info["edible_ticks"]) > 0)
-            or events.intersection({"power_pellet_eaten", "ghost_eaten", "death"})
-        ):
-            return None, "state_event_interrupt"
-        if remaining_moves <= 0:
-            return None, "max_commit"
-        try:
-            action, status = self.planner.continue_option(option, state)
-        except EdwardSafetyRefusal:
-            return None, "safe_hint_interrupt"
-        if status == "active" and action not in info["legal_actions"]:
-            return None, "option_no_longer_legal"
-        return action, status
+    @staticmethod
+    def parse(decision: Decision) -> str:
+        answers = re.findall(r"<answer>(.*?)</answer>", decision.text, re.DOTALL)
+        match = (
+            re.fullmatch(r"\s*MOVE ([UDLR])\s*", answers[0])
+            if len(answers) == 1
+            else None
+        )
+        unsupported = decision.choice.get("tool_calls") or decision.choice.get(
+            "refusal"
+        )
+        parseable = match is not None and not unsupported
+        strict = bool(
+            parseable
+            and re.fullmatch(
+                r"\s*<answer>MOVE [UDLR]</answer>\s*",
+                decision.text,
+            )
+        )
+        decision.evidence.update(
+            action_parseable=parseable,
+            parse_valid=parseable,
+            strict_format_valid=strict,
+            # Compatibility field now means the strict visible serialization.
+            format_valid=strict,
+        )
+        if not parseable:
+            raise EpisodeStop("invalid_format")
+        assert match is not None
+        return match.group(1)

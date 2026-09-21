@@ -5,7 +5,6 @@
 import asyncio
 import hashlib
 import json
-import re
 import threading
 import time
 import uuid
@@ -15,8 +14,15 @@ from typing import Any
 
 from examples.vlm.game_player.pacman.tools.encoding import PacmanPolicyCodec
 from examples.vlm.game_player.pacman.tools.harness import PacmanHarness
-from examples.vlm.game_player.pacman.tools.rewards import EpisodeReward
+from examples.vlm.game_player.pacman.tools.rewards import (
+    DEFAULT_STEP_EFFICIENCY_PENALTY_WEIGHT,
+    EpisodeReward,
+)
 from examples.vlm.game_player.pacman.tools.storage import JsonEpisodeStore
+from examples.vlm.game_player.pacman.tools.visual_planner import (
+    VisualActionSpace,
+    detect_pacman_cell,
+)
 from examples.vlm.game_player.protocols import (
     ActionResult,
     Decision,
@@ -127,8 +133,8 @@ class PacmanEpisodeArtifacts:
             "split": split,
             "initial_state_sha256": initial_state_hash,
             "provenance": env.provenance,
-            "harness": "advisory_options_and_legal_moves_v1",
-            "reward_objective_contract": "bounded_episode_return_v1",
+            "harness": "pure_vision_single_moves_v1",
+            "reward_objective_contract": "completion_only_step_penalty_strict_format_v3",
             "ghost_mode": "normal",
             "episode_life_mode": "third_death_ends_episode",
             "death_limit": 3,
@@ -151,6 +157,16 @@ class PacmanEpisodeArtifacts:
             "game_score": int(info["score"]),
             "total_shaped_reward": reward.total,
             "reward": reward.total,
+            "bounded_game_reward": reward.bounded_game_reward,
+            "weighted_game_reward": reward.weighted_game_reward,
+            "strict_serialization_bonus": reward.strict_format_bonus,
+            "all_strict": reward.all_strict,
+            "step_efficiency_penalty_weight": reward.step_efficiency_penalty_weight,
+            "completion_step_ratio": reward.completion_step_ratio,
+            "completion_step_penalty": reward.completion_step_penalty,
+            "weighted_completion_step_penalty": reward.components.get(
+                "completion_step_penalty", 0.0
+            ),
             "special_pellet_clear_rate": 1
             - int(info["power_pellets_remaining"]) / reward.initial_power
             if reward.initial_power
@@ -158,16 +174,25 @@ class PacmanEpisodeArtifacts:
             "ghosts_eaten": reward.ghosts_eaten,
             "ghost_reward_target": reward.ghost_reward_target,
             "reward_components": reward.components,
-            "env_steps": int(info["step"]),
+            "env_steps": reward.env_steps,
             "logic_frames": int(info["logic_frame"]) - int(initial_info["logic_frame"]),
             "decisions": len(decisions),
             "terminal_reason": info["terminal_reason"],
-            "safety_refusal_triggers": harness.refusal_triggers,
+            "safety_refusal_triggers": 0,
             "invalid_format": info["terminal_reason"] == "invalid_format",
             "invalid_action": info["terminal_reason"] == "invalid_action",
-            "context_budget_exhausted": info["terminal_reason"]
-            == "context_budget_exhausted",
-            "format_valid_rate": sum(row["format_valid"] for row in decisions)
+            "parse_valid_rate": sum(row["parse_valid"] for row in decisions)
+            / len(decisions)
+            if decisions
+            else 0.0,
+            # Compatibility metric now measures the strict visible wire format.
+            "format_valid_rate": sum(row["strict_format_valid"] for row in decisions)
+            / len(decisions)
+            if decisions
+            else 0.0,
+            "strict_format_valid_rate": sum(
+                row["strict_format_valid"] for row in decisions
+            )
             / len(decisions)
             if decisions
             else 0.0,
@@ -175,10 +200,8 @@ class PacmanEpisodeArtifacts:
             / len(decisions)
             if decisions
             else 0.0,
-            "safe_advice_match_rate": sum(row["safe_advice_match"] for row in decisions)
-            / len(decisions)
-            if decisions
-            else 0.0,
+            # Legacy metric: no advice exists in the pure-vision protocol.
+            "safe_advice_match_rate": None,
             "elapsed_seconds": elapsed_seconds,
             "model_versions": sorted(
                 {
@@ -402,88 +425,79 @@ class PacmanGame:
 
 
 class PacmanHarnessAdapter:
-    """Strict syntax/physical legality; safe hints never constrain sampling."""
+    """Parse moves and derive legality/continuation only from transient RGB pixels."""
 
-    def __init__(self, harness: PacmanHarness):
+    def __init__(
+        self,
+        harness: PacmanHarness,
+        event_observer=None,
+        *,
+        strict_legality: bool = True,
+    ):
         self.harness = harness
-        self.initialized = False
-        self.option = None
-        self.remaining = 0
+        self.event_observer = event_observer
+        self.strict_legality = strict_legality
+        self._visual_actions = VisualActionSpace()
 
     def prepare(self, observation: Observation) -> Any:
-        if not self.initialized:
-            self.harness.planner.observe(observation.state)
-            self.initialized = True
-        legal = [
-            action
-            for action in ("U", "D", "L", "R")
-            if action in observation.info["legal_actions"]
-        ]
+        legal = list(self._visual_actions.available_actions(observation.value))
         if not legal:
             raise EpisodeStop("no_legal_moves")
-        return self.harness.candidates(observation.state), legal
+        return legal
 
     def start(self, decision: Decision, context: Any) -> Any:
-        candidates, legal = context
-        match = re.fullmatch(
-            r"\s*<answer>(OPTION|MOVE) ([A-Za-z0-9]+)</answer>\s*", decision.text
-        )
-        # A native reasoning/tool output is not part of this action protocol.
-        if (
-            match is None
-            or decision.choice.get("reasoning_content")
-            or decision.choice.get("tool_calls")
-            or decision.choice.get("refusal")
-        ):
-            raise EpisodeStop("invalid_format")
-        decision.evidence["format_valid"] = True
-        kind, value = match.groups()
-        self.option = None
-        if kind == "OPTION":
-            self.option = next(
-                (candidate for candidate in candidates if candidate.option_id == value),
-                None,
+        try:
+            action = self.harness.parse(decision)
+        finally:
+            self.harness.record_format(decision)
+        action_legal = action in context
+        if self.event_observer is not None:
+            self.event_observer(
+                {"kind": "parsed_action", "action": action, "legal": action_legal}
             )
-            action = self.option.first_action if self.option is not None else None
-            self.remaining = self.option.commit_moves if self.option is not None else 0
-        else:
-            action, self.remaining = value, 1
-        if action not in legal:
-            raise EpisodeStop("invalid_action")
         decision.evidence.update(
-            action_legal=True,
-            selected_option=value if kind == "OPTION" else None,
+            action_legal=action_legal,
+            blocked_action=not action_legal,
             selected_action=action,
-            safe_advice_match=any(
-                candidate.first_action == action for candidate in candidates
-            ),
         )
+        if self.strict_legality and not action_legal:
+            raise EpisodeStop("invalid_action")
         return action
 
     def before_step(self, action: Any) -> None:
-        self.harness.planner.record_action(action)
+        pass
 
     def after_step(self, transition: Transition) -> ActionResult:
-        self.remaining -= 1
-        current, previous = transition.current, transition.previous
-        self.harness.observe_transition(current.info, current.state)
+        if self.event_observer is not None:
+            self.event_observer(
+                {"kind": "executed_action", "action": transition.action}
+            )
         if transition.terminated or transition.truncated:
             return ActionResult(status="terminal")
-        if self.option is None:
-            return ActionResult(status="move_complete")
-        action, status = self.harness.continue_option(
-            self.option,
-            previous.info,
-            current.info,
-            current.state,
-            self.remaining,
-        )
-        return ActionResult(action, status)
+        previous_cell = detect_pacman_cell(transition.previous.value)
+        current_cell = detect_pacman_cell(transition.current.value)
+        blocked = previous_cell is not None and current_cell == previous_cell
+        transition.evidence["visual_move"] = {
+            "source": "rgb_pixels_only",
+            "previous_pacman_cell_row_col": list(previous_cell)
+            if previous_cell is not None
+            else None,
+            "current_pacman_cell_row_col": list(current_cell)
+            if current_cell is not None
+            else None,
+            "blocked": blocked,
+        }
+        return ActionResult(status="blocked" if blocked else "move_complete")
 
 
 class PacmanRewardAdapter:
-    def __init__(self, game: PacmanGame, options: dict[str, Any]):
-        self.game, self.options = game, options
+    def __init__(
+        self,
+        game: PacmanGame,
+        harness: PacmanHarness,
+        options: dict[str, Any],
+    ):
+        self.game, self.harness, self.options = game, harness, options
         self._reward: EpisodeReward | None = None
 
     @property
@@ -492,6 +506,11 @@ class PacmanRewardAdapter:
             self._reward = EpisodeReward(
                 self.game.initial_info,
                 self.options.get("ghost_reward_target", 4),
+                max_steps=self.game.max_steps,
+                step_efficiency_penalty_weight=self.options.get(
+                    "step_efficiency_penalty_weight",
+                    DEFAULT_STEP_EFFICIENCY_PENALTY_WEIGHT,
+                ),
             )
         return self._reward
 
@@ -504,7 +523,11 @@ class PacmanRewardAdapter:
         return RewardValue(value, components)
 
     def finish(self, reason: str, observation: Observation) -> RewardValue:
-        value, components = self.reward.finish(reason, observation.info)
+        value, components = self.reward.finish(
+            reason,
+            observation.info,
+            all_strict=self.harness.all_strict,
+        )
         return RewardValue(value, components)
 
 
@@ -520,6 +543,7 @@ class PacmanSessionFactory:
         context: EpisodeContext,
         *,
         frame_observer: Callable[[Any, dict[str, Any]], None] | None = None,
+        event_observer: Callable[[dict[str, Any]], None] | None = None,
         env_factory: Callable[[Any], Any] | None = None,
     ) -> Session:
         artifacts = PacmanEpisodeArtifacts(self.owner, context, context.model_version)
@@ -533,16 +557,21 @@ class PacmanSessionFactory:
                 env_factory=env_factory,
             )
             harness = PacmanHarness()
-            reward = PacmanRewardAdapter(game, self.owner.options)
+            reward = PacmanRewardAdapter(game, harness, self.owner.options)
             policy = PacmanPolicyCodec(
                 self.owner,
-                harness,
                 generation_seed=header["generation_seed"],
                 proxy_session=context.proxy_session_id is not None,
+                event_observer=event_observer,
             )
+            strict_legality = context.proxy_session_id is not None
             return Session(
                 game=game,
-                harness=PacmanHarnessAdapter(harness),
+                harness=PacmanHarnessAdapter(
+                    harness,
+                    event_observer,
+                    strict_legality=strict_legality,
+                ),
                 policy=policy,
                 reward=reward,
                 max_steps=game.max_steps,

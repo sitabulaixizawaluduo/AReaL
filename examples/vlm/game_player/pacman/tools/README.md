@@ -44,20 +44,20 @@ tracker derives the concise current cell, open moves, visible lethal ghosts and
 suggested move from RGB pixels. Coordinates never come from source state or enter final
 content.
 
-Standalone recovery compares Pacman's current large yellow component with the compact
-cell stored before the previous action. If unchanged, the current request reports the
-blocked direction without resending the old screenshot. Small pellets and HUD lives are
-excluded; ambiguous detections add no feedback, and proxy sessions never receive this
-standalone-only recovery prompt.
+Both modes compare Pacman's current large yellow component with the compact cell stored
+before the previous action. If unchanged, the current request reports the blocked
+direction without resending the old screenshot. Small pellets and HUD lives are
+excluded; ambiguous detections add no feedback.
 
-The standalone codec additionally builds the 16-pixel maze topology and excludes the
-visible red ghost gate using only the reset RGB frame. It detects visible actors and
-pellets from subsequent frames and adds a short `rgb_pixels_only` plan with open moves
-and one recommended direction. Edward supplies the normal route choice; an RGB-derived
-deterministic safety fallback handles Edward refusal. This text is bounded to the
-current request, omitted on ambiguous extraction and absent from AReaL proxy training.
-It advises the model but never bypasses the model response or executes an action
-directly.
+The shared codec builds the 16-pixel maze topology and excludes the visible red ghost
+gate using only the reset RGB frame. It detects visible actors and pellets from later
+frames and adds a short `rgb_pixels_only` plan with open moves and one recommendation.
+Edward supplies the normal route choice; an RGB-derived deterministic safety fallback
+handles Edward refusal. A just-blocked direction is excluded from the next plan. The
+text is bounded to the current request and omitted on ambiguous extraction. Training and
+standalone evaluation enable it by default. It advises the model but never bypasses the
+response or executes an action. Pass `--no-planner-assisted` for standalone ablation;
+set `planner_assisted: false` for the matching training ablation.
 
 `datasets.py` owns fixed tasks, `metrics.py` owns outcome accounting, `storage.py` owns
 JSON persistence, and `prepare.py` owns game source/dependency setup. Training-specific
@@ -96,15 +96,15 @@ does not support a separate reasoning channel; this sends
 Separate SDK `reasoning_content` remains audit-only: it does not enter visible-content
 strictness or independently cause `invalid_format`. `--reasoning` restores the default
 explicitly. This flag applies only to standalone commands: AReaL training proxy sessions
-always disable reasoning generation.
+always disable reasoning generation. Use `--no-reasoning` for a strict train/evaluate
+comparison of generation settings.
 
 At the fresh-game spawn point Pacman is in a horizontal corridor: the first action must
 be `MOVE L` or `MOVE R`. The first user request states this reset-only constraint;
-subsequent requests use the generic four-direction request. In standalone play, a
-well-formed direction blocked by a wall is executed as the game's natural no-op,
-consumes one step and continues from the next screenshot. Its failed legality and
-blocked status remain in audit evidence. AReaL proxy sessions retain the strict
-zero-reward `invalid_action` ending used by training.
+subsequent requests use the generic four-direction request. In both modes, a well-formed
+direction blocked by a wall is the game's natural one-step no-op and play continues from
+the next screenshot. Its failed visual legality and collision remain in audit evidence,
+and the next request reports the blocked direction.
 
 Every parsed move executes one environment step and then requests a new model decision.
 The harness derives legal moves from the full RGB frame and cached pixel-reconstructed

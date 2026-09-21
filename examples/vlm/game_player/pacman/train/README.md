@@ -11,9 +11,11 @@ RL, using SGLang, Megatron and critic-free GRPO. There is no custom engine,
 distribution, logit processor, tensor-export hook or algorithm implementation. No core
 patch or not-yet-merged sequence-mean reduction is assumed.
 
-The policy receives original-resolution screenshots and a fixed MOVE U/D/L/R request,
-with no textual game state, legal-move list or planner hints. Every decision executes at
-most one environment step; the reward and game rules are unchanged.
+The policy receives original-resolution screenshots, a fixed MOVE U/D/L/R request and
+the same current-turn RGB-only planner hint used by independent evaluation. The planner
+reconstructs visible topology and actors from pixels, uses Edward with a visual fallback
+and recommends one move. The model still emits and owns every executed move. Set
+`planner_assisted: false` only for an explicit train/evaluate ablation.
 
 ## Native training semantics
 
@@ -28,9 +30,11 @@ The harness separates executable parsing from strict serialization. Exactly one 
 strict flag requires the entire visible response to be that tag plus optional outer
 whitespace. Separate `reasoning_content` does not affect strictness. For normal endings,
 the raw objective is `0.9 * bounded_game_reward + 0.1 * all_strict`; one non-strict turn
-removes the episode's format bonus. Unparseable output and illegal actions still settle
-the total reward at zero. Artifacts expose parse/strict rates, `all_strict`, the
-unscaled game reward, strict bonus and additive reward components.
+removes the episode's format bonus. Unparseable output still settles the total reward at
+zero. A parseable wall collision executes as a one-step environment no-op in both
+training and evaluation; the next turn receives the same pixel-derived blocked hint.
+Artifacts expose parse/strict rates, `all_strict`, planner hint/match rates, wall
+collisions, the unscaled game reward, strict bonus and additive reward components.
 
 Completed games also receive
 `step_efficiency = -step_efficiency_penalty_weight * clamp(env_steps/max_steps, 0, 1)`

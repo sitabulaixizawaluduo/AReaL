@@ -85,6 +85,12 @@ class PacmanEpisodeArtifacts:
             "seed": seed,
             "generation_seed": generation_seed,
             "split": split,
+            "planner_assisted": bool(options.get("planner_assisted", True)),
+            "planner_source": (
+                "rgb_pixels_only"
+                if bool(options.get("planner_assisted", True))
+                else None
+            ),
             "requested_model_version": self.source_model_version,
         }
         return self.attempt_header
@@ -133,7 +139,13 @@ class PacmanEpisodeArtifacts:
             "split": split,
             "initial_state_sha256": initial_state_hash,
             "provenance": env.provenance,
-            "harness": "pure_vision_single_moves_v1",
+            "harness": (
+                "rgb_visual_planner_single_moves_v2"
+                if bool(options.get("planner_assisted", True))
+                else "pure_vision_single_moves_v2"
+            ),
+            "planner_assisted": bool(options.get("planner_assisted", True)),
+            "planner_source": header["planner_source"],
             "reward_objective_contract": "completion_only_step_penalty_strict_format_v3",
             "ghost_mode": "normal",
             "episode_life_mode": "third_death_ends_episode",
@@ -200,7 +212,38 @@ class PacmanEpisodeArtifacts:
             / len(decisions)
             if decisions
             else 0.0,
-            # Legacy metric: no advice exists in the pure-vision protocol.
+            "planner_hint_rate": sum(
+                row.get("planner_recommended_action") is not None for row in decisions
+            )
+            / len(decisions)
+            if decisions
+            else 0.0,
+            "planner_recommendation_match_rate": (
+                sum(
+                    bool(row.get("planner_recommendation_match"))
+                    for row in decisions
+                    if row.get("planner_recommended_action") is not None
+                )
+                / sum(
+                    row.get("planner_recommended_action") is not None
+                    for row in decisions
+                )
+                if any(
+                    row.get("planner_recommended_action") is not None
+                    for row in decisions
+                )
+                else None
+            ),
+            "wall_collision_count": sum(
+                bool(row.get("wall_collision")) for row in decisions
+            ),
+            "wall_collision_rate": sum(
+                bool(row.get("wall_collision")) for row in decisions
+            )
+            / len(decisions)
+            if decisions
+            else 0.0,
+            # Legacy safety-advice metric is distinct from the visual planner.
             "safe_advice_match_rate": None,
             "elapsed_seconds": elapsed_seconds,
             "model_versions": sorted(
@@ -251,6 +294,10 @@ class PacmanEpisodeArtifacts:
                     "option_return": decision.total_reward,
                     "option_status": last.status if last is not None else record.reason,
                     "executed": last is not None,
+                    "wall_collision": bool(
+                        last is not None
+                        and last.evidence.get("visual_move", {}).get("blocked")
+                    ),
                 }
             )
         trajectory = []
@@ -431,12 +478,9 @@ class PacmanHarnessAdapter:
         self,
         harness: PacmanHarness,
         event_observer=None,
-        *,
-        strict_legality: bool = True,
     ):
         self.harness = harness
         self.event_observer = event_observer
-        self.strict_legality = strict_legality
         self._visual_actions = VisualActionSpace()
 
     def prepare(self, observation: Observation) -> Any:
@@ -459,9 +503,12 @@ class PacmanHarnessAdapter:
             action_legal=action_legal,
             blocked_action=not action_legal,
             selected_action=action,
+            planner_recommendation_match=(
+                action == decision.evidence.get("planner_recommended_action")
+                if decision.evidence.get("planner_recommended_action") is not None
+                else None
+            ),
         )
-        if self.strict_legality and not action_legal:
-            raise EpisodeStop("invalid_action")
         return action
 
     def before_step(self, action: Any) -> None:
@@ -472,8 +519,6 @@ class PacmanHarnessAdapter:
             self.event_observer(
                 {"kind": "executed_action", "action": transition.action}
             )
-        if transition.terminated or transition.truncated:
-            return ActionResult(status="terminal")
         previous_cell = detect_pacman_cell(transition.previous.value)
         current_cell = detect_pacman_cell(transition.current.value)
         blocked = previous_cell is not None and current_cell == previous_cell
@@ -487,6 +532,8 @@ class PacmanHarnessAdapter:
             else None,
             "blocked": blocked,
         }
+        if transition.terminated or transition.truncated:
+            return ActionResult(status="terminal")
         return ActionResult(status="blocked" if blocked else "move_complete")
 
 
@@ -562,16 +609,12 @@ class PacmanSessionFactory:
                 self.owner,
                 generation_seed=header["generation_seed"],
                 proxy_session=context.proxy_session_id is not None,
+                planner_assisted=bool(self.owner.options.get("planner_assisted", True)),
                 event_observer=event_observer,
             )
-            strict_legality = context.proxy_session_id is not None
             return Session(
                 game=game,
-                harness=PacmanHarnessAdapter(
-                    harness,
-                    event_observer,
-                    strict_legality=strict_legality,
-                ),
+                harness=PacmanHarnessAdapter(harness, event_observer),
                 policy=policy,
                 reward=reward,
                 max_steps=game.max_steps,

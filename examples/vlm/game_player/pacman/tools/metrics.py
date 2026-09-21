@@ -34,6 +34,10 @@ class EpisodeMetrics:
             "elapsed_seconds",
             "death_count",
             "ghosts_eaten",
+            "planner_hint_rate",
+            "planner_recommendation_match_rate",
+            "wall_collision_count",
+            "wall_collision_rate",
         ):
             values = [row[name] for row in complete if row.get(name) is not None]
             means[f"mean_{name}"] = sum(values) / len(values) if values else None
@@ -42,7 +46,13 @@ class EpisodeMetrics:
             decision for row in complete for decision in row.get("decision_records", [])
         ]
         action_metrics = {}
-        for name in ("format_valid", "action_legal", "safe_advice_match"):
+        for name in (
+            "format_valid",
+            "action_legal",
+            "planner_recommendation_match",
+            "wall_collision",
+            "safe_advice_match",
+        ):
             values = [
                 decision[name]
                 for decision in decision_rows

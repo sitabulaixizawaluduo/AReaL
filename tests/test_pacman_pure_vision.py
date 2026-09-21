@@ -158,11 +158,14 @@ def test_visual_plan_hint_and_evidence_match_proxy_and_standalone():
             record_model_action=lambda action: None,
         )
         decision = codec.decide(Observation(image), None, generate, 0)
+        PacmanHarnessAdapter(PacmanHarness()).start(decision, ["L", "R"])
         prompt = requests[-1]["messages"][-1]["content"][0]["text"]
         assert "recommend=R mode=C" in prompt
         assert decision.evidence["visual_plan"]["source"] == "rgb_pixels_only"
         assert decision.evidence["planner_assisted"] is True
         assert decision.evidence["planner_recommended_action"] == "R"
+        assert decision.evidence["selected_action"] == "L"
+        assert decision.evidence["planner_recommendation_match"] is False
 
 
 @pytest.mark.parametrize("proxy_session", [False, True])
@@ -356,7 +359,7 @@ def test_prompt_falls_back_to_full_frame_after_nonportal_jump():
 
 def test_harness_legal_actions_come_from_pixels_not_observation_info():
     frame = _synthetic_visual_level_frame()
-    adapter = PacmanHarnessAdapter(PacmanHarness(), strict_legality=True)
+    adapter = PacmanHarnessAdapter(PacmanHarness())
 
     legal = adapter.prepare(Observation(frame, {"legal_actions": ["U", "D"]}))
 
@@ -635,7 +638,7 @@ def test_move_parser_allows_text_outside_one_valid_answer(text):
 
 def test_harness_tracks_all_strict_across_the_episode():
     harness = PacmanHarness()
-    adapter = PacmanHarnessAdapter(harness, strict_legality=True)
+    adapter = PacmanHarnessAdapter(harness)
     strict = Decision("strict", {}, "  <answer>MOVE R</answer>\n", "stop")
     prose = Decision("prose", {}, "go <answer>MOVE R</answer>", "stop")
 
@@ -795,32 +798,48 @@ def test_step_efficiency_weight_validation_accepts_bounded_values(value):
     validate_step_efficiency_penalty_weight(value)
 
 
-def test_proxy_rejects_blocked_move_but_standalone_executes_and_audits_it():
-    """Standalone wall collisions are natural no-ops; proxy semantics stay strict."""
+def test_proxy_and_standalone_execute_and_audit_blocked_move_identically():
+    """Wall collisions are natural one-step no-ops in both inference modes."""
     context = ["R"]
-    proxy = PacmanHarnessAdapter(PacmanHarness(), strict_legality=True)
-    with pytest.raises(EpisodeStop, match="invalid_action"):
-        proxy.start(Decision("id", {}, "<answer>MOVE U</answer>", "stop"), context)
-
-    standalone = PacmanHarnessAdapter(PacmanHarness(), strict_legality=False)
-    decision = Decision("id", {}, "<answer>MOVE U</answer>", "stop")
-    action = standalone.start(decision, context)
     frame = _synthetic_visual_level_frame()
-    result = standalone.after_step(
-        SimpleNamespace(
-            action=action,
-            previous=Observation(frame, {"legal_actions": ["R"]}),
-            current=Observation(frame, {"legal_actions": ["R"]}),
-            evidence={},
-            terminated=False,
-            truncated=False,
+    for mode in ("proxy", "standalone"):
+        adapter = PacmanHarnessAdapter(PacmanHarness())
+        decision = Decision(mode, {}, "<answer>MOVE U</answer>", "stop")
+        action = adapter.start(decision, context)
+        result = adapter.after_step(
+            SimpleNamespace(
+                action=action,
+                previous=Observation(frame, {"legal_actions": ["R"]}),
+                current=Observation(frame, {"legal_actions": ["R"]}),
+                evidence={},
+                terminated=False,
+                truncated=False,
+            )
         )
+        assert action == "U"
+        assert decision.evidence["action_legal"] is False
+        assert decision.evidence["blocked_action"] is True
+        assert result.action is None
+        assert result.status == "blocked"
+
+
+@pytest.mark.parametrize(("terminated", "truncated"), [(True, False), (False, True)])
+def test_terminal_wall_collision_retains_visual_move_audit(terminated, truncated):
+    frame = _synthetic_visual_level_frame()
+    transition = SimpleNamespace(
+        action="U",
+        previous=Observation(frame),
+        current=Observation(frame),
+        evidence={},
+        terminated=terminated,
+        truncated=truncated,
     )
-    assert action == "U"
-    assert decision.evidence["action_legal"] is False
-    assert decision.evidence["blocked_action"] is True
-    assert result.action is None
-    assert result.status == "blocked"
+
+    result = PacmanHarnessAdapter(PacmanHarness()).after_step(transition)
+
+    assert result.status == "terminal"
+    assert transition.evidence["visual_move"]["blocked"] is True
+    assert transition.evidence["visual_move"]["source"] == "rgb_pixels_only"
 
 
 def test_player_construction_does_not_import_model_libraries(monkeypatch):

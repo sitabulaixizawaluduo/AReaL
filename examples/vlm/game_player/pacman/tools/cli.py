@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import json
+import math
 import os
 import sys
 from functools import partial
@@ -24,7 +25,7 @@ class PacmanCommands:
         prepare.add_argument("--root", type=Path, required=True)
         prepare.add_argument("--install-game", action="store_true")
         commands.add_parser("preflight")
-        for name in ("evaluate", "record_video"):
+        for name in ("evaluate", "record_video", "dashboard"):
             command = commands.add_parser(name)
             command.add_argument(
                 "--endpoint",
@@ -34,7 +35,7 @@ class PacmanCommands:
             command.add_argument(
                 "--model",
                 required=True,
-                help="Model identifier accepted by the endpoint and available to local HF processing",
+                help="Model identifier sent unchanged to the remote endpoint",
             )
             command.add_argument(
                 "--api-key",
@@ -62,9 +63,24 @@ class PacmanCommands:
                 "--concurrency", type=int, default=1 if name == "record_video" else 4
             )
             command.add_argument("--max-steps", type=int, default=512)
-            command.add_argument("--max-tokens", type=int, default=32768)
-            command.add_argument("--max-new-tokens", type=int, default=64)
+            command.add_argument("--max-new-tokens", type=int, default=512)
+            command.add_argument("--temperature", type=float, default=0.2)
+            command.add_argument("--top-p", type=float, default=0.9)
+            command.add_argument(
+                "--reasoning",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help="Enable the endpoint's separate reasoning channel (default: enabled)",
+            )
             command.add_argument("--ghost-reward-target", type=int, default=4)
+            if name == "dashboard":
+                command.add_argument("--host", default="127.0.0.1")
+                command.add_argument("--port", type=int, default=8765)
+                command.add_argument(
+                    "--keep-open",
+                    action="store_true",
+                    help="Keep the dashboard available after all games finish",
+                )
         summarize = commands.add_parser("summarize")
         summarize.add_argument("directory", type=Path)
         summarize.add_argument(
@@ -84,7 +100,7 @@ class PacmanCommands:
             print(GamePreparation.prepare(args.root, args.install_game))
         elif args.command == "preflight":
             print(json.dumps(GamePreparation.verify_environment(), indent=2))
-        elif args.command in ("evaluate", "record_video"):
+        elif args.command in ("evaluate", "record_video", "dashboard"):
             from examples.vlm.game_player.pacman.tools.evaluate import PacmanEvaluation
 
             GamePreparation.verify_environment()
@@ -94,15 +110,30 @@ class PacmanCommands:
                 or (args.limit is not None and args.limit < 1)
                 or min(
                     args.max_steps,
-                    args.max_tokens,
                     args.max_new_tokens,
                     args.ghost_reward_target,
                 )
                 < 1
+                or not math.isfinite(args.temperature)
+                or args.temperature <= 0
+                or not math.isfinite(args.top_p)
+                or not 0 < args.top_p <= 1
             ):
                 parser.error(
-                    "Episode counts, token budgets, step budget and ghost reward target must be positive"
+                    "Episode counts and budgets must be positive; temperature must be positive and finite; top_p must be in (0, 1]"
                 )
+            if args.command == "dashboard":
+                from examples.vlm.game_player.pacman.tools.dashboard import (
+                    DashboardServer,
+                )
+
+                if not 0 <= args.port <= 65535:
+                    parser.error("port must be between 0 and 65535")
+                try:
+                    exit_code = asyncio.run(DashboardServer.run(args))
+                except KeyboardInterrupt:
+                    exit_code = 130
+                sys.exit(exit_code)
             factory = None
             if args.command == "record_video":
                 from examples.vlm.game_player.pacman.tools.recording import (

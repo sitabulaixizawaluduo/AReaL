@@ -14,6 +14,9 @@ from examples.vlm.game_player.pacman.tools.datasets import (
     SplitManifest,
 )
 from examples.vlm.game_player.pacman.tools.metrics import EpisodeMetrics
+from examples.vlm.game_player.pacman.tools.rewards import (
+    DEFAULT_STEP_EFFICIENCY_PENALTY_WEIGHT,
+)
 
 
 class PacmanEvaluation:
@@ -24,7 +27,7 @@ class PacmanEvaluation:
             stream.write("\n")
 
     @staticmethod
-    async def run(args, frame_observer=None, env_factory=None):
+    async def run(args, frame_observer=None, env_factory=None, dashboard=None):
         from examples.vlm.game_player.pacman.tools.player import PacmanPlayer
         from examples.vlm.game_player.pacman.tools.prepare import GamePreparation
 
@@ -49,6 +52,8 @@ class PacmanEvaluation:
             for seed in seeds
             for repeat in range(args.repeats)
         ]
+        if dashboard is not None:
+            dashboard.plan(planned)
         url = args.endpoint.rstrip("/")
         endpoint = urlparse(url)
         if (
@@ -74,34 +79,36 @@ class PacmanEvaluation:
             "split_manifest_sha256": await asyncio.to_thread(
                 ArtifactIdentity.sha256, args.manifest
             ),
-            "harness_contract": "free_actions_with_safe_advice",
-            "reward_contract": "bounded_episode_v1",
+            "harness_contract": "pure_vision_single_moves_v1",
+            "reward_contract": "completion_only_step_penalty_strict_format_v3",
             "death_limit": 3,
             "ghost_reward_target": args.ghost_reward_target,
-            "temperature": 0.7,
-            "top_p": 1.0,
+            "step_efficiency_penalty_weight": (DEFAULT_STEP_EFFICIENCY_PENALTY_WEIGHT),
+            "temperature": args.temperature,
+            "top_p": args.top_p,
             "max_environment_steps": args.max_steps,
-            "max_tokens": args.max_tokens,
             "max_new_tokens": args.max_new_tokens,
+            "reasoning_enabled": args.reasoning,
             "selection": "fixed manifest prefix" if args.limit else "whole split",
             "retry_policy": "none; failures remain in denominator",
             "transport": "standard OpenAI SDK directly to the supplied endpoint",
         }
         await asyncio.to_thread(PacmanEvaluation._write, root / "plan.json", plan)
-        player = await asyncio.to_thread(
-            PacmanPlayer,
+        player = PacmanPlayer(
             model=args.model,
             generation={
                 "max_new_tokens": args.max_new_tokens,
-                "max_tokens": args.max_tokens,
-                "temperature": 0.7,
-                "top_p": 1.0,
+                "temperature": args.temperature,
+                "top_p": args.top_p,
                 "seed": args.generation_seed,
+                "reasoning": args.reasoning,
             },
             options={
                 "environment_max_steps": args.max_steps,
                 "ghost_reward_target": args.ghost_reward_target,
-                "context_safety_margin": 256,
+                "step_efficiency_penalty_weight": (
+                    DEFAULT_STEP_EFFICIENCY_PENALTY_WEIGHT
+                ),
                 "artifact_root": str(root / "artifacts"),
                 "pacman_python_root": os.environ["MAAPACMAN_PACMAN_ROOT"],
                 "worker_base_dir": os.environ.get("PACMAN_WORKER_BASE_DIR", ""),
@@ -117,12 +124,31 @@ class PacmanEvaluation:
             async def episode(row):
                 async with semaphore:
                     started = time.monotonic()
+                    episode_id = row["episode_id"]
+                    if dashboard is not None:
+                        dashboard.begin(episode_id)
+
+                    def observe_frame(image, info):
+                        if frame_observer is not None:
+                            frame_observer(image, info)
+                        if dashboard is not None:
+                            dashboard.frame(episode_id, image, info)
+
+                    def observe_event(event):
+                        if dashboard is not None:
+                            dashboard.event(episode_id, event)
+
                     try:
                         collected = await player.collect(
                             row,
                             client=client,
                             factory_kwargs={
-                                "frame_observer": frame_observer,
+                                "frame_observer": observe_frame
+                                if dashboard is not None or frame_observer is not None
+                                else None,
+                                "event_observer": observe_event
+                                if dashboard is not None
+                                else None,
                                 "env_factory": env_factory,
                             },
                         )
@@ -141,8 +167,12 @@ class PacmanEvaluation:
                         root / "episodes" / f"{row['episode_id']}.json",
                         result,
                     )
+                    if dashboard is not None:
+                        dashboard.finish(episode_id, result)
 
             await asyncio.gather(*(episode(row) for row in planned))
+            if dashboard is not None:
+                dashboard.finalizing()
         summary = await asyncio.to_thread(EpisodeMetrics.read, root)
         await asyncio.to_thread(PacmanEvaluation._write, root / "summary.json", summary)
         return summary

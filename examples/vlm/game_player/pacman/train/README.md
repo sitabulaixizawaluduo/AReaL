@@ -11,6 +11,10 @@ RL, using SGLang, Megatron and critic-free GRPO. There is no custom engine,
 distribution, logit processor, tensor-export hook or algorithm implementation. No core
 patch or not-yet-merged sequence-mean reduction is assumed.
 
+The policy receives original-resolution screenshots and a fixed MOVE U/D/L/R request,
+with no textual game state, legal-move list or planner hints. Every decision executes at
+most one environment step; the reward and game rules are unchanged.
+
 ## Native training semantics
 
 Both native agent chat template and export style are `concat`. An unbranched real
@@ -19,12 +23,35 @@ tokens across turns. The adapter returns one episode reward, or an empty mapping
 model completion exists. Invalid model output is a real zero-reward training sample;
 `mask_no_eos_with_zero=false` keeps length-limited invalid completions trainable.
 
+The harness separates executable parsing from strict serialization. Exactly one valid
+`<answer>MOVE X</answer>` tag executes even with surrounding visible prose, while the
+strict flag requires the entire visible response to be that tag plus optional outer
+whitespace. Separate `reasoning_content` does not affect strictness. For normal endings,
+the raw objective is `0.9 * bounded_game_reward + 0.1 * all_strict`; one non-strict turn
+removes the episode's format bonus. Unparseable output and illegal actions still settle
+the total reward at zero. Artifacts expose parse/strict rates, `all_strict`, the
+unscaled game reward, strict bonus and additive reward components.
+
+Completed games also receive
+`step_efficiency = -step_efficiency_penalty_weight * clamp(env_steps/max_steps, 0, 1)`
+inside the bounded game reward; the recipe default is `0.05`. Failures receive no step
+term, because rewarding shorter failures would favor early death, invalid termination or
+giving up instead of collecting more pellets. Setting the weight to zero restores the
+previous game-reward formula. Artifacts record the budget, observed steps, configured
+weight and actual raw/weighted step contribution.
+
 `gconfig.reward_normalization=true` normalizes one return per episode within each seed's
 12-game group, using mean and population standard deviation. Raw game rewards remain in
 \[0,1\]; normalized training rewards can be negative or exceed 1. This is not batch
 min-max normalization. Actor reward/advantage normalization are disabled to avoid a
 second normalization. **The native loss is token-mean, not equal weight per episode.**
-One concatenated row per episode does not change that reduction.
+One concatenated row per episode does not change that reduction. The Pacman agent does
+not load a local tokenizer/processor; the native proxy and training backend continue
+owning tokenization and multimodal training tensors. Proxy requests carry
+`gconfig.max_tokens` as `max_total_tokens`, without a player-side estimate or history
+truncation. A measured 419-decision concat is estimated at about 45.5K tokens, while the
+512-decision upper bound is about 55.6K, so the 128K default leaves headroom. Remote
+context-limit failures are rejected as technical errors.
 
 The recipe keeps KL 0.01, a fixed reference initialized from the actor's starting model,
 one PPO minibatch, LR `5e-7`, clip 0.05, BF16 model weights, FP32 optimizer states and
@@ -93,8 +120,8 @@ python "$GAME_PLAYER_SOURCE_ROOT/examples/vlm/game_player/pacman/train/train.py"
 
 Inspect valid/invalid decisions, invalid outputs receiving zero reward with no action,
 third-death endings, whole-history loss masks, finite updates and repeated memory usage.
-For other allocations, scale batch size and microbatch divisibility for DP/PP. Context
-budget endings are distinct from game wins or technical failures. No UT, training,
+For other allocations, scale batch size and microbatch divisibility for DP/PP. Remote
+context-limit errors are technical failures, not completed games. No UT, training,
 GPU/runtime acceptance or learning-quality validation was run as part of delivery.
 
 ## Recovery and metrics

@@ -359,6 +359,7 @@ async def test_evaluation_persists_episodes_before_finalizing_dashboard(
         max_steps=10,
         max_new_tokens=16,
         reasoning=True,
+        planner_assisted=True,
         concurrency=1,
         api_key=None,
     )

@@ -474,10 +474,14 @@ def test_standalone_reasoning_flag_defaults_on_and_can_be_disabled():
         "output",
     ]
     assert parser.parse_args(common).reasoning is True
+    assert parser.parse_args(common).planner_assisted is True
     assert parser.parse_args(common).temperature == 0.2
     assert parser.parse_args(common).top_p == 0.9
     assert parser.parse_args([*common, "--no-reasoning"]).reasoning is False
     assert parser.parse_args([*common, "--reasoning"]).reasoning is True
+    assert (
+        parser.parse_args([*common, "--no-planner-assisted"]).planner_assisted is False
+    )
     tuned = parser.parse_args([*common, "--temperature", "0.1", "--top-p", "0.8"])
     assert tuned.temperature == 0.1
     assert tuned.top_p == 0.8

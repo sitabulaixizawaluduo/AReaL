@@ -72,6 +72,12 @@ class PacmanCommands:
                 default=True,
                 help="Enable the endpoint's separate reasoning channel (default: enabled)",
             )
+            command.add_argument(
+                "--planner-assisted",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help="Include the RGB-only visual planner hint (default: enabled)",
+            )
             command.add_argument("--ghost-reward-target", type=int, default=4)
             if name == "dashboard":
                 command.add_argument("--host", default="127.0.0.1")

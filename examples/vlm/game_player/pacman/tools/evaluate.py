@@ -79,7 +79,13 @@ class PacmanEvaluation:
             "split_manifest_sha256": await asyncio.to_thread(
                 ArtifactIdentity.sha256, args.manifest
             ),
-            "harness_contract": "pure_vision_single_moves_v1",
+            "harness_contract": (
+                "rgb_visual_planner_single_moves_v2"
+                if args.planner_assisted
+                else "pure_vision_single_moves_v2"
+            ),
+            "planner_assisted": args.planner_assisted,
+            "planner_source": "rgb_pixels_only" if args.planner_assisted else None,
             "reward_contract": "completion_only_step_penalty_strict_format_v3",
             "death_limit": 3,
             "ghost_reward_target": args.ghost_reward_target,
@@ -105,6 +111,7 @@ class PacmanEvaluation:
             },
             options={
                 "environment_max_steps": args.max_steps,
+                "planner_assisted": args.planner_assisted,
                 "ghost_reward_target": args.ghost_reward_target,
                 "step_efficiency_penalty_weight": (
                     DEFAULT_STEP_EFFICIENCY_PENALTY_WEIGHT

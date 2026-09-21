@@ -25,6 +25,7 @@ class PacmanConfig(GRPOConfig):
     pacman_python_root: str = ""
     worker_base_dir: str = ""
     environment_max_steps: int = 512
+    planner_assisted: bool = True
     ghost_reward_target: int = 4
     step_efficiency_penalty_weight: float = DEFAULT_STEP_EFFICIENCY_PENALTY_WEIGHT
     require_recovery: bool = False
@@ -117,6 +118,7 @@ class PacmanConfig(GRPOConfig):
             "experiment_name": self.experiment_name,
             "trial_name": self.trial_name,
             "environment_max_steps": self.environment_max_steps,
+            "planner_assisted": self.planner_assisted,
             "ghost_reward_target": self.ghost_reward_target,
             "step_efficiency_penalty_weight": self.step_efficiency_penalty_weight,
             "pacman_python_root": self.pacman_python_root,

@@ -29,6 +29,7 @@ from examples.vlm.game_player.pacman.tools.visual_planner import (
     reconstruct_visual_level,
 )
 from examples.vlm.game_player.pacman.train.config import (
+    PacmanConfig,
     validate_step_efficiency_penalty_weight,
 )
 from examples.vlm.game_player.protocols import Decision, EpisodeStop, Observation
@@ -485,6 +486,21 @@ def test_standalone_reasoning_flag_defaults_on_and_can_be_disabled():
     tuned = parser.parse_args([*common, "--temperature", "0.1", "--top-p", "0.8"])
     assert tuned.temperature == 0.1
     assert tuned.top_p == 0.8
+
+
+def test_training_workflow_options_plumb_explicit_planner_ablation():
+    config = object.__new__(PacmanConfig)
+    config.run_artifact_root = "artifacts"
+    config.experiment_name = "experiment"
+    config.trial_name = "trial"
+    config.environment_max_steps = 512
+    config.planner_assisted = False
+    config.ghost_reward_target = 4
+    config.step_efficiency_penalty_weight = 0.05
+    config.pacman_python_root = "game"
+    config.worker_base_dir = "workers"
+
+    assert config.workflow_options()["planner_assisted"] is False
 
 
 @pytest.mark.parametrize("proxy_session", [False, True])

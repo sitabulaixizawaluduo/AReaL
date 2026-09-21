@@ -1,5 +1,5 @@
-# Pure-vision policy: original screenshots + fixed MOVE U/D/L/R request.
-# Full append-only conversation, native concat export; no planner options/hints.
+# RGB-only visual planner + original screenshots + fixed MOVE U/D/L/R request.
+# Full append-only conversation and native concat export; the model owns every move.
 # Candidate topology. Override resource fields for your allocated hardware.
 experiment_name: pacman-grpo
 trial_name: ${oc.env:PACMAN_TRIAL,trial0}
@@ -8,6 +8,7 @@ run_artifact_root: ${artifact_root}/runs/${experiment_name}/${trial_name}
 split_manifest: ${oc.env:PACMAN_SPLIT_MANIFEST}
 pacman_python_root: ${oc.env:MAAPACMAN_PACMAN_ROOT}
 worker_base_dir: ${oc.env:PACMAN_WORKER_BASE_DIR}
+planner_assisted: true
 ghost_reward_target: 4
 step_efficiency_penalty_weight: 0.05
 environment_max_steps: 512

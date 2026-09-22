@@ -55,7 +55,8 @@ def _image_token(processor) -> str:
     return token
 
 
-def _render_prompt(actions: Sequence[str], image_token: str) -> str:
+def render_question(actions: Sequence[str]) -> str:
+    """Render the action-choice portion shared by training and service evaluation."""
     options = []
     for letter, action in zip(LETTERS[: len(actions)], actions, strict=True):
         description = ACTION_DESCRIPTIONS.get(action)
@@ -66,12 +67,18 @@ def _render_prompt(actions: Sequence[str], image_token: str) -> str:
     allowed_letters = ", ".join(LETTERS[: len(actions)])
     options_text = "\n".join(options)
     return (
-        f"{SYSTEM_PROMPT}\n\n"
-        f"<state>\n{image_token}\n</state>\n\n"
         f"Question: {QUESTION}\n\n"
         f"Options:\n{options_text}\n\n"
         f"Answer with one letter: {allowed_letters}.\n"
         "Answer:"
+    )
+
+
+def _render_prompt(actions: Sequence[str], image_token: str) -> str:
+    return (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"<state>\n{image_token}\n</state>\n\n"
+        f"{render_question(actions)}"
     )
 
 
@@ -91,13 +98,14 @@ def _is_selected_split(
     )
 
 
-def _load_decisions(
+def load_pacman_decisions(
     root: Path,
     split: str,
     split_modulus: int,
     validation_remainder: int,
     shards: Sequence[str] | None,
 ) -> list[PacmanDecision]:
+    """Load validated Pacman decisions while preserving their global sample IDs."""
     if split_modulus <= 1:
         raise ValueError("split_modulus must be greater than 1")
     if not 0 <= validation_remainder < split_modulus:
@@ -252,7 +260,7 @@ def get_pacman_sft_dataset(
     shuffle_seed: int = 1,
 ) -> PacmanSFTDataset:
     root = Path(path).expanduser().resolve()
-    decisions = _load_decisions(
+    decisions = load_pacman_decisions(
         root=root,
         split=split,
         split_modulus=int(split_modulus),

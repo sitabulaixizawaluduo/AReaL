@@ -27,8 +27,9 @@ turn's assistant answer. The adapter returns one terminal episode reward, or an 
 mapping when no model completion exists. With `turn_discount=1`, the proxy propagates
 that outcome backward to every decision row from the same episode. Actor `discount=1`
 and `gae_lambda=1` preserve the shared whole-game signal without decay. Invalid model
-output is a real zero-reward training sample; `mask_no_eos_with_zero=false` keeps
-length-limited invalid completions trainable.
+output terminates the episode and earns no format bonus, but keeps game progress earned
+before termination. `mask_no_eos_with_zero=false` keeps length-limited invalid
+completions trainable.
 
 The harness separates executable parsing from strict serialization. Exactly one valid
 `<answer>MOVE X</answer>` or `<answer>OPTION A0</answer>` tag executes even with
@@ -36,11 +37,12 @@ surrounding visible prose, while the strict flag requires the entire visible res
 be that tag plus optional outer whitespace. Separate `reasoning_content` does not affect
 strictness. For normal endings, the raw objective is
 `0.9 * bounded_game_reward + 0.1 * all_strict`; one non-strict turn removes the
-episode's format bonus. Unparseable output still settles the total reward at zero. A
-parseable wall collision executes as a one-step environment no-op in both training and
-evaluation; the next turn receives the same pixel-derived blocked hint. Artifacts expose
-parse/strict rates, `all_strict`, planner hint/match rates, wall collisions, the
-unscaled game reward, strict bonus and additive reward components.
+episode's format bonus. Unparseable output terminates immediately and keeps only the
+weighted game progress earned before termination. A parseable wall collision executes as
+a one-step environment no-op in both training and evaluation; the next turn receives the
+same pixel-derived blocked hint. Artifacts expose parse/strict rates, `all_strict`,
+planner hint/match rates, wall collisions, the unscaled game reward, strict bonus and
+additive reward components.
 
 Completed games also receive
 `step_efficiency = -step_efficiency_penalty_weight * clamp(env_steps/max_steps, 0, 1)`
@@ -55,15 +57,18 @@ seed's 12-game group, using mean and population standard deviation. Every decisi
 from an episode receives the same normalized episode signal. Raw game rewards remain in
 \[0,1\]; normalized training rewards can be negative or exceed 1. This is not batch
 min-max normalization. Actor reward/advantage normalization are disabled to avoid a
-second normalization. `actor.loss_aggregation=rollout_mean` makes the policy objective
-equal-weight by episode: token losses are averaged within each decision row, decision
-rows are averaged within their logical episode, then episode losses are averaged across
-the batch. Thus a 400-decision episode does not outweigh a 40-decision episode, and
-answer token length does not change a row's weight. The Pacman agent does not load a
-local tokenizer/processor; the native proxy and training backend continue owning
-tokenization and multimodal training tensors. Proxy requests carry `gconfig.max_tokens`
-as `max_total_tokens` per independent turn, without player-side token estimation or
-truncation. Remote context-limit failures are rejected as technical errors.
+second normalization. The entrypoint rejects groups whose `original_rewards` are all
+equal because they contain no relative GRPO signal; rejected trajectories can still be
+written to rollout artifacts for audit. `actor.loss_aggregation=rollout_mean` makes the
+policy objective equal-weight by episode: token losses are averaged within each decision
+row, decision rows are averaged within their logical episode, then episode losses are
+averaged across the batch. Thus a 400-decision episode does not outweigh a 40-decision
+episode, and answer token length does not change a row's weight. The Pacman agent does
+not load a local tokenizer/processor; the native proxy and training backend continue
+owning tokenization and multimodal training tensors. Proxy requests carry
+`gconfig.max_tokens` as `max_total_tokens` per independent turn, without player-side
+token estimation or truncation. Remote context-limit failures are rejected as technical
+errors.
 
 The recipe keeps KL 0.01, a fixed reference initialized from the actor's starting model,
 one PPO minibatch, LR `5e-7`, clip 0.05, BF16 model weights, FP32 optimizer states and

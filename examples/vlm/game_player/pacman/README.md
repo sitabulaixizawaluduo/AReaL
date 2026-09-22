@@ -92,7 +92,8 @@ hashes, scope, crop bounds and padding are also audited. The player does not loa
 model, tokenizer or processor. The remote server owns tokenization and context-limit
 enforcement.
 
-Malformed answers end the episode with **reward zero, no executed action and no retry**.
+Malformed answers end the episode with **no format bonus, no executed action and no
+retry**. Game progress earned before the malformed answer remains in the episode return.
 In both modes, a well-formed U/D/L/R blocked by a wall is sent to the environment:
 Pacman stays in place, the step is consumed, and the next request reports the visually
 detected collision. This is audited as a wall collision rather than an `invalid_action`
@@ -115,12 +116,13 @@ R = 0.9*G + 0.1*I(every visible response uses the canonical strict answer form)
 A response with exactly one valid answer tag remains executable even when visible text
 appears outside the tag, but it loses the whole-episode strict-format bonus. Separate
 SDK `reasoning_content` is not visible response text and does not affect strictness. A
-fully unparseable response overrides the formula with zero. Game/step-budget endings use
-actual progress. Step efficiency applies only after a win: penalizing failures would
-reward early death, invalid output or giving up over longer attempts that collect more
-pellets. `env_steps`, `max_steps`, the configured weight, actual efficiency penalty,
-`bounded_game_reward`, `all_strict`, strict bonus and additive `reward_components` make
-the final bounded return auditable. Transition rewards are zero before final settlement.
+fully unparseable response terminates immediately and earns no format bonus, while the
+`0.9*G` game term keeps prior progress. Game/step-budget endings use actual progress.
+Step efficiency applies only after a win: penalizing failures would reward early death,
+invalid output or giving up over longer attempts that collect more pellets. `env_steps`,
+`max_steps`, the configured weight, actual efficiency penalty, `bounded_game_reward`,
+`all_strict`, strict bonus and additive `reward_components` make the final bounded
+return auditable. Transition rewards are zero before final settlement.
 
 Compare checkpoints with identical game rules, harness, seeds, sampling and budgets. Use
 dev for selection and untouched test seeds for final acceptance. Primary metrics are

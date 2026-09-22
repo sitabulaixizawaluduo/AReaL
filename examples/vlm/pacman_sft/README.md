@@ -16,31 +16,16 @@ available in the raw data but are not consumed by AReaL's standard token-level S
 
 ## Run
 
-The example reads the model, data, and output paths from environment variables. For the
-0.8B base model and the Pacman data already installed on the shared filesystem:
+From the AReaL repository root, launch the fixed Qwen3.5-0.8B, single-node, eight-GPU
+recipe directly:
 
 ```bash
-export MODEL_PATH=/storage/openpsi/models/Qwen__Qwen3.5-0.8B
-export PACMAN_DATA_ROOT=/storage/openpsi/users/ljl/workspace/game_player/pacman
-export AREAL_OUTPUT_ROOT=/storage/openpsi/users/ljl/workspace/game_player/outputs
-
-python examples/vlm/pacman_sft/train.py \
-  --config examples/vlm/pacman_sft/pacman_sft.yaml
+bash examples/vlm/pacman_sft/run_qwen3_5_0_8b_8gpu.sh
 ```
 
-The default recipe uses one node with eight GPUs and `fsdp:d8p1t1`. Override
-`ACTOR_BACKEND` and the cluster fields when using a different allocation.
-
-For a short end-to-end smoke run, retain the same distributed setup but limit the
-dataset and optimizer steps:
-
-```bash
-TRIAL_NAME=smoke python examples/vlm/pacman_sft/train.py \
-  --config examples/vlm/pacman_sft/pacman_sft.yaml \
-  total_train_steps=2 \
-  train_dataset.dataset_kwargs.max_samples=256 \
-  valid_dataset.dataset_kwargs.max_samples=64
-```
+The script uses `fsdp:d8p1t1` and supplies the model, dataset, output, and eight-GPU
+settings as literal CLI overrides. It does not require, declare, or export custom
+environment variables.
 
 Dataset preprocessing is lazy: the example scans JSONL metadata at startup and
 decodes/processes JPEGs in DataLoader workers. It does not materialize another copy of

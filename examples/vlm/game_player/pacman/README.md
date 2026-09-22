@@ -25,12 +25,13 @@ state, timers, legal-move lists or source-state planner suggestions are supplied
 text. The screenshot may naturally contain the game's visible HUD. Environment state
 remains available only for reward, termination and audit.
 
-Each standalone request contains the fixed system prompt, one current image and a short
-pixel-derived hint. The reset request sends the original 336×400 frame. Later requests
-send a 13×13-tile (208×208) crop centered on Pacman at the original pixel resolution,
-with black padding at screen edges. Previous images and assistant messages are not
-resent. Ambiguous Pacman detection or a non-portal position jump/respawn falls back to
-the full frame. The visual planner and blocked-move detector always inspect full RGB.
+Every model request is an independent decision containing only the fixed system prompt,
+the current image and a short pixel-derived hint. The reset request sends the original
+336×400 frame. Later requests send a 13×13-tile (208×208) crop centered on Pacman at the
+original pixel resolution, with black padding at screen edges. Previous images, answers
+and reasoning are not resent. Ambiguous Pacman detection or a non-portal position
+jump/respawn falls back to the full frame. The visual planner and blocked-move detector
+always inspect full RGB.
 
 Both modes compare Pacman's current pixel-derived cell with the compact cell stored
 before the previous model action. If it is unchanged, the current request reports that
@@ -41,43 +42,55 @@ Training and standalone play reconstruct the same fixed 16-pixel maze grid, walk
 graph and red ghost-pen gate from the reset screenshot. On each turn they detect Pacman,
 visible pellets and confidently identified normal/vulnerable ghosts from RGB colors,
 then use the Edward route planner with a deterministic pixel-only safety fallback to add
-one concise recommended move. A just-blocked direction is excluded from that turn's
-recommendation. The model still returns and owns every executed action; the planner
-never executes a move. The hint and evidence are labeled `rgb_pixels_only`, omitted when
-extraction is ambiguous and bounded to the current turn. `planner_assisted` defaults to
-true and supports an explicit false ablation in both modes.
+one bounded visual option. The model owns the high-level choice:
+`<answer>OPTION A0</answer>` selects its advertised route, while
+`<answer>MOVE X</answer>` remains a one-step correction fallback. During an option, the
+harness checks every new screenshot and interrupts on a blocked or unexpected
+transition, ambiguous Pacman detection, target arrival, ghost-mode change or the
+advertised commit limit. The refreshed RGB/Edward plan exposes all currently safe first
+actions; the harness continues the originally advertised route when its next move
+remains in that set. It never replaces the route with the refreshed recommendation. No
+continuation check reads source state, `info` or source legal actions. The hint and
+evidence record `safe_actions`, are labeled `rgb_pixels_only` and are omitted when
+extraction is ambiguous. `planner_assisted` defaults to true and supports an explicit
+false ablation in both modes.
 
-The four model outputs are fixed moves:
+The model chooses the advertised option or one fixed move:
 
 ```text
 <answer>MOVE U</answer>
 <answer>MOVE D</answer>
 <answer>MOVE L</answer>
 <answer>MOVE R</answer>
+<answer>OPTION A0</answer>
 ```
 
-Every model move executes exactly one environment step, followed by a new visual
-decision. Physical legality is derived from the RGB-reconstructed maze graph and fails
-closed on ambiguous extraction; it never falls back to source-state legal actions.
+For compatibility with checkpoints that emit only the advertised identifier,
+`<answer>A0</answer>` executes the same option. It is deliberately non-strict and cannot
+earn the strict-format bonus; the canonical option form remains
+`<answer>OPTION A0</answer>`.
+
+An option may execute up to eight environment steps inside one model decision. Physical
+legality and continuation are derived from fresh RGB frames and the reconstructed maze
+graph and fail closed on ambiguous extraction; they never fall back to source-state
+legal actions.
 
 At a newly reset game's spawn point, Pacman is in a horizontal corridor: the first move
 must be `L` or `R`; the reset request explicitly offers only those two actions.
 
 Standalone tools enable native thinking with `enable_thinking=true`; SDK
-`reasoning_content` is shown/audited but removed before the next request. Standalone
-requests retain only the system prompt and current screenshot; the previous screenshot,
-action and reasoning are not resent. The original output remains decision evidence.
-Standalone `--no-reasoning` sends `enable_thinking=false` and leaves visible content
-unsplit. Training proxy requests always keep `enable_thinking=false`. In both modes,
-separate SDK `reasoning_content` is audit-only: it is not visible content, does not
-affect strictness and does not independently cause `invalid_format`. The proxy retains
-the configured `gconfig.max_tokens` as `max_total_tokens`; its original-resolution
-reset-frame/cropped screenshots and assistant responses remain in the complete
-append-only concat conversation across model decisions. Provider-reported prompt,
-completion and total token counts are copied into decision evidence when present, but
-never enter a later prompt. Full-frame and prompt-image hashes, scope, crop bounds and
-padding are also audited. The player does not load a model, tokenizer or processor. The
-remote server owns tokenization and context-limit enforcement.
+`reasoning_content` is shown/audited but removed before the next request. Standalone and
+training use the same independent current-frame requests. The original output remains
+decision evidence. Standalone `--no-reasoning` sends `enable_thinking=false` and leaves
+visible content unsplit. Training proxy requests always keep `enable_thinking=false`. In
+both modes, separate SDK `reasoning_content` is audit-only: it is not visible content,
+does not affect strictness and does not independently cause `invalid_format`. The proxy
+retains the configured `gconfig.max_tokens` as `max_total_tokens` for each request.
+Provider- reported prompt, completion and total token counts are copied into decision
+evidence when present, but never enter a later prompt. Full-frame and prompt-image
+hashes, scope, crop bounds and padding are also audited. The player does not load a
+model, tokenizer or processor. The remote server owns tokenization and context-limit
+enforcement.
 
 Malformed answers end the episode with **reward zero, no executed action and no retry**.
 In both modes, a well-formed U/D/L/R blocked by a wall is sent to the environment:
@@ -96,7 +109,7 @@ and completion-only efficiency weight is `w=0.05`:
 ```text
 E = win ? -w*clamp(n/M, 0, 1) : 0
 G = clip((win ? 0.9 : 0.5*p) + 0.05*s + 0.05*min(g/K, 1) - 0.02*d + E, 0, 1)
-R = 0.9*G + 0.1*I(every visible response is exactly <answer>MOVE X</answer>)
+R = 0.9*G + 0.1*I(every visible response uses the canonical strict answer form)
 ```
 
 A response with exactly one valid answer tag remains executable even when visible text

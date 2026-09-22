@@ -34,9 +34,9 @@ tokenizer, processor, Transformers installation or model download. The server ow
 model processing and context limits. The reset request contains the full 336×400 frame;
 later requests use a Pacman-centered 13×13-tile (208×208) crop at the original pixel
 resolution. Crops receive black edge padding. Ambiguous visual detection or a non-portal
-jump/respawn falls back to the full frame. Standalone sends only the current image;
-AReaL proxy sessions retain full-reset then cropped images in append-only concat. Remote
-context errors remain technical failures, with no synthetic game result.
+jump/respawn falls back to the full frame. Standalone and AReaL proxy sessions send each
+frame as an independent request with no earlier image or answer. Remote context errors
+remain technical failures, with no synthetic game result.
 
 The policy receives no dynamic source-state text. The fixed prompt preserves the win,
 ghost, power-pellet, wall, death and output-format rules in under 170 words. A local
@@ -51,13 +51,19 @@ excluded; ambiguous detections add no feedback.
 
 The shared codec builds the 16-pixel maze topology and excludes the visible red ghost
 gate using only the reset RGB frame. It detects visible actors and pellets from later
-frames and adds a short `rgb_pixels_only` plan with open moves and one recommendation.
-Edward supplies the normal route choice; an RGB-derived deterministic safety fallback
-handles Edward refusal. A just-blocked direction is excluded from the next plan. The
-text is bounded to the current request and omitted on ambiguous extraction. Training and
-standalone evaluation enable it by default. It advises the model but never bypasses the
-response or executes an action. Pass `--no-planner-assisted` for standalone ablation;
-set `planner_assisted: false` for the matching training ablation.
+frames and adds one bounded `rgb_pixels_only` option. Edward supplies the route; an
+RGB-derived deterministic safety fallback handles Edward refusal. The model selects
+`<answer>OPTION A0</answer>` to execute that advertised route, or uses
+`<answer>MOVE X</answer>` for a one-step correction. Every option step is checked
+against a fresh screenshot and interrupts on target arrival, collision, unexpected
+movement, ambiguous extraction, ghost-mode change, loss of safety approval or the commit
+limit. The RGB/Edward refresh records a `safe_actions` set. The harness continues only
+when the next action of the already selected route remains in that set; it never
+substitutes the refresh's preferred action. `<answer>A0</answer>` is an executable
+compatibility alias, but only canonical `<answer>OPTION A0</answer>` can earn the
+strict-format bonus. Training and standalone evaluation use the same planner and
+harness. Pass `--no-planner-assisted` for standalone ablation; set
+`planner_assisted: false` for the matching training ablation.
 
 `datasets.py` owns fixed tasks, `metrics.py` owns outcome accounting, `storage.py` owns
 JSON persistence, and `prepare.py` owns game source/dependency setup. Training-specific
@@ -83,12 +89,13 @@ endpoint must support image messages, the selected model, and the
 provider may return private reasoning through SDK `reasoning_content`. For Qwen
 templates that prefill `<think>` in the generation prompt, the provider may instead put
 the reasoning and emitted `</think>` boundary in `content`; the standalone player splits
-that boundary. Only the final content is executed and it must remain an exact move
-response. Every standalone call contains one current screenshot; earlier screenshots,
-actions and reasoning do not enter the next request. Compact RGB-derived tracker state
-may appear only in the current pixel hint. Rejection of an unsupported extension is a
-visible failure, not a silent change to thinking mode. The recorded model identity is
-caller-declared; it is not independently verified.
+that boundary. Only the final content is executed and its answer tag must contain one
+advertised option or one move. Every standalone call contains only the system prompt and
+one current screenshot/hint; earlier screenshots, actions and reasoning do not enter the
+request. Compact RGB-derived tracker state may appear only in the current pixel hint.
+Rejection of an unsupported extension is a visible failure, not a silent change to
+thinking mode. The recorded model identity is caller-declared; it is not independently
+verified.
 
 Standalone commands enable reasoning by default. Pass `--no-reasoning` when an endpoint
 does not support a separate reasoning channel; this sends
@@ -106,10 +113,10 @@ direction blocked by a wall is the game's natural one-step no-op and play contin
 the next screenshot. Its failed visual legality and collision remain in audit evidence,
 and the next request reports the blocked direction.
 
-Every parsed move executes one environment step and then requests a new model decision.
-The harness derives legal moves from the full RGB frame and cached pixel-reconstructed
-topology. Ambiguous extraction is a technical error and never falls back to source-state
-legal actions.
+Every parsed move executes one environment step. An advertised option may execute up to
+eight checked steps before the next model decision. The harness derives legal moves and
+continuation from full RGB frames and cached pixel-reconstructed topology. Ambiguous
+extraction ends the option and never falls back to source-state legal actions.
 
 For a local SGLang deployment, install/start SGLang in a **separate server
 environment**. In terminal 1, run the server with tokenization enabled (omit

@@ -58,3 +58,37 @@ still using the service's chat template. This is a service-level benchmark, so i
 bit-identical to the raw token sequence used during training. Use the same prompt mode
 when comparing checkpoints. The benchmark measures one-step teacher imitation, not
 closed-loop game score.
+
+## Run offline GRPO
+
+The first RL stage is an offline, single-frame contextual-bandit task. It reuses the
+collected frames and teacher actions, samples several answers for the same prompt, and
+applies a deterministic verifier:
+
+```text
+reward = 1.0  if stripped completion == shuffled teacher-answer letter
+         0.0  otherwise
+```
+
+This deliberately remains a strict `[0, 1]` reward. Option permutation is identical to
+SFT, and the verifier compares against the letter after permutation rather than the raw
+`teacher_action` index.
+
+On the configured eight-GPU host, run:
+
+```bash
+bash examples/vlm/pacman_sft/run_qwen3_5_0_8b_8gpu_grpo.sh
+```
+
+The launcher uses the final SFT Hugging Face export as the actor, tokenizer, and SGLang
+initial checkpoint. Four GPUs run `megatron:d4p1t1` and four run `sglang:d4p1t1`. Each
+optimizer update consumes 32 prompt groups with eight samples per group, for 256
+generated completions. Rewards are normalized within each eight-sample group;
+rollout-time reward normalization is disabled to avoid applying normalization twice.
+Evaluation uses a deterministic 1,000-example validation subset before training and
+every 100 steps.
+
+This stage verifies the SFT-checkpoint-to-GRPO-update path and improves one-step teacher
+imitation. It does not launch the Pacman process, advance an episode, or optimize game
+score. Online C1/C2 gameplay requires a separate environment-backed multi-step workflow
+and episode reward contract.

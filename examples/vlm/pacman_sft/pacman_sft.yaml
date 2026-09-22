@@ -15,7 +15,7 @@ cluster:
     nfs_record_root: ${cluster.fileroot}/name_resolve
 
 actor:
-  backend: ${oc.env:ACTOR_BACKEND,"fsdp:d8p1t1"}
+  backend: ${oc.env:ACTOR_BACKEND,"megatron:d8p1t1"}
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: ${oc.env:MODEL_PATH}
@@ -24,6 +24,15 @@ actor:
   dtype: bfloat16
   mb_spec:
     max_tokens_per_mb: 4096
+  megatron:
+    bridge_type: megatron-bridge
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    ddp:
+      use_distributed_optimizer: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
   optimizer:
     type: adam
     lr: 2e-5

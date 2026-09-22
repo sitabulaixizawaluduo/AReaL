@@ -16,7 +16,7 @@ exec python3 examples/vlm/pacman_sft/train.py \
   cluster.n_gpus_per_node=8 \
   cluster.fileroot=/storage/openpsi/users/ljl/workspace/game_player/outputs \
   cluster.name_resolve.nfs_record_root=/storage/openpsi/users/ljl/workspace/game_player/outputs/name_resolve \
-  actor.backend=fsdp:d8p1t1 \
+  actor.backend=megatron:d8p1t1 \
   actor.path=/storage/openpsi/models/Qwen__Qwen3.5-0.8B \
   tokenizer_path=/storage/openpsi/models/Qwen__Qwen3.5-0.8B \
   train_dataset.path=/storage/openpsi/users/ljl/workspace/game_player/pacman \

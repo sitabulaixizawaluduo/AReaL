@@ -15,10 +15,12 @@ from areal.utils import stats_tracker
 
 
 class PacmanAgent:
-    """Plain async agent; the proxy records tokens and exports concat episodes.
+    """Plain async agent; the proxy exports independent decision rows.
 
     All gameplay and SDK resource management live in the independent player.
-    This adapter supplies training context and returns one whole-game reward.
+    This adapter supplies training context and returns one whole-game reward. With
+    individual export and unit turn discount, the proxy propagates that terminal
+    outcome to every decision row from the same episode.
     """
 
     def __init__(

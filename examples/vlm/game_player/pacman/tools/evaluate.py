@@ -80,7 +80,7 @@ class PacmanEvaluation:
                 ArtifactIdentity.sha256, args.manifest
             ),
             "harness_contract": (
-                "rgb_visual_planner_single_moves_v2"
+                "rgb_visual_planner_interruptible_options_v4"
                 if args.planner_assisted
                 else "pure_vision_single_moves_v2"
             ),
@@ -95,6 +95,7 @@ class PacmanEvaluation:
             "max_environment_steps": args.max_steps,
             "max_new_tokens": args.max_new_tokens,
             "reasoning_enabled": args.reasoning,
+            "conversation_mode": "individual_current_frame",
             "selection": "fixed manifest prefix" if args.limit else "whole split",
             "retry_policy": "none; failures remain in denominator",
             "transport": "standard OpenAI SDK directly to the supplied endpoint",

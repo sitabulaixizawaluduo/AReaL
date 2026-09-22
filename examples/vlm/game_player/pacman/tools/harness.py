@@ -3,8 +3,15 @@
 """Parse executable moves separately from strict response serialization."""
 
 import re
+from dataclasses import dataclass
 
 from examples.vlm.game_player.protocols import Decision, EpisodeStop
+
+
+@dataclass(frozen=True)
+class PacmanCommand:
+    kind: str
+    value: str
 
 
 class PacmanHarness:
@@ -25,10 +32,13 @@ class PacmanHarness:
         )
 
     @staticmethod
-    def parse(decision: Decision) -> str:
+    def parse(decision: Decision) -> PacmanCommand:
         answers = re.findall(r"<answer>(.*?)</answer>", decision.text, re.DOTALL)
         match = (
-            re.fullmatch(r"\s*MOVE ([UDLR])\s*", answers[0])
+            re.fullmatch(
+                r"\s*(?:(MOVE) ([UDLR])|(OPTION) (A0)|(A0))\s*",
+                answers[0],
+            )
             if len(answers) == 1
             else None
         )
@@ -39,7 +49,7 @@ class PacmanHarness:
         strict = bool(
             parseable
             and re.fullmatch(
-                r"\s*<answer>MOVE [UDLR]</answer>\s*",
+                r"\s*<answer>(?:MOVE [UDLR]|OPTION A0)</answer>\s*",
                 decision.text,
             )
         )
@@ -49,8 +59,22 @@ class PacmanHarness:
             strict_format_valid=strict,
             # Compatibility field now means the strict visible serialization.
             format_valid=strict,
+            command_form=(
+                "option_alias"
+                if parseable and match is not None and match.group(5) is not None
+                else "canonical"
+                if parseable
+                else None
+            ),
         )
         if not parseable:
             raise EpisodeStop("invalid_format")
         assert match is not None
-        return match.group(1)
+        move_kind, move_value, option_kind, option_value, option_alias = match.groups()
+        kind, value = (
+            (move_kind, move_value)
+            if move_kind
+            else (option_kind or "OPTION", option_value or option_alias)
+        )
+        assert kind is not None and value is not None
+        return PacmanCommand(kind, value)

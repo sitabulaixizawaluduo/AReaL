@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Free SDK generation with proxy concat and current-frame standalone prompts."""
+"""Free SDK generation with independent current-frame decisions."""
 
 import base64
 import hashlib
 import json
 from collections.abc import Callable
+from dataclasses import dataclass
 from io import BytesIO
 from typing import Any
 
@@ -24,19 +25,73 @@ SYSTEM_PROMPT = """Play Pacman from the screenshot and pixel-derived hint only.
   Touching a colored ghost costs a life; the third death ends the game.
 - Blue walls and screen boundaries are impassable. U/D/L/R mean screen up/down/left/right.
   Choose an adjacent open corridor, favor pellets, and avoid nearby colored ghosts.
-- Each command moves one game step; inspect the new screenshot before every command.
+- A shown visual OPTION executes its bounded route while the harness rechecks every RGB
+  frame. MOVE executes one step and is the fallback for ambiguity or precise correction.
 - Reset shows the full map; later views may be Pacman-centered crops at the same tile
   scale. Black crop padding is unknown space, not a wall or map boundary.
 - At reset, the spawn corridor permits only L or R; U and D are walls.
-- Reply with exactly one <answer>MOVE X</answer>, where X is U, D, L, or R. Never output
-  multiple moves, WAIT, or option IDs. Bad format ends the episode with zero reward.
+- Reply with exactly one shown <answer>OPTION A0</answer>, or <answer>MOVE X</answer>
+  where X is U, D, L, or R. Never invent options or output multiple commands. Bad format
+  ends the episode with zero reward.
+- For compatibility, <answer>A0</answer> also executes the shown option, but it is not
+  strict format and cannot earn the strict serialization bonus.
 Use a separate reasoning channel only for private reasoning; keep final content exact."""
 
-ACTION_REQUEST = "Choose from the current screenshot. Return exactly <answer>MOVE X</answer> with X in U,D,L,R."
-RESET_ACTION_REQUEST = "Reset frame: U/D are walls. Return exactly <answer>MOVE L</answer> or <answer>MOVE R</answer>."
+ACTION_REQUEST = (
+    "Choose the shown visual option with <answer>OPTION A0</answer>, or use exactly "
+    "<answer>MOVE X</answer> with X in U,D,L,R for a one-step correction. The visual "
+    "hint's safe set lists RGB/Edward-approved first actions used only to interrupt an "
+    "already selected route, never to replace its next action."
+)
+RESET_ACTION_REQUEST = (
+    "Reset frame: U/D are walls. Choose the shown option, or return exactly "
+    "<answer>MOVE L</answer> or <answer>MOVE R</answer>."
+)
+MOVE_ONLY_ACTION_REQUEST = (
+    "No visual option is available. Return exactly <answer>MOVE X</answer> with "
+    "X in U,D,L,R."
+)
+MOVE_ONLY_RESET_ACTION_REQUEST = (
+    "Reset frame: U/D are walls and no visual option is available. Return exactly "
+    "<answer>MOVE L</answer> or <answer>MOVE R</answer>."
+)
 BLOCKED_ACTION_RULE = "A blocked move consumes a step; the next hint reports it so choose another direction."
 _PROMPT_CROP_TILES = 13
 _TILE_PIXELS = 16
+
+
+@dataclass
+class VisualTransitionTracker:
+    """Share only RGB-derived transition continuity between harness and policy."""
+
+    observed: bool = False
+    current_cell: tuple[int, int] | None = None
+    blocked: bool = False
+    expected: bool = False
+
+    def record(
+        self,
+        current_cell: tuple[int, int] | None,
+        *,
+        blocked: bool,
+        expected: bool,
+    ) -> None:
+        self.observed = True
+        self.current_cell = current_cell
+        self.blocked = blocked
+        self.expected = expected
+
+    def as_evidence(self) -> dict[str, Any] | None:
+        if not self.observed:
+            return None
+        return {
+            "source": "rgb_pixels_only",
+            "current_pacman_cell_row_col": (
+                list(self.current_cell) if self.current_cell is not None else None
+            ),
+            "blocked": self.blocked,
+            "expected_transition": self.expected,
+        }
 
 
 def _crop_prompt_image(
@@ -126,21 +181,28 @@ class PacmanPolicyCodec:
         generation_seed: int,
         proxy_session: bool = True,
         planner_assisted: bool = True,
+        visual_planner: StandaloneVisualPlanner | None = None,
+        transition_tracker: VisualTransitionTracker | None = None,
         event_observer: Callable[[dict[str, Any]], None] | None = None,
     ):
         self.owner = owner
         self.event_observer = event_observer
         self.generation_seed, self.proxy_session = generation_seed, proxy_session
-        self.messages: list[dict[str, Any]] = [
-            {"role": "system", "content": f"{SYSTEM_PROMPT}\n{BLOCKED_ACTION_RULE}"}
-        ]
+        self._system_message: dict[str, Any] = {
+            "role": "system",
+            "content": f"{SYSTEM_PROMPT}\n{BLOCKED_ACTION_RULE}",
+        }
         if proxy_session and owner.gconfig.max_tokens is None:
             raise ValueError("Training proxy sessions require max_tokens")
         self._previous_visual_cell: tuple[int, int] | None = None
         self._previous_parsed_action: str | None = None
+        self._previous_command_kind: str | None = None
         self._visual_actions = VisualActionSpace()
+        self._transition_tracker = transition_tracker or VisualTransitionTracker()
         self.planner_assisted = planner_assisted
-        self._visual_planner = StandaloneVisualPlanner() if planner_assisted else None
+        self._visual_planner = (
+            visual_planner or StandaloneVisualPlanner() if planner_assisted else None
+        )
 
     @staticmethod
     def _detect_pacman_visual_cell(image: Any) -> tuple[int, int] | None:
@@ -161,20 +223,19 @@ class PacmanPolicyCodec:
         image = observation.value
         visual_cell = self._detect_pacman_visual_cell(image)
         visual_blocked_action = (
-            visual_cell is not None
+            self._previous_command_kind == "MOVE"
+            and visual_cell is not None
             and visual_cell == self._previous_visual_cell
             and self._previous_parsed_action is not None
         )
-        visual_plan = (
-            self._visual_planner.plan(
+        visual_plan = context.get("visual_plan") if isinstance(context, dict) else None
+        if visual_plan is None and self._visual_planner is not None:
+            visual_plan = self._visual_planner.plan(
                 image,
                 blocked_action=self._previous_parsed_action
                 if visual_blocked_action
                 else None,
             )
-            if self._visual_planner is not None
-            else None
-        )
         prompt_image, prompt_image_scope = image, "reset"
         prompt_image_crop = None
         prompt_image_fallback_reason = None
@@ -188,7 +249,23 @@ class PacmanPolicyCodec:
         elif visual_cell is None:
             prompt_image_scope = "fallback"
             prompt_image_fallback_reason = "ambiguous_pacman"
-        elif self._previous_visual_cell is None or self._previous_parsed_action is None:
+        elif self._transition_tracker.observed:
+            transition_continuous = (
+                self._transition_tracker.blocked or self._transition_tracker.expected
+            )
+            if not transition_continuous:
+                prompt_image_scope = "fallback"
+                prompt_image_fallback_reason = "nonportal_jump_or_respawn"
+            elif visual_cell != self._transition_tracker.current_cell:
+                prompt_image_scope = "fallback"
+                prompt_image_fallback_reason = "transition_frame_mismatch"
+            else:
+                prompt_image, prompt_image_crop = _crop_prompt_image(image, visual_cell)
+                prompt_image_scope = "crop"
+        elif self._previous_visual_cell is None:
+            prompt_image_scope = "fallback"
+            prompt_image_fallback_reason = "missing_previous_visual_cell"
+        elif self._previous_parsed_action is None:
             prompt_image_scope = "fallback"
             prompt_image_fallback_reason = "missing_previous_visual_action"
         elif not self._visual_actions.is_expected_transition(
@@ -205,7 +282,16 @@ class PacmanPolicyCodec:
             with BytesIO() as buffer:
                 pil_image.save(buffer, format="PNG")
                 encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-        request_text = RESET_ACTION_REQUEST if decision_index == 0 else ACTION_REQUEST
+        if visual_plan is not None:
+            request_text = (
+                RESET_ACTION_REQUEST if decision_index == 0 else ACTION_REQUEST
+            )
+        else:
+            request_text = (
+                MOVE_ONLY_RESET_ACTION_REQUEST
+                if decision_index == 0
+                else MOVE_ONLY_ACTION_REQUEST
+            )
         if visual_blocked_action:
             request_text = (
                 f"{request_text} Previous MOVE {self._previous_parsed_action} did not "
@@ -227,10 +313,9 @@ class PacmanPolicyCodec:
                 },
             ],
         }
-        # Standalone calls are independent current-frame decisions. Stateful visual
-        # tracking stays local and enters only as the concise current hint. Training
-        # proxy calls retain the full append-only conversation for concat.
-        messages = [*self.messages, user_message]
+        # Every policy decision is an independent sample. Keep only the fixed system
+        # instruction and the current RGB observation/hint in the model request.
+        messages = [self._system_message, user_message]
         generation_seed = (self.generation_seed + decision_index) % 0x80000000
         standalone_reasoning = not self.proxy_session and self.owner.gconfig.reasoning
         template = {"chat_template_kwargs": {"enable_thinking": standalone_reasoning}}
@@ -312,7 +397,9 @@ class PacmanPolicyCodec:
                 else None
             ),
             "previous_parsed_action": self._previous_parsed_action,
+            "previous_command_kind": self._previous_command_kind,
             "visual_blocked_action_detected": visual_blocked_action,
+            "previous_visual_transition": self._transition_tracker.as_evidence(),
             "planner_assisted": self.planner_assisted,
             "planner_source": "rgb_pixels_only" if visual_plan is not None else None,
             "planner_recommended_action": (
@@ -338,18 +425,21 @@ class PacmanPolicyCodec:
             finish_reason=choice.finish_reason,
             evidence=evidence,
         )
-        if self.proxy_session:
-            # Training retains the exact append-only SDK conversation for concat.
-            self.messages = [*messages, assistant]
-        # Both modes retain only compact RGB tracker state. Proxy messages still
-        # preserve the complete trainable concat, now with reset-full then crops.
+        # Both modes retain only compact RGB tracker state between independent model
+        # requests. Previous images, answers and reasoning never enter the next prompt.
         try:
-            action = PacmanHarness.parse(decision)
+            command = PacmanHarness.parse(decision)
         except EpisodeStop:
             pass
         else:
-            if self._visual_planner is not None:
-                self._visual_planner.record_model_action(action)
+            action = (
+                command.value
+                if command.kind == "MOVE"
+                else visual_plan.action
+                if visual_plan is not None
+                else None
+            )
             self._previous_visual_cell = visual_cell
             self._previous_parsed_action = action
+            self._previous_command_kind = command.kind
         return decision

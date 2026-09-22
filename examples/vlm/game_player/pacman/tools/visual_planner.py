@@ -104,16 +104,25 @@ class VisualPlan:
     visible_normal_pellets: int
     visible_power_pellets: int
     planner: str
+    option_id: str
+    target_cell: tuple[int, int]
+    action_sequence: tuple[str, ...]
+    commit_moves: int
+    safe_actions: tuple[str, ...] = ()
 
     def prompt_text(self) -> str:
         open_text = "".join(self.open_actions)
         threat_text = (
             ",".join(f"{row}:{col}" for row, col in self.normal_ghost_cells) or "none"
         )
+        route_text = ",".join(self.action_sequence)
         return (
             f"Pixel plan: P={self.pacman_cell[0]},{self.pacman_cell[1]} "
             f"open={open_text} ghosts={threat_text} recommend={self.action} "
-            f"mode={self.strategy[:1]}."
+            f"mode={self.strategy[:1]}. Visual OPTION {self.option_id}: "
+            f"target={self.target_cell[0]},{self.target_cell[1]} "
+            f"route={route_text} commit={self.commit_moves} "
+            f"safe={''.join(self.safe_actions)}."
         )
 
     def as_evidence(self) -> dict[str, Any]:
@@ -132,7 +141,25 @@ class VisualPlan:
             ],
             "visible_normal_pellets": self.visible_normal_pellets,
             "visible_power_pellets": self.visible_power_pellets,
+            "option_id": self.option_id,
+            "target_cell_row_col": list(self.target_cell),
+            "action_sequence": list(self.action_sequence),
+            "commit_moves": self.commit_moves,
+            "safe_actions": list(self.safe_actions),
         }
+
+
+def detect_ghost_mode_signature(image: Any) -> tuple[int, int] | None:
+    """Return RGB-only lethal/vulnerable ghost counts, or fail on bad pixels."""
+    rgb = np.asarray(image)
+    if rgb.ndim != 3 or rgb.shape[2] < 3:
+        return None
+    normal = sum(_actor_cell(rgb, color) is not None for color in _NORMAL_GHOST_COLORS)
+    vulnerable = sum(
+        _actor_cell(rgb, color, minimum_area=minimum_area) is not None
+        for color, minimum_area in (((50, 50, 255), 20), ((255, 255, 255), 40))
+    )
+    return normal, vulnerable
 
 
 def _components(mask: np.ndarray) -> list[_Component]:
@@ -557,6 +584,31 @@ class StandaloneVisualPlanner:
             scored.append((clearance, distance_score, degree, -reversal, action))
         return max(scored)[-1]
 
+    def _shortest_route(
+        self, source: Position, target: Position
+    ) -> tuple[str, ...] | None:
+        """Recover one deterministic route from the RGB-derived topology."""
+        assert self.level is not None
+        queue = deque([(source, ())])
+        visited = {source}
+        while queue:
+            current, route = queue.popleft()
+            if current == target:
+                return route
+            for action, (row_delta, col_delta) in _DELTAS.items():
+                adjacent = Position(
+                    current.row + row_delta,
+                    current.col + col_delta,
+                )
+                if self.level.is_wall(adjacent, actor="pacman"):
+                    continue
+                candidate = self.level.portal_exit(adjacent, action)
+                if candidate in visited:
+                    continue
+                visited.add(candidate)
+                queue.append((candidate, (*route, action)))
+        return None
+
     def plan(
         self, image: Any, *, blocked_action: str | None = None
     ) -> VisualPlan | None:
@@ -596,6 +648,10 @@ class StandaloneVisualPlanner:
             "edible_ticks": 0,
         }
         planner_name = "edward_visual"
+        target = player
+        commit_moves = 1
+        route: tuple[str, ...] = ()
+        safe_actions: tuple[str, ...] = ()
         try:
             if self.planner is None:
                 raise EdwardSafetyRefusal("Edward planner is unavailable")
@@ -606,7 +662,21 @@ class StandaloneVisualPlanner:
                 for candidate in decision.candidates
                 if candidate.option_id == decision.option_id
             )
+            safe_actions = tuple(
+                action
+                for action in open_actions
+                if any(
+                    candidate.first_action == action
+                    for candidate in decision.candidates
+                )
+            )
             strategy = selected.strategy
+            target = Position(*selected.target)
+            candidate_route = self._shortest_route(player, target)
+            if not candidate_route or candidate_route[0] != action:
+                raise ValueError("visual route does not match Edward's first action")
+            commit_moves = min(8, selected.commit_moves, len(candidate_route))
+            route = candidate_route[:commit_moves]
         except (EdwardSafetyRefusal, ValueError, StopIteration):
             planner_name = "visual_safety_fallback"
             action = self._fallback_action(
@@ -616,8 +686,19 @@ class StandaloneVisualPlanner:
                 normal_pellets,
             )
             strategy = "AVOID" if normal_ghosts else "COLLECT"
+            safe_actions = (action,) if action is not None else ()
         if action not in open_actions:
             return None
+        if not route:
+            row_delta, col_delta = _DELTAS[action]
+            target = self.level.portal_exit(
+                Position(player.row + row_delta, player.col + col_delta),
+                action,
+            )
+            route = (action,)
+            commit_moves = 1
+        if not safe_actions:
+            safe_actions = (action,)
         return VisualPlan(
             action=action,
             strategy=strategy,
@@ -628,4 +709,9 @@ class StandaloneVisualPlanner:
             visible_normal_pellets=len(normal_pellets),
             visible_power_pellets=len(power_pellets),
             planner=planner_name,
+            option_id="A0",
+            target_cell=(target.row, target.col),
+            action_sequence=route,
+            commit_moves=commit_moves,
+            safe_actions=safe_actions,
         )

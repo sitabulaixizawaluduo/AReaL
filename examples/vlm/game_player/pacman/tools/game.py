@@ -12,7 +12,10 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from examples.vlm.game_player.pacman.tools.encoding import PacmanPolicyCodec
+from examples.vlm.game_player.pacman.tools.encoding import (
+    PacmanPolicyCodec,
+    VisualTransitionTracker,
+)
 from examples.vlm.game_player.pacman.tools.harness import PacmanHarness
 from examples.vlm.game_player.pacman.tools.rewards import (
     DEFAULT_STEP_EFFICIENCY_PENALTY_WEIGHT,
@@ -20,7 +23,9 @@ from examples.vlm.game_player.pacman.tools.rewards import (
 )
 from examples.vlm.game_player.pacman.tools.storage import JsonEpisodeStore
 from examples.vlm.game_player.pacman.tools.visual_planner import (
+    StandaloneVisualPlanner,
     VisualActionSpace,
+    detect_ghost_mode_signature,
     detect_pacman_cell,
 )
 from examples.vlm.game_player.protocols import (
@@ -140,7 +145,7 @@ class PacmanEpisodeArtifacts:
             "initial_state_sha256": initial_state_hash,
             "provenance": env.provenance,
             "harness": (
-                "rgb_visual_planner_single_moves_v2"
+                "rgb_visual_planner_interruptible_options_v4"
                 if bool(options.get("planner_assisted", True))
                 else "pure_vision_single_moves_v2"
             ),
@@ -478,23 +483,66 @@ class PacmanHarnessAdapter:
         self,
         harness: PacmanHarness,
         event_observer=None,
+        *,
+        visual_planner: StandaloneVisualPlanner | None = None,
+        transition_tracker: VisualTransitionTracker | None = None,
     ):
         self.harness = harness
         self.event_observer = event_observer
         self._visual_actions = VisualActionSpace()
+        self._visual_planner = visual_planner
+        self._transition_tracker = transition_tracker or VisualTransitionTracker()
+        self._active_route: tuple[str, ...] = ()
+        self._active_index = 0
+        self._active_target: tuple[int, int] | None = None
+        self._ghost_mode_signature: tuple[int, int] | None = None
+        self._last_blocked_action: str | None = None
 
     def prepare(self, observation: Observation) -> Any:
         legal = list(self._visual_actions.available_actions(observation.value))
         if not legal:
             raise EpisodeStop("no_legal_moves")
-        return legal
+        visual_plan = (
+            self._visual_planner.plan(
+                observation.value,
+                blocked_action=self._last_blocked_action,
+            )
+            if self._visual_planner is not None
+            else None
+        )
+        return {"legal_actions": legal, "visual_plan": visual_plan}
 
     def start(self, decision: Decision, context: Any) -> Any:
         try:
-            action = self.harness.parse(decision)
+            command = self.harness.parse(decision)
         finally:
             self.harness.record_format(decision)
-        action_legal = action in context
+        legal = context["legal_actions"]
+        visual_plan = context.get("visual_plan")
+        self._active_route = ()
+        self._active_index = 0
+        self._active_target = None
+        self._ghost_mode_signature = None
+        if command.kind == "OPTION":
+            advertised = (
+                visual_plan is not None and command.value == visual_plan.option_id
+            )
+            route = tuple(visual_plan.action_sequence) if advertised else ()
+            action = route[0] if route else None
+            if advertised and route:
+                self._active_route = route[: visual_plan.commit_moves]
+                self._active_target = visual_plan.target_cell
+        else:
+            advertised = True
+            action = command.value
+        # The prompt evidence is the authoritative RGB snapshot for the selected
+        # option. Its ghost mode is already recorded by the pixel planner.
+        if command.kind == "OPTION" and visual_plan is not None:
+            self._ghost_mode_signature = (
+                len(visual_plan.normal_ghost_cells),
+                len(visual_plan.vulnerable_ghost_cells),
+            )
+        action_legal = advertised and action in legal
         if self.event_observer is not None:
             self.event_observer(
                 {"kind": "parsed_action", "action": action, "legal": action_legal}
@@ -503,16 +551,21 @@ class PacmanHarnessAdapter:
             action_legal=action_legal,
             blocked_action=not action_legal,
             selected_action=action,
+            selected_option=command.value if command.kind == "OPTION" else None,
+            selected_option_route=list(self._active_route),
             planner_recommendation_match=(
                 action == decision.evidence.get("planner_recommended_action")
                 if decision.evidence.get("planner_recommended_action") is not None
                 else None
             ),
         )
+        if action is None or (command.kind == "OPTION" and not action_legal):
+            raise EpisodeStop("invalid_action")
         return action
 
     def before_step(self, action: Any) -> None:
-        pass
+        if self._visual_planner is not None:
+            self._visual_planner.record_model_action(action)
 
     def after_step(self, transition: Transition) -> ActionResult:
         if self.event_observer is not None:
@@ -522,6 +575,20 @@ class PacmanHarnessAdapter:
         previous_cell = detect_pacman_cell(transition.previous.value)
         current_cell = detect_pacman_cell(transition.current.value)
         blocked = previous_cell is not None and current_cell == previous_cell
+        expected = bool(
+            previous_cell is not None
+            and current_cell is not None
+            and not blocked
+            and self._visual_actions.is_expected_transition(
+                previous_cell,
+                current_cell,
+                transition.action,
+            )
+        )
+        if blocked:
+            self._last_blocked_action = str(transition.action)
+        elif expected:
+            self._last_blocked_action = None
         transition.evidence["visual_move"] = {
             "source": "rgb_pixels_only",
             "previous_pacman_cell_row_col": list(previous_cell)
@@ -531,10 +598,50 @@ class PacmanHarnessAdapter:
             if current_cell is not None
             else None,
             "blocked": blocked,
+            "expected_transition": expected,
         }
+        self._transition_tracker.record(
+            current_cell,
+            blocked=blocked,
+            expected=expected,
+        )
         if transition.terminated or transition.truncated:
             return ActionResult(status="terminal")
-        return ActionResult(status="blocked" if blocked else "move_complete")
+        if not self._active_route:
+            return ActionResult(status="blocked" if blocked else "move_complete")
+        if current_cell is None or not expected:
+            return ActionResult(
+                status="blocked" if blocked else "visual_option_ambiguous"
+            )
+        self._active_index += 1
+        if current_cell == self._active_target:
+            return ActionResult(status="option_completed")
+        if self._active_index >= len(self._active_route):
+            return ActionResult(status="max_commit")
+        current_ghost_mode = detect_ghost_mode_signature(transition.current.value)
+        if (
+            current_ghost_mode is None
+            or current_ghost_mode != self._ghost_mode_signature
+        ):
+            return ActionResult(status="ghost_state_interrupt")
+        next_action = self._active_route[self._active_index]
+        try:
+            next_legal = self._visual_actions.available_actions(
+                transition.current.value
+            )
+        except ValueError:
+            return ActionResult(status="visual_option_ambiguous")
+        if next_action not in next_legal:
+            return ActionResult(status="option_no_longer_legal")
+        if self._visual_planner is None:
+            return ActionResult(status="safety_interrupt")
+        refreshed_plan = self._visual_planner.plan(transition.current.value)
+        transition.evidence["visual_move"]["refreshed_safe_actions"] = (
+            list(refreshed_plan.safe_actions) if refreshed_plan is not None else None
+        )
+        if refreshed_plan is None or next_action not in refreshed_plan.safe_actions:
+            return ActionResult(status="safety_interrupt")
+        return ActionResult(action=next_action, status="active")
 
 
 class PacmanRewardAdapter:
@@ -605,16 +712,26 @@ class PacmanSessionFactory:
             )
             harness = PacmanHarness()
             reward = PacmanRewardAdapter(game, harness, self.owner.options)
+            planner_assisted = bool(self.owner.options.get("planner_assisted", True))
+            visual_planner = StandaloneVisualPlanner() if planner_assisted else None
+            transition_tracker = VisualTransitionTracker()
             policy = PacmanPolicyCodec(
                 self.owner,
                 generation_seed=header["generation_seed"],
                 proxy_session=context.proxy_session_id is not None,
-                planner_assisted=bool(self.owner.options.get("planner_assisted", True)),
+                planner_assisted=planner_assisted,
+                visual_planner=visual_planner,
+                transition_tracker=transition_tracker,
                 event_observer=event_observer,
             )
             return Session(
                 game=game,
-                harness=PacmanHarnessAdapter(harness, event_observer),
+                harness=PacmanHarnessAdapter(
+                    harness,
+                    event_observer,
+                    visual_planner=visual_planner,
+                    transition_tracker=transition_tracker,
+                ),
                 policy=policy,
                 reward=reward,
                 max_steps=game.max_steps,

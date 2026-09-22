@@ -81,17 +81,22 @@ class PacmanConfig(GRPOConfig):
             for engine in (self.actor, self.ref)
         ):
             raise ValueError(
-                "Concat episode rows require actor/ref max_tokens_per_mb >= gconfig.max_tokens"
+                "Individual decision rows require actor/ref max_tokens_per_mb >= gconfig.max_tokens"
             )
         agent = self.rollout.agent
         if (
             agent is None
             or agent.mode != "inline"
-            or agent.chat_template_type != "concat"
-            or agent.export_style != "concat"
+            or agent.chat_template_type != "hf"
+            or agent.export_style != "individual"
+            or agent.turn_discount != 1
         ):
             raise ValueError(
-                "Use inline agent with concat chat template and concat export"
+                "Use inline individual export with the HF chat template and turn_discount=1"
+            )
+        if getattr(self.actor, "loss_aggregation", None) != "rollout_mean":
+            raise ValueError(
+                "Individual Pacman training requires actor.loss_aggregation=rollout_mean"
             )
         for generation in (self.gconfig, self.eval_gconfig):
             if (

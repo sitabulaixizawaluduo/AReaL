@@ -1,5 +1,5 @@
-# RGB-only visual planner + original screenshots + fixed MOVE U/D/L/R request.
-# Full append-only conversation and native concat export; the model owns every move.
+# RGB-only visual planner + current screenshots + fixed MOVE/OPTION answer contract.
+# Independent current-frame decisions and native individual export; the model owns every move.
 # Candidate topology. Override resource fields for your allocated hardware.
 experiment_name: pacman-grpo
 trial_name: ${oc.env:PACMAN_TRIAL,trial0}
@@ -75,11 +75,11 @@ actor:
   temperature: ${gconfig.temperature}
   eps_clip: 0.05
   kl_ctl: 0.01
-  kl_logprob_source: proximal
   reward_scaling: 1.0
   reward_bias: 0.0
   reward_clip: 20.0
   ppo_n_minibatches: 1
+  loss_aggregation: rollout_mean
   recompute_logprob: true
   use_decoupled_loss: true
   prox_logp_method: recompute
@@ -133,8 +133,8 @@ rollout:
   dump_to_file: true
   agent:
     mode: inline
-    export_style: concat
-    chat_template_type: concat
+    export_style: individual
+    chat_template_type: hf
     engine_max_tokens: ${gconfig.max_tokens}
     turn_discount: 1.0
   scheduling_strategy:
@@ -154,8 +154,15 @@ ref:
   attn_impl: flash_attention_2
   optimizer: null
   temperature: ${gconfig.temperature}
-  mb_spec: ${actor.mb_spec}
-  megatron: ${actor.megatron}
+  mb_spec:
+    max_tokens_per_mb: ${actor.mb_spec.max_tokens_per_mb}
+    n_mbs_divisor: ${actor.mb_spec.n_mbs_divisor}
+  megatron:
+    bridge_type: ${actor.megatron.bridge_type}
+    enable_mtp: ${actor.megatron.enable_mtp}
+    main_params_dtype: ${actor.megatron.main_params_dtype}
+    exp_avg_dtype: ${actor.megatron.exp_avg_dtype}
+    exp_avg_sq_dtype: ${actor.megatron.exp_avg_sq_dtype}
   scheduling_strategy:
     type: colocation
     target: actor

@@ -2,7 +2,7 @@
 
 This example cold-starts a vision-language policy from teacher-labelled Pacman frames
 before online RL. It is intentionally isolated under `examples/`: the standard AReaL
-`SFTTrainer`, FSDP engine, and loss implementation are unchanged.
+`SFTTrainer`, Megatron engine, and loss implementation are unchanged.
 
 Each `records.jsonl` row becomes one causal-LM SFT sample:
 
@@ -23,9 +23,9 @@ recipe directly:
 bash examples/vlm/pacman_sft/run_qwen3_5_0_8b_8gpu.sh
 ```
 
-The script uses `fsdp:d8p1t1` and supplies the model, dataset, output, and eight-GPU
-settings as literal CLI overrides. It does not require, declare, or export custom
-environment variables.
+The script uses `megatron:d8p1t1` (DP=8, PP=1, TP=1) with `megatron-bridge` and supplies
+the model, dataset, output, and eight-GPU settings as literal CLI overrides. It does not
+require, declare, or export custom environment variables.
 
 Dataset preprocessing is lazy: the example scans JSONL metadata at startup and
 decodes/processes JPEGs in DataLoader workers. It does not materialize another copy of

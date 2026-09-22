@@ -82,6 +82,28 @@ def _render_prompt(actions: Sequence[str], image_token: str) -> str:
     )
 
 
+def _permuted_actions_and_answer(
+    decision: PacmanDecision,
+    *,
+    shuffle_options: bool,
+    shuffle_seed: int,
+) -> tuple[list[str], str]:
+    permutation = list(range(len(decision.actions)))
+    if shuffle_options:
+        random.Random(shuffle_seed + decision.sample_id).shuffle(permutation)
+    actions = [decision.actions[i] for i in permutation]
+    answer_position = permutation.index(decision.teacher_action)
+    return actions, LETTERS[answer_position]
+
+
+def _load_rgb_image(frame_path: Path) -> Image.Image:
+    try:
+        with Image.open(frame_path) as source_image:
+            return source_image.convert("RGB")
+    except OSError as exc:
+        raise OSError(f"Cannot load Pacman frame {frame_path}") from exc
+
+
 def _is_selected_split(
     seed: int,
     split: str,
@@ -195,21 +217,14 @@ class PacmanSFTDataset(Dataset[dict[str, Any]]):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         decision = self.decisions[index]
-        permutation = list(range(len(decision.actions)))
-        if self.shuffle_options:
-            random.Random(self.shuffle_seed + decision.sample_id).shuffle(permutation)
-
-        actions = [decision.actions[i] for i in permutation]
-        answer_position = permutation.index(decision.teacher_action)
-        answer = LETTERS[answer_position]
+        actions, answer = _permuted_actions_and_answer(
+            decision,
+            shuffle_options=self.shuffle_options,
+            shuffle_seed=self.shuffle_seed,
+        )
         prompt = _render_prompt(actions, self.image_token)
         sequence = f"{prompt} {answer}{self.tokenizer.eos_token}"
-
-        try:
-            with Image.open(decision.frame_path) as source_image:
-                image = source_image.convert("RGB")
-        except OSError as exc:
-            raise OSError(f"Cannot load Pacman frame {decision.frame_path}") from exc
+        image = _load_rgb_image(decision.frame_path)
 
         processed = self.processor(
             text=[sequence],
@@ -244,6 +259,42 @@ class PacmanSFTDataset(Dataset[dict[str, Any]]):
         if token_type_ids is not None:
             sample["mm_token_type_ids"] = token_type_ids.squeeze(0)
         return sample
+
+
+class PacmanRLDataset(Dataset[dict[str, Any]]):
+    """Lazy single-frame Pacman prompts for VisionRLVRWorkflow."""
+
+    def __init__(
+        self,
+        decisions: Sequence[PacmanDecision],
+        processor,
+        shuffle_options: bool,
+        shuffle_seed: int,
+    ) -> None:
+        self.decisions = list(decisions)
+        self.image_token = _image_token(processor)
+        self.shuffle_options = shuffle_options
+        self.shuffle_seed = shuffle_seed
+
+    def __len__(self) -> int:
+        return len(self.decisions)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        decision = self.decisions[index]
+        actions, expected_letter = _permuted_actions_and_answer(
+            decision,
+            shuffle_options=self.shuffle_options,
+            shuffle_seed=self.shuffle_seed,
+        )
+        return {
+            "messages": _render_prompt(actions, self.image_token),
+            "images": [_load_rgb_image(decision.frame_path)],
+            "expected_letter": expected_letter,
+            "actions": actions,
+            "seed": decision.seed,
+            "sample_id": decision.sample_id,
+            "frame": str(decision.frame_path),
+        }
 
 
 def get_pacman_sft_dataset(
@@ -286,6 +337,50 @@ def get_pacman_sft_dataset(
         decisions=decisions,
         processor=processor,
         max_length=max_length,
+        shuffle_options=bool(shuffle_options),
+        shuffle_seed=int(shuffle_seed),
+    )
+
+
+def get_pacman_rl_dataset(
+    path: str,
+    split: str,
+    processor,
+    split_modulus: int = 10,
+    validation_remainder: int = 0,
+    shards: Sequence[str] | None = None,
+    max_samples: int | None = None,
+    subset_seed: int = 1,
+    shuffle_options: bool = True,
+    shuffle_seed: int = 1,
+) -> PacmanRLDataset:
+    """Build the offline single-frame dataset used by Pacman GRPO."""
+    root = Path(path).expanduser().resolve()
+    decisions = load_pacman_decisions(
+        root=root,
+        split=split,
+        split_modulus=int(split_modulus),
+        validation_remainder=int(validation_remainder),
+        shards=shards,
+    )
+    if max_samples is not None:
+        max_samples = int(max_samples)
+        if max_samples <= 0:
+            raise ValueError("max_samples must be positive when set")
+        rng = random.Random(int(subset_seed))
+        rng.shuffle(decisions)
+        decisions = decisions[:max_samples]
+    if not decisions:
+        raise ValueError(f"Pacman split {split!r} selected no records from {root}")
+
+    logger.info(
+        f"Loaded {len(decisions)} Pacman {split} RL decisions from {root} "
+        f"(seed % {split_modulus} {'!=' if split == 'train' else '=='} "
+        f"{validation_remainder})"
+    )
+    return PacmanRLDataset(
+        decisions=decisions,
+        processor=processor,
         shuffle_options=bool(shuffle_options),
         shuffle_seed=int(shuffle_seed),
     )

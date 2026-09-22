@@ -130,8 +130,7 @@ class EpisodeReward:
         total = min(1.0, max(0.0, weighted_game_reward + strict_format_bonus))
         if reason in {"invalid_format", "invalid_action"}:
             components["strict_serialization"] = 0.0
-            components["invalid_output"] = -weighted_game_reward
-            total = 0.0
+            total = weighted_game_reward
             strict_format_bonus = 0.0
         self.bounded_game_reward = bounded_game_reward
         self.weighted_game_reward = weighted_game_reward

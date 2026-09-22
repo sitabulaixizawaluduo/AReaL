@@ -4,6 +4,7 @@ import json
 import sys
 from datetime import UTC
 from pathlib import Path
+from typing import Any
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
@@ -16,6 +17,23 @@ from areal.api.cli_args import load_expr_config
 from areal.trainer import PPOTrainer
 from areal.utils import checkpoint_pointer
 from areal.utils.saver import Saver
+
+
+def accept_nonconstant_reward_group(sample: dict[str, Any]) -> bool:
+    """Keep only groups with a usable relative-reward signal."""
+    import torch
+
+    rewards = sample.get("original_rewards")
+    if rewards is None:
+        raise ValueError("Pacman group filtering requires original_rewards")
+    if not isinstance(rewards, torch.Tensor):
+        rewards = torch.as_tensor(rewards)
+    rewards = rewards.reshape(-1)
+    if rewards.numel() == 0:
+        raise ValueError("Pacman group filtering requires at least one reward")
+    if not torch.isfinite(rewards).all().item():
+        raise ValueError("Pacman group filtering requires finite rewards")
+    return bool((rewards != rewards[0]).any().item())
 
 
 def main(args: list[str]) -> None:
@@ -65,6 +83,10 @@ def main(args: list[str]) -> None:
             workflow_kwargs=kwargs,
             eval_workflow="examples.vlm.game_player.pacman.train.agent.PacmanAgent",
             eval_workflow_kwargs=eval_kwargs,
+            dynamic_filter_fn=(
+                "examples.vlm.game_player.pacman.train.train."
+                "accept_nonconstant_reward_group"
+            ),
         )
 
 

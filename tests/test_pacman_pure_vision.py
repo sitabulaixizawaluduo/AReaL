@@ -32,6 +32,9 @@ from examples.vlm.game_player.pacman.train.config import (
     PacmanConfig,
     validate_step_efficiency_penalty_weight,
 )
+from examples.vlm.game_player.pacman.train.train import (
+    accept_nonconstant_reward_group,
+)
 from examples.vlm.game_player.protocols import Decision, EpisodeStop, Observation
 
 
@@ -702,7 +705,7 @@ def test_episode_reward_combines_game_score_and_all_strict():
 
 
 @pytest.mark.parametrize("reason", ["invalid_format", "invalid_action"])
-def test_invalid_policy_endings_cancel_game_and_strict_rewards(reason):
+def test_invalid_policy_endings_preserve_game_progress_without_format_bonus(reason):
     reward = EpisodeReward(
         {
             "normal_pellets_remaining": 100,
@@ -720,10 +723,24 @@ def test_invalid_policy_endings_cancel_game_and_strict_rewards(reason):
         },
         all_strict=True,
     )
-    assert total == 0.0
+    # Existing game progress survives the invalid terminal decision:
+    # 0.9 * (0.5*0.5 + 0.05*0.5 - 0.02) = 0.2295.
+    assert total == pytest.approx(0.9 * 0.255)
     assert reward.strict_format_bonus == 0.0
     assert components["strict_serialization"] == 0.0
-    assert sum(components.values()) == pytest.approx(0.0)
+    assert "invalid_output" not in components
+    assert sum(components.values()) == pytest.approx(total)
+
+
+def test_pacman_group_filter_rejects_equal_original_rewards():
+    import torch
+
+    assert not accept_nonconstant_reward_group(
+        {"original_rewards": torch.tensor([0.2, 0.2, 0.2, 0.2])}
+    )
+    assert accept_nonconstant_reward_group(
+        {"original_rewards": torch.tensor([0.2, 0.2, 0.3, 0.2])}
+    )
 
 
 def _finish_win_at_step(

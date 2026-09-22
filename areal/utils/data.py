@@ -793,6 +793,38 @@ class MicroBatchList:
 DEFAULT_MAX_TOKENS_PER_MB = int(1e12)
 
 
+def _resolve_microbatch_sequence_groups(
+    bs: int,
+    granularity: int,
+    group_sizes: Sequence[int] | torch.Tensor | None,
+) -> tuple[list[list[int]], list[int] | None]:
+    if group_sizes is None:
+        if bs % granularity != 0:
+            raise RuntimeError(
+                f"Batch size {bs} cannot divide granularity {granularity}."
+            )
+        return [
+            list(range(i * granularity, (i + 1) * granularity))
+            for i in range(bs // granularity)
+        ], None
+
+    if torch.is_tensor(group_sizes):
+        group_sizes = group_sizes.detach().cpu().tolist()
+    sizes = [int(size) for size in group_sizes]
+    if any(size <= 0 for size in sizes):
+        raise ValueError(f"group_sizes must be positive, got {sizes}.")
+    total = sum(sizes)
+    if total != bs:
+        raise ValueError(f"group_sizes sum to {total} but batch size is {bs}.")
+
+    groups = []
+    offset = 0
+    for size in sizes:
+        groups.append(list(range(offset, offset + size)))
+        offset += size
+    return groups, sizes
+
+
 def make_transport_dummy(template: dict[str, Any]) -> dict[str, Any]:
     """Create one model-valid row for collective participation."""
     batch_size = get_batch_size(template)
@@ -801,7 +833,9 @@ def make_transport_dummy(template: dict[str, Any]) -> dict[str, Any]:
 
     dummy: dict[str, Any] = {}
     for key, value in template.items():
-        if is_multi_modal_key(key) and isinstance(value, list):
+        if key == "group_sizes":
+            dummy[key] = [1]
+        elif is_multi_modal_key(key) and isinstance(value, list):
             dummy[key] = [{}]
         elif (
             isinstance(value, torch.Tensor)
@@ -839,6 +873,23 @@ def _pad_batch_to_min_groups(
     granularity: int,
 ) -> tuple[dict[str, Any], int]:
     batch_size = get_batch_size(data)
+    group_sizes = data.get("group_sizes")
+    if group_sizes is not None:
+        _, explicit_sizes = _resolve_microbatch_sequence_groups(
+            batch_size, granularity, group_sizes
+        )
+        assert explicit_sizes is not None
+        pad_count = max(min_groups - len(explicit_sizes), 0)
+        if pad_count == 0:
+            return data, 0
+        tensor_data = {
+            key: value for key, value in data.items() if key != "group_sizes"
+        }
+        dummies = [make_transport_dummy(tensor_data) for _ in range(pad_count)]
+        padded = concat_padded_tensors([tensor_data, *dummies])
+        padded["group_sizes"] = [*explicit_sizes, *([1] * pad_count)]
+        return padded, pad_count
+
     if batch_size % granularity != 0:
         raise RuntimeError(
             f"Batch size {batch_size} cannot divide granularity {granularity}."
@@ -897,22 +948,21 @@ def split_padded_tensor_dict_into_mb_list(
             allocation_spec = MicroBatchSpec.new(mb_spec, n_mbs=target_n_mbs)
 
         bs = data["attention_mask"].shape[0]
-        if bs % granularity != 0:
-            raise RuntimeError(
-                f"Batch size {bs} cannot divide granularity {granularity}."
-            )
+        seq_groups, explicit_group_sizes = _resolve_microbatch_sequence_groups(
+            bs, granularity, data.get("group_sizes")
+        )
         max_seqlen = data["attention_mask"].shape[1]
         seq_lens = data["attention_mask"].sum(1).long().cpu().numpy().tolist()
-        input_lens = (
-            data["attention_mask"]
-            .view(bs // granularity, granularity, -1)
-            .sum(dim=(1, 2))
-            .long()
-            .cpu()
-            .numpy()
+        input_lens = np.asarray(
+            [sum(seq_lens[i] for i in seq_group) for seq_group in seq_groups]
         )
         if transport_dummy_count:
-            input_lens[-transport_dummy_count // granularity :] = 0
+            dummy_groups = (
+                transport_dummy_count
+                if explicit_group_sizes is not None
+                else transport_dummy_count // granularity
+            )
+            input_lens[-dummy_groups:] = 0
 
         if not allow_transport_padding:
             group_indices = (
@@ -939,6 +989,8 @@ def split_padded_tensor_dict_into_mb_list(
     to_split = {}
     not_to_split = {}
     for key, value in data.items():
+        if key == "group_sizes":
+            continue
         if key in multimodal_keys:
             continue
         if key == "position_ids" or (
@@ -950,10 +1002,13 @@ def split_padded_tensor_dict_into_mb_list(
             not_to_split[key] = value
 
     # split
+    mb_group_sizes = (
+        [[len(seq_groups[i]) for i in group_index] for group_index in group_indices]
+        if explicit_group_sizes is not None
+        else None
+    )
     group_indices = [
-        seqpack.flat2d(
-            [list(range(i * granularity, (i + 1) * granularity)) for i in group_index]
-        )
+        seqpack.flat2d([seq_groups[i] for i in group_index])
         for group_index in group_indices
     ]
     splitted_lens = [
@@ -1000,7 +1055,7 @@ def split_padded_tensor_dict_into_mb_list(
     results = []
     # organize splitted micro batches
     assert len(mbs) == len(splitted_lens), (len(mbs), len(splitted_lens))
-    for mb, indices in zip(mbs, group_indices, strict=True):
+    for i, (mb, indices) in enumerate(zip(mbs, group_indices, strict=True)):
         has_transport_dummy = any(index >= semantic_batch_size for index in indices)
         is_transport_dummy = has_transport_dummy and all(
             index >= semantic_batch_size for index in indices
@@ -1009,6 +1064,8 @@ def split_padded_tensor_dict_into_mb_list(
             raise RuntimeError(
                 "Transport padding must not share a micro-batch with semantic rows"
             )
+        if mb_group_sizes is not None:
+            mb["group_sizes"] = mb_group_sizes[i]
         result = {**mb, **not_to_split}
         if is_transport_dummy:
             result[TRANSPORT_DUMMY_KEY] = True
@@ -1037,7 +1094,9 @@ def split_training_batch_into_microbatches(
     if batch_size < 1:
         raise ValueError("Cannot split an empty training batch")
 
-    local_n_mbs = min(batch_size, n_mbs)
+    group_sizes = data.get("group_sizes")
+    local_group_count = len(group_sizes) if group_sizes is not None else batch_size
+    local_n_mbs = min(local_group_count, n_mbs)
     local_mbs = split_padded_tensor_dict_into_mb_list(
         data,
         MicroBatchSpec(n_mbs=local_n_mbs),

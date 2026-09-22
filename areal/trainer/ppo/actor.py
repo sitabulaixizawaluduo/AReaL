@@ -47,6 +47,7 @@ from areal.utils.functional import (
     reward_overlong_penalty,
     sapo_loss_fn,
 )
+from areal.utils.functional.loss_aggregation import PolicyGradientReduction
 from areal.utils.perf_tracer import trace_perf
 from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
@@ -86,6 +87,60 @@ def _group_training_metrics(
     )
     group_loss_weights[starts] = cumulative_tokens[ends] - cumulative_tokens[starts]
     return group_starts, usable_group_sizes, group_loss_weights
+
+
+def _build_rollout_mean_weights(
+    loss_mask: torch.Tensor, meta: TrajBatchMeta
+) -> torch.Tensor:
+    """Give every logical rollout equal policy-gradient mass.
+
+    Each active response row first receives unit mass across its valid tokens.
+    That row mass is then divided by the number of active response rows in its
+    logical rollout. The resulting tensor can be split at arbitrary row or token
+    boundaries while retaining exact rollout-level weighting.
+    """
+    if loss_mask.ndim != 2:
+        raise ValueError(
+            "loss_aggregation='rollout_mean' requires a padded 2D loss_mask "
+            "before engine microbatch packing."
+        )
+    if meta.rollout_groups is None or any(
+        group is None for group in meta.rollout_groups
+    ):
+        raise ValueError(
+            "loss_aggregation='rollout_mean' requires RolloutGroup metadata "
+            "for every prompt group."
+        )
+
+    row_counts = [
+        count
+        for group in meta.rollout_groups
+        if group is not None
+        for count in group.row_counts
+    ]
+    batch_size = loss_mask.shape[0]
+    if sum(row_counts) != batch_size:
+        raise ValueError(
+            f"logical rollout row counts sum to {sum(row_counts)}, "
+            f"expected batch size {batch_size}."
+        )
+
+    device = loss_mask.device
+    counts = torch.tensor(row_counts, dtype=torch.long, device=device)
+    rollout_ids = torch.arange(len(row_counts), device=device).repeat_interleave(
+        counts, output_size=batch_size
+    )
+    token_counts = loss_mask.reshape(batch_size, -1).sum(1, dtype=torch.float32)
+    active_rows = token_counts > 0
+    active_row_counts = torch.zeros(len(row_counts), dtype=torch.float32, device=device)
+    active_row_counts.scatter_add_(0, rollout_ids, active_rows.to(torch.float32))
+    row_weights = torch.where(
+        active_rows,
+        active_row_counts[rollout_ids].clamp_min(1).reciprocal(),
+        torch.zeros_like(token_counts),
+    )
+    token_weights = loss_mask.to(torch.float32) / token_counts.clamp_min(1).unsqueeze(1)
+    return token_weights * row_weights.unsqueeze(1)
 
 
 def _shape_advantages_with_gvpo(
@@ -670,6 +725,21 @@ class PPOActor:
         reward_score = data["rewards"]
         seqlens = attn_mask.sum(-1)
 
+        if self.config.loss_aggregation == "prompt_mean":
+            if meta is None:
+                raise ValueError(
+                    "loss_aggregation='prompt_mean' requires trajectory batch metadata."
+                )
+            data["group_sizes"] = meta.traj_group_sizes
+        elif self.config.loss_aggregation == "rollout_mean":
+            if meta is None:
+                raise ValueError(
+                    "loss_aggregation='rollout_mean' requires trajectory batch metadata."
+                )
+            data["loss_aggregation_weights"] = _build_rollout_mean_weights(
+                loss_mask, meta
+            )
+
         ########## Logging code starts ##########
         task_reward = (
             data["original_rewards"].float()
@@ -796,6 +866,10 @@ class PPOActor:
         with stats_tracker.scope("update"):
             # Get current version for proximal approximation metrics
             current_version = self.engine.get_version()
+            pg_reduction = PolicyGradientReduction(
+                mode=self.config.loss_aggregation,
+                divisor=self.config.loss_aggregation_divisor,
+            )
 
             for mb in mb_inputs:
                 train_stat = self.engine.train_batch(
@@ -816,8 +890,9 @@ class PPOActor:
                         use_cispo_loss=self.config.use_cispo_loss,
                         use_decoupled_loss=self.config.use_decoupled_loss,
                         mopd_loss_config=self._mopd_loss_config,
+                        pg_reduction=pg_reduction,
                     ),
-                    loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
+                    loss_weight_fn=pg_reduction.normalizer_fn,
                 )
                 stats_tracker.scalar(**train_stat)
 
@@ -977,6 +1052,7 @@ def grpo_loss_fn(
     use_cispo_loss: bool = False,
     use_decoupled_loss: bool = False,
     mopd_loss_config: MOPDLossConfig | None = None,
+    pg_reduction: PolicyGradientReduction | None = None,
     vocab_min_logits: torch.Tensor | None = None,
     vocab_max_logits: torch.Tensor | None = None,
     vocab_mean_logits: torch.Tensor | None = None,
@@ -985,6 +1061,14 @@ def grpo_loss_fn(
     """Loss function for actor step, all inputs should be splitted into
     pipeline micro batches, returns loss and logging stats."""
     loss_mask = input_data["loss_mask"].bool()
+    pg_reduction = pg_reduction or PolicyGradientReduction()
+    if pg_reduction.mode != "token_mean" and (
+        input_data.get("teacher_logp") is not None
+        or input_data.get("mopd_teacher_logp_sum") is not None
+    ):
+        raise ValueError(
+            "Teacher distillation is only supported with loss_aggregation='token_mean'."
+        )
     if mopd_loss_config is not None and mopd_loss_config.rl_coefficient == 0:
         teacher_logp_sum = input_data.get("mopd_teacher_logp_sum")
         teacher_weight_sum = input_data.get("mopd_teacher_weight_sum")
@@ -1068,6 +1152,10 @@ def grpo_loss_fn(
     # Apply M2PO masking if threshold is set
     if m2_threshold is not None:
         loss_mask = _apply_m2po_masking(old_logp, prox_logp, loss_mask, m2_threshold)
+    # Preserve the current denominator contract: M2 narrows both numerator and
+    # denominator, while behavioral rejection inside the surrogate narrows only
+    # the numerator.
+    denominator_mask = loss_mask
 
     # Use CISPO, SAPO, or PPO loss
     if use_cispo_loss:
@@ -1091,6 +1179,10 @@ def grpo_loss_fn(
             old_logprobs=old_logp,
             rejection_sampling=rejection_sampling,
             cu_seqlens=input_data.get("cu_seqlens"),
+            group_sizes=input_data.get("group_sizes"),
+            pg_reduction=pg_reduction,
+            denominator_mask=denominator_mask,
+            loss_aggregation_weights=input_data.get("loss_aggregation_weights"),
         )
     elif use_sapo_loss:
         if use_decoupled_loss:
@@ -1107,6 +1199,10 @@ def grpo_loss_fn(
             loss_mask=loss_mask,
             importance_sampling_level=importance_sampling_level,
             cu_seqlens=input_data.get("cu_seqlens"),
+            group_sizes=input_data.get("group_sizes"),
+            pg_reduction=pg_reduction,
+            denominator_mask=denominator_mask,
+            loss_aggregation_weights=input_data.get("loss_aggregation_weights"),
         )
     else:
         loss, stat = ppo_actor_loss_fn(
@@ -1121,6 +1217,10 @@ def grpo_loss_fn(
             rejection_sampling=rejection_sampling,
             importance_sampling_level=importance_sampling_level,
             cu_seqlens=input_data.get("cu_seqlens"),
+            group_sizes=input_data.get("group_sizes"),
+            pg_reduction=pg_reduction,
+            denominator_mask=denominator_mask,
+            loss_aggregation_weights=input_data.get("loss_aggregation_weights"),
         )
 
     # M2 is part of the shared training-validity contract. Behavioral

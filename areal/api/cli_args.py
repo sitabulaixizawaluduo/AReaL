@@ -1862,9 +1862,50 @@ class PPOActorConfig(TrainEngineConfig):
         metadata={
             "help": "Use CISPO loss: clip the importance-sampling weight under "
             "stop-gradient and keep gradient on every token's log pi (MiniMax-M1 "
-            "Eq. 4-5). Mutually exclusive with SAPO. Token-level only. Requires "
-            "eps_clip_higher > 0; recommended eps_clip=1.0 (single-sided, lower "
-            "bound 0) with eps_clip_higher=4.0."
+            "Eq. 4-5). Mutually exclusive with SAPO. Uses token-level "
+            "importance-sampling ratios. Requires eps_clip_higher > 0; recommended "
+            "eps_clip=1.0 (single-sided, lower bound 0) with eps_clip_higher=4.0."
+        },
+    )
+    loss_aggregation: str = field(
+        default="token_mean",
+        metadata={
+            "help": "Policy-gradient loss reduction. "
+            "'token_mean': average over valid tokens. "
+            "'seq_mean': average per-response token means. "
+            "'prompt_mean': average per-prompt-group token means. "
+            "'rollout_mean': average response token means within each logical "
+            "rollout, then average logical rollouts. "
+            "'constant': average each response's masked token sum divided by "
+            "loss_aggregation_divisor. Sequence, prompt, and constant modes require "
+            "sequence boundaries; rollout_mean requires RolloutGroup metadata. "
+            "Tree-packed actor training currently supports only 'token_mean'.",
+            "help_zh": "Policy-gradient loss 的归约方式。"
+            "'token_mean': 对有效 token 求平均。"
+            "'seq_mean': 先对每条 response 的有效 token 求平均，再对 response "
+            "求平均。'prompt_mean': 先对同一 prompt 的 response group 内有效 "
+            "token 求平均，再对 prompt group 求平均。'rollout_mean': 先对每条 "
+            "response 的有效 token 求平均，再在同一逻辑 rollout 内求平均，最后 "
+            "对逻辑 rollout 求平均。'constant': 将每条 response 的 masked token "
+            "loss 之和除以 loss_aggregation_divisor 后再求平均。seq_mean、"
+            "prompt_mean 和 constant 需要 sequence 边界；rollout_mean 需要 "
+            "RolloutGroup 元数据。tree-packed actor 训练目前仅支持 'token_mean'。",
+            "choices": [
+                "token_mean",
+                "seq_mean",
+                "prompt_mean",
+                "rollout_mean",
+                "constant",
+            ],
+        },
+    )
+    loss_aggregation_divisor: float | None = field(
+        default=None,
+        metadata={
+            "help": "Positive fixed denominator L for loss_aggregation='constant'. "
+            "Unused by other loss aggregation modes.",
+            "help_zh": "loss_aggregation='constant' 使用的正数固定分母 L。其他 "
+            "loss aggregation 模式不使用。",
         },
     )
 
@@ -1969,6 +2010,34 @@ class PPOActorConfig(TrainEngineConfig):
 
     def __post_init__(self):
         """Validate PPO actor configuration."""
+        valid_loss_aggregations = (
+            "token_mean",
+            "seq_mean",
+            "prompt_mean",
+            "rollout_mean",
+            "constant",
+        )
+        if self.loss_aggregation not in valid_loss_aggregations:
+            raise ValueError(
+                f"loss_aggregation must be one of {valid_loss_aggregations}, "
+                f"got {self.loss_aggregation!r}."
+            )
+        if self.loss_aggregation == "constant":
+            if (
+                self.loss_aggregation_divisor is None
+                or not math.isfinite(self.loss_aggregation_divisor)
+                or self.loss_aggregation_divisor <= 0
+            ):
+                raise ValueError(
+                    "loss_aggregation_divisor must be a positive finite value "
+                    "when loss_aggregation='constant'."
+                )
+        elif self.loss_aggregation_divisor is not None:
+            raise ValueError(
+                "loss_aggregation_divisor is only used when "
+                "loss_aggregation='constant'."
+            )
+
         if isinstance(self.gae_lambda, bool) or not isinstance(
             self.gae_lambda, int | float | str
         ):

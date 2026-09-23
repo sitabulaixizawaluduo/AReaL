@@ -62,8 +62,9 @@ closed-loop game score.
 ## Run offline GRPO
 
 The first RL stage is an offline, single-frame contextual-bandit task. It reuses the
-collected frames and teacher actions, samples several answers for the same prompt, and
-applies a deterministic verifier:
+collected frames and teacher actions and runs every sample through an agentic
+`async def run` workflow backed by AReaL's OpenAI-compatible rollout proxy. The agent
+samples several answers for the same prompt and applies a deterministic verifier:
 
 ```text
 reward = 1.0  if stripped completion == shuffled teacher-answer letter
@@ -80,15 +81,17 @@ On the configured eight-GPU host, run:
 bash examples/vlm/pacman_sft/run_qwen3_5_0_8b_8gpu_grpo.sh
 ```
 
-The launcher uses the final SFT Hugging Face export as the actor, tokenizer, and SGLang
-initial checkpoint. Four GPUs run `megatron:d4p1t1` and four run `sglang:d4p1t1`. Each
-optimizer update consumes 32 prompt groups with eight samples per group, for 256
-generated completions. Rewards are normalized within each eight-sample group;
-rollout-time reward normalization is disabled to avoid applying normalization twice.
-Evaluation uses a deterministic 1,000-example validation subset before training and
-every 100 steps.
+The default launcher starts directly from the Qwen3.5-0.8B base model; the epoch-2 SFT
+checkpoint remains an optional warm-start baseline. The eight physical GPUs are shared
+through AWEX colocation: the actor runs as `megatron:d8p1t1` and rollout runs as
+`sglang:d8p1t1` on the same GPU set, with memory ownership handed over between rollout
+and update phases. Each optimizer update consumes 32 prompt groups with eight samples
+per group, for 256 generated completions. Rewards are normalized within each
+eight-sample group; rollout-time reward normalization is disabled to avoid applying
+normalization twice. Evaluation uses a deterministic 1,000-example validation subset
+before training and every 100 steps.
 
-This stage verifies the SFT-checkpoint-to-GRPO-update path and improves one-step teacher
-imitation. It does not launch the Pacman process, advance an episode, or optimize game
-score. Online C1/C2 gameplay requires a separate environment-backed multi-step workflow
-and episode reward contract.
+This stage verifies the base-checkpoint-to-agentic-GRPO update path and improves
+one-step teacher imitation. It does not launch the Pacman process, advance an episode,
+or optimize game score. Online C1/C2 gameplay requires a separate environment-backed
+multi-step workflow and episode reward contract.

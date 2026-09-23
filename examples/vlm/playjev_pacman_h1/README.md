@@ -31,6 +31,25 @@ contains an image path, source-state oracle label, teacher action and probabilit
 seed, step, and replayable action prefix. The `PacmanH1Dataset` reads JSONL lazily; only
 the screenshot reaches model input. Do not serve the manifest itself to the model.
 
+Freeze a smaller first-run experiment from that collection pool. This copies selected
+images into separate train and valid directories; the original 100,000/2,000 records are
+not modified:
+
+```bash
+python3 -m examples.vlm.playjev_pacman_h1.snapshot \
+  --source /path/to/pacman_h1 \
+  --output /path/to/pacman_h1_experiment \
+  --train-count 4000 --valid-count 256 --seed 1
+```
+
+The snapshot command refuses to overwrite an existing output. It selects
+deterministically and excludes repeated sample IDs, source states, and image bytes
+within or across splits. It also verifies disjoint seeds and writes content hashes to
+`snapshot.json` and `train/split.json` / `valid/split.json`. The training entry point
+rechecks the complete snapshot before launch; moving the directory preserves its
+identity, but editing any sample invalidates it. Recheck a copied snapshot with
+`python3 -m examples.vlm.playjev_pacman_h1.snapshot --verify --output /path/to/pacman_h1_experiment`.
+
 H1 excludes frames where a ghost is vulnerable or eaten. The original teacher tracks
 hidden power-pill and ghost timers across steps, so the stateless tool would otherwise
 disagree with the source teacher. Those states require a stateful extension in a later
@@ -44,7 +63,7 @@ run:
 ```bash
 bash examples/vlm/playjev_pacman_h1/run_8gpu.sh \
   /path/to/Qwen3.5-0.8B \
-  /path/to/pacman_h1 \
+  /path/to/pacman_h1_experiment \
   /path/to/experiment_root
 ```
 
@@ -52,8 +71,10 @@ The script takes three positional paths and sets no environment variables. The r
 uses Megatron `d8p1t1`, SGLang AWEX colocation on the same eight GPUs, eight GRPO
 samples per prompt, `concat` export, group-level actor reward normalization, and a
 filter for identical-reward groups. Validation samples one deterministic rollout per
-screenshot every 100 steps. The full default training epoch covers the 100,000 train
-decisions; checkpoints are saved every 100 steps.
+screenshot every 25 steps. With the 4,000-decision snapshot and train batch size 64, one
+epoch has 62 updates (`drop_last=true`); each update requests eight GRPO rollouts per
+image. `max_tokens_per_mb` remains 16384, and checkpoints are saved every 25 steps and
+at the end of the epoch.
 
 The verifier reward is `0.4 * visual_state_accuracy + 0.6 * teacher_action_quality`.
 Action quality is the source teacher's probability for the chosen action divided by its

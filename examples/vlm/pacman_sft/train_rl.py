@@ -40,13 +40,11 @@ def main(args: list[str]) -> None:
         "temperature": config.gconfig.temperature,
         "top_p": config.gconfig.top_p,
         "max_tokens": config.gconfig.max_new_tokens,
-        "stop": config.gconfig.stop,
     }
     eval_workflow_kwargs = {
         "temperature": 0.0,
         "top_p": config.eval_gconfig.top_p,
         "max_tokens": config.eval_gconfig.max_new_tokens,
-        "stop": config.eval_gconfig.stop,
     }
     workflow = "examples.vlm.pacman_sft.pacman_agent.PacmanAgent"
 

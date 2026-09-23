@@ -48,8 +48,6 @@ gconfig:
   max_new_tokens: 4
   greedy: false
   temperature: 1.0
-  stop:
-    - "\n"
   seed: null
   reward_normalization: false
   drop_incomplete_group: true
@@ -60,8 +58,6 @@ eval_gconfig:
   max_new_tokens: 4
   greedy: true
   temperature: 1.0
-  stop:
-    - "\n"
   seed: null
 
 actor:

@@ -7,8 +7,8 @@ if [[ ! -f pyproject.toml ]]; then
   exit 2
 fi
 
-if [[ ! -d /storage/openpsi/experiments/checkpoints/admin/ljl-pacman-vlm-sft/qwen3_5_0_8b_8gpu-2/default/epoch2epochstep175globalstep527 ]]; then
-  echo "Pacman SFT checkpoint is missing." >&2
+if [[ ! -d /storage/openpsi/models/Qwen__Qwen3.5-0.8B ]]; then
+  echo "Qwen3.5-0.8B base model is missing." >&2
   exit 2
 fi
 
@@ -21,8 +21,8 @@ exec python3 examples/vlm/pacman_sft/train_rl.py \
   cluster.n_gpus_per_node=8 \
   cluster.fileroot=/storage/openpsi/experiments \
   cluster.name_resolve.nfs_record_root=/storage/openpsi/experiments/name_resolve \
-  actor.path=/storage/openpsi/experiments/checkpoints/admin/ljl-pacman-vlm-sft/qwen3_5_0_8b_8gpu-2/default/epoch2epochstep175globalstep527 \
-  tokenizer_path=/storage/openpsi/experiments/checkpoints/admin/ljl-pacman-vlm-sft/qwen3_5_0_8b_8gpu-2/default/epoch2epochstep175globalstep527 \
-  sglang.model_path=/storage/openpsi/experiments/checkpoints/admin/ljl-pacman-vlm-sft/qwen3_5_0_8b_8gpu-2/default/epoch2epochstep175globalstep527 \
+  actor.path=/storage/openpsi/models/Qwen__Qwen3.5-0.8B \
+  tokenizer_path=/storage/openpsi/models/Qwen__Qwen3.5-0.8B \
+  sglang.model_path=/storage/openpsi/models/Qwen__Qwen3.5-0.8B \
   train_dataset.path=/storage/openpsi/users/ljl/workspace/game_player/pacman \
   valid_dataset.path=/storage/openpsi/users/ljl/workspace/game_player/pacman

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-from typing import Any
 
 if __package__:
     from .pacman_dataset import get_pacman_rl_dataset
@@ -13,19 +12,6 @@ else:
 from areal import PPOTrainer
 from areal.api.cli_args import GRPOConfig, load_expr_config
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer
-
-
-def pacman_reward_fn(
-    prompt: str,
-    completions: str,
-    prompt_ids,
-    completion_ids,
-    expected_letter: str,
-    **kwargs: Any,
-) -> float:
-    """Reward an exact teacher-action match after deterministic option shuffling."""
-    del prompt, prompt_ids, completion_ids, kwargs
-    return float(str(completions).strip() == str(expected_letter).strip())
 
 
 def _build_dataset(dataset_config, processor):
@@ -51,14 +37,18 @@ def main(args: list[str]) -> None:
     )
 
     workflow_kwargs = {
-        "reward_fn": "examples.vlm.pacman_sft.train_rl.pacman_reward_fn",
-        "gconfig": config.gconfig,
-        "tokenizer": config.tokenizer_path,
-        "processor": config.tokenizer_path,
-        "enable_thinking": False,
+        "temperature": config.gconfig.temperature,
+        "top_p": config.gconfig.top_p,
+        "max_tokens": config.gconfig.max_new_tokens,
+        "stop": config.gconfig.stop,
     }
-    eval_workflow_kwargs = workflow_kwargs.copy()
-    eval_workflow_kwargs["gconfig"] = config.eval_gconfig
+    eval_workflow_kwargs = {
+        "temperature": 0.0,
+        "top_p": config.eval_gconfig.top_p,
+        "max_tokens": config.eval_gconfig.max_new_tokens,
+        "stop": config.eval_gconfig.stop,
+    }
+    workflow = "examples.vlm.pacman_sft.pacman_agent.PacmanAgent"
 
     with PPOTrainer(
         config,
@@ -66,9 +56,9 @@ def main(args: list[str]) -> None:
         valid_dataset=valid_dataset,
     ) as trainer:
         trainer.train(
-            workflow="areal.workflow.vision_rlvr.VisionRLVRWorkflow",
+            workflow=workflow,
             workflow_kwargs=workflow_kwargs,
-            eval_workflow="areal.workflow.vision_rlvr.VisionRLVRWorkflow",
+            eval_workflow=workflow,
             eval_workflow_kwargs=eval_workflow_kwargs,
         )
 

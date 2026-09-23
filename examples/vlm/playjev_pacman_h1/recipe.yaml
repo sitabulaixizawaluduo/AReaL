@@ -138,18 +138,18 @@ sglang:
   enable_multimodal: true
 
 train_dataset:
-  path: ./data/pacman_h1
+  path: ./data/pacman_h1_experiment/train
   type: rl
-  batch_size: 32
+  batch_size: 64
   shuffle: true
   pin_memory: true
   num_workers: 4
   drop_last: true
 
 valid_dataset:
-  path: ${train_dataset.path}
+  path: ./data/pacman_h1_experiment/valid
   type: rl
-  batch_size: 32
+  batch_size: 64
   shuffle: false
   pin_memory: true
   num_workers: 4
@@ -159,8 +159,8 @@ saver:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
-  freq_epochs: null
-  freq_steps: 100
+  freq_epochs: 1
+  freq_steps: 25
   freq_secs: null
 
 recover:
@@ -168,8 +168,8 @@ recover:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
-  freq_epochs: null
-  freq_steps: 100
+  freq_epochs: 1
+  freq_steps: 25
   freq_secs: 3600
 
 evaluator:
@@ -177,7 +177,7 @@ evaluator:
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
   freq_epochs: null
-  freq_steps: 100
+  freq_steps: 25
   freq_secs: null
   eval_before_train: true
 

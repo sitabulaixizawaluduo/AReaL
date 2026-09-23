@@ -5,15 +5,24 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 from areal import PPOTrainer
 from areal.api.cli_args import GRPOConfig, load_expr_config
 
 from .dataset import PacmanH1Dataset
+from .snapshot import verify_snapshot
 
 
 def main(args: list[str]) -> None:
     config, _ = load_expr_config(args, GRPOConfig)
+    train_root = Path(config.train_dataset.path).resolve()
+    valid_root = Path(config.valid_dataset.path).resolve()
+    if train_root == valid_root or train_root.parent != valid_root.parent:
+        raise ValueError("train and valid must be separate directories in one snapshot")
+    if train_root.name != "train" or valid_root.name != "valid":
+        raise ValueError("snapshot split directories must be named train and valid")
+    verify_snapshot(train_root.parent)
     train_dataset = PacmanH1Dataset(config.train_dataset.path, "train")
     valid_dataset = PacmanH1Dataset(config.valid_dataset.path, "valid")
     workflow = "examples.vlm.playjev_pacman_h1.workflow.PacmanH1Agent"

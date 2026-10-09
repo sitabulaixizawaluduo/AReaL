@@ -1,6 +1,7 @@
 experiment_name: playjev-pacman-sft
 trial_name: trial0
-allocation_mode: megatron:d1p1t1
+# Throughput starting point for Qwen3.5-2B on one 8-GPU H200 node.
+allocation_mode: megatron:d8p1t1
 seed: 0
 enable_offload: false
 total_train_epochs: 1
@@ -9,7 +10,7 @@ tokenizer_path: ${actor.path}
 
 cluster:
   n_nodes: 1
-  n_gpus_per_node: 1
+  n_gpus_per_node: 8
   fileroot: ${oc.env:AREAL_OUTPUT_ROOT,/tmp/areal/experiments}
   name_resolve:
     type: nfs
@@ -24,12 +25,14 @@ actor:
   trial_name: ${trial_name}
   path: ${oc.env:MODEL_PATH}
   init_from_scratch: false
-  gradient_checkpointing: true
+  gradient_checkpointing: false
   dtype: bfloat16
   temperature: 1.0
   enable_tree_training: false
   mb_spec:
-    max_tokens_per_mb: 4096
+    # Per DP rank; includes image tokens. Tune against measured peak memory.
+    n_mbs: 1
+    max_tokens_per_mb: 32768
     n_mbs_divisor: 1
   megatron:
     bridge_type: megatron-bridge
@@ -37,13 +40,14 @@ actor:
     enable_mtp_training: false
     enable_chunked_logits: false
     lm_head_loss_chunk_size: 0
-    recompute_granularity: full
-    recompute_method: uniform
-    recompute_num_layers: 1
+    # Megatron Bridge applies these fields independently of gradient_checkpointing.
+    recompute_granularity: null
+    recompute_method: null
+    recompute_num_layers: null
     ddp:
       use_distributed_optimizer: true
-      overlap_grad_reduce: false
-      overlap_param_gather: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
   optimizer:
     type: adam
     lr: 2e-5
@@ -65,7 +69,7 @@ actor:
 
 train_dataset:
   path: ${oc.env:PLAYJEV_DATA_ROOT}
-  batch_size: 64
+  batch_size: 512
   shuffle: true
   num_workers: 4
   max_length: 4096
@@ -75,7 +79,7 @@ train_dataset:
 
 valid_dataset:
   path: ${train_dataset.path}
-  batch_size: 64
+  batch_size: 512
   shuffle: false
   drop_last: false
   num_workers: 4

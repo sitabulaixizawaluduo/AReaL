@@ -11,6 +11,11 @@ cd "$REPO_ROOT"
   examples/game_player/pacman_sft/train.py \
   --config examples/game_player/pacman_sft/megatron.yaml \
   trial_name="smoke-$(date +%Y%m%d-%H%M%S)" \
+  allocation_mode=megatron:d1p1t1 cluster.n_gpus_per_node=1 \
+  actor.mb_spec.max_tokens_per_mb=4096 actor.gradient_checkpointing=true \
+  actor.megatron.recompute_granularity=full actor.megatron.recompute_method=uniform \
+  actor.megatron.recompute_num_layers=1 \
+  actor.megatron.ddp.overlap_grad_reduce=false actor.megatron.ddp.overlap_param_gather=false \
   total_train_steps=2 train_dataset.batch_size=2 valid_dataset.batch_size=2 \
   train_dataset.num_workers=0 valid_dataset.num_workers=0 \
   +train_dataset.dataset_kwargs.limit=4 +valid_dataset.dataset_kwargs.limit=2 \

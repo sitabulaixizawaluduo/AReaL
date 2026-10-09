@@ -128,6 +128,7 @@ from areal.models.tree_attn.module import (
     patch_bridge_for_tree_training,
 )
 from areal.models.tree_attn.tree import build_packed_tree_batch
+from areal.trainer.sft.candidate_objective import CandidateSoftSFTObjective
 from areal.utils import logging, name_resolve, names, perf_tracer, stats_tracker
 from areal.utils.constants import (
     DEFAULT_VECTORIZED_ALIGNMENT_BYTES,
@@ -1399,6 +1400,7 @@ class MegatronEngine(TrainEngine):
         ],
         forward_only: bool = False,
         gather_cp_output: bool = False,
+        candidate_soft_sft: bool = False,
     ) -> None:
         self._ensure_ready()
         validate_transport_padding(
@@ -1410,6 +1412,20 @@ class MegatronEngine(TrainEngine):
 
         def forward_step(batch_iter, model):
             source_mb: MicroBatchItem = next(batch_iter)
+            if CandidateSoftSFTObjective.enabled(source_mb.orig_mb):
+                if not candidate_soft_sft:
+                    raise ValueError("Soft candidate targets require the SFT objective")
+                if self.config.temperature != 1.0:
+                    raise ValueError("Candidate soft SFT requires temperature=1")
+                if (
+                    mpu.get_context_parallel_world_size() != 1
+                    or self.enable_tree_training
+                    or self.mcore_config.enable_mtp_training
+                    or self.mcore_config.lm_head_loss_chunk_size > 0
+                ):
+                    raise NotImplementedError(
+                        "Candidate soft SFT requires CP=1, no tree, MTP training or chunked LM head"
+                    )
             # Keep MicroBatchList CPU-only. The returned accelerator dictionaries
             # are owned solely by this forward step and cannot accumulate in the
             # source list as the schedule consumes more microbatches.
@@ -1743,6 +1759,7 @@ class MegatronEngine(TrainEngine):
                 mb_list,
                 process_output,
                 forward_only=False,
+                candidate_soft_sft=isinstance(loss_fn, CandidateSoftSFTObjective),
             )
 
             # Step 4: Optimizer step
@@ -1820,7 +1837,12 @@ class MegatronEngine(TrainEngine):
             losses.append(loss.detach())
             return loss
 
-        self.forward_backward_batch(mb_list, process_output, forward_only=True)
+        self.forward_backward_batch(
+            mb_list,
+            process_output,
+            forward_only=True,
+            candidate_soft_sft=isinstance(loss_fn, CandidateSoftSFTObjective),
+        )
 
         # Step 4: Aggregate losses
         if mpu.is_pipeline_last_stage():
@@ -3452,19 +3474,28 @@ class MegatronEngine(TrainEngine):
                     vocab_norm_logits = torch.linalg.vector_norm(
                         output.detach(), dim=-1, dtype=torch.float32
                     )
-                    logprobs, entropy = gather_logprobs_entropy(
-                        output,
-                        labels,
-                        temperature=self.config.temperature,
-                        tp_group=mpu.get_tensor_model_parallel_group()
-                        if mpu.get_tensor_model_parallel_world_size() > 1
-                        else None,
-                        chunk_size=self.config.logprobs_chunk_size,
-                        reuse_logits=_reuse_chunked_logits_storage(
-                            self.mcore_config.enable_chunked_logits,
-                            self.mcore_config.entropy_requires_grad,
-                        ),
-                    )
+                    if CandidateSoftSFTObjective.enabled(inputs):
+                        logprobs, entropy = CandidateSoftSFTObjective.readout(
+                            output,
+                            inputs,
+                            tp_group=mpu.get_tensor_model_parallel_group()
+                            if mpu.get_tensor_model_parallel_world_size() > 1
+                            else None,
+                        )
+                    else:
+                        logprobs, entropy = gather_logprobs_entropy(
+                            output,
+                            labels,
+                            temperature=self.config.temperature,
+                            tp_group=mpu.get_tensor_model_parallel_group()
+                            if mpu.get_tensor_model_parallel_world_size() > 1
+                            else None,
+                            chunk_size=self.config.logprobs_chunk_size,
+                            reuse_logits=_reuse_chunked_logits_storage(
+                                self.mcore_config.enable_chunked_logits,
+                                self.mcore_config.entropy_requires_grad,
+                            ),
+                        )
                 if cp_padded_cu_seqlens is not None:
                     logprobs = reassemble_cp_packed_logprobs(
                         logprobs, cp_padded_cu_seqlens
@@ -3763,6 +3794,8 @@ class MegatronPPOCritic(MegatronEngine):
 
 class MegatronLMEngine(MegatronEngine):
     """Language model engine for SFT using Megatron backend."""
+
+    supports_candidate_soft_targets = True
 
     def __init__(self, config: TrainEngineConfig):
         from areal.trainer.sft.lm_engine import LMEngine

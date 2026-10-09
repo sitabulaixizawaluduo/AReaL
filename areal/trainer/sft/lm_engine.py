@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -8,6 +9,7 @@ from areal.api import TrainEngine
 from areal.engine.core import stage_batch_for_engine
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
+from areal.trainer.sft.candidate_objective import CandidateSoftSFTObjective
 from areal.utils import stats_tracker
 from areal.utils.data import batched_call
 from areal.utils.perf_tracer import trace_perf
@@ -26,13 +28,14 @@ class LMEngine:
         batched_call(self._train_lm, data, unpack=False)
 
     def _train_lm(self, data: dict[str, Any]) -> None:
+        loss_fn = self._objective(data)
         self.engine.train()
         data["input_token_loss_mask"] = data["loss_mask"].bool()
         data["loss_mask"] = torch.roll(data["loss_mask"].bool(), shifts=-1, dims=-1)
         stage_batch_for_engine(data, self.engine)
         stats = self.engine.train_batch(
             input_=data,
-            loss_fn=compute_packed_sft_loss,
+            loss_fn=loss_fn,
             loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
         )
         stats_tracker.scalar(**stats)
@@ -43,15 +46,25 @@ class LMEngine:
         batched_call(self._evaluate_lm, data, unpack=False)
 
     def _evaluate_lm(self, data: dict[str, Any]) -> None:
+        loss_fn = self._objective(data)
         self.engine.eval()
         data["input_token_loss_mask"] = data["loss_mask"].bool()
         data["loss_mask"] = torch.roll(data["loss_mask"].bool(), shifts=-1, dims=-1)
         stage_batch_for_engine(data, self.engine)
         self.engine.eval_batch(
             input_=data,
-            loss_fn=compute_packed_sft_loss,
+            loss_fn=loss_fn,
             loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
         )
+
+    def _objective(self, data: dict[str, Any]) -> Callable[..., torch.Tensor]:
+        if not CandidateSoftSFTObjective.enabled(data):
+            return compute_packed_sft_loss
+        if not getattr(self.engine, "supports_candidate_soft_targets", False):
+            raise NotImplementedError("Candidate soft SFT currently requires Megatron")
+        if data["input_ids"].device.type == "cpu":
+            CandidateSoftSFTObjective.validate(data)
+        return CandidateSoftSFTObjective()
 
 
 class LMController(TrainController):

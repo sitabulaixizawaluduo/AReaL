@@ -96,19 +96,58 @@ bash examples/game_player/pacman_sft/run_train.sh total_train_epochs=2
 ```
 
 `train.py` 直接构建两个 dataset 并调用 `SFTTrainer.train()`，沿用已有配置。 PlayJev 专用数据参数使用已有的
-`dataset_kwargs`，没有修改 `cli_args.py` 或 launcher。 默认配置是单 GPU 的
-`megatron:d1p1t1`，便于先验证小模型；它不是显存或速度保证。
+`dataset_kwargs`，没有修改 `cli_args.py` 或 launcher。 默认配置针对当前 Qwen3.5-2B、单机 8 张 H200，使用
+`megatron:d8p1t1`（DP=8，TP=PP=CP=1）。每卡保留完整模型，分片 optimizer； 对这个小模型优先用数据并行扩大
+batch，减少模型并行通信。以下是吞吐优先的起始配置，最大吞吐与显存占用仍需在目标机器实测。
 
-| 参数         | Recipe                                                  |
-| ------------ | ------------------------------------------------------- |
-| 输入         | 单帧，原 plain prompt，四个方向全部保留并随机排列       |
-| 标签         | 原 teacher_probs，保持原采集器的四位小数                |
-| 划分         | 原 PlayJev 的 seed 隔离 train/validation                |
-| 更新         | 全参数 SFT，一轮，global batch 64                       |
-| 优化器       | Adam，lr 2e-5，betas 0.9/0.95，eps 1e-8，weight decay 0 |
-| 调度         | cosine，warmup 3%，gradient clipping 1.0                |
-| 精度         | BF16，gradient checkpointing，候选 softmax/CE 用 FP32   |
-| Token budget | 每个样本和 microbatch 4096；超长样本报错，不截断图像    |
+| 参数         | Recipe                                                   |
+| ------------ | -------------------------------------------------------- |
+| 输入         | 单帧，原 plain prompt，四个方向全部保留并随机排列        |
+| 标签         | 原 teacher_probs，保持原采集器的四位小数                 |
+| 划分         | 原 PlayJev 的 seed 隔离 train/validation                 |
+| 更新         | 全参数 SFT，一轮，global batch 512，每个 DP rank 64 条   |
+| 优化器       | Adam，lr 2e-5，betas 0.9/0.95，eps 1e-8，weight decay 0  |
+| 调度         | cosine，warmup 3%，gradient clipping 1.0                 |
+| 精度         | BF16，关闭 activation recompute，候选 softmax/CE 用 FP32 |
+| Token budget | 单样本上限 4096；每卡 microbatch 总 token 上限 32768     |
+
+`max_tokens_per_mb` 是每个 DP rank 单次 forward 的总 token 预算，包含图像 token， 不是样本数量；packing 可能把每卡
+64 条拆成多个 microbatch。`n_mbs=1` 不强制梯度累积。 本地用当前 2B processor 检查了 32 条采集样本，长度都是 269 tokens；
+按这一长度，每卡 64 条约 17,216 tokens，packing 会分配为一个 microbatch。 这只是输入长度检查，没有执行 GPU forward
+或吞吐测试。 当前实现仍计算完整词表 LM head，再提取四项 logits；按 248,320 词表和 FP32 输出估算， 17,216 tokens 的单份
+logits 约 15.9 GiB，且还需考虑 logits 副本、反向梯度和模型激活。 四项 softmax 不代表仅有四项输出的显存成本，因此显存不能只按 2B 权重估算。
+
+开启 distributed optimizer、gradient reduce/parameter gather overlap，关闭 offload。 Megatron
+Bridge 会读取 `recompute_*`，因此同时将这些字段设为 `null`，确保全层重计算关闭。 每个 DP rank 使用 4 个数据加载 worker，共 32
+个；若 CPU/JPEG 处理成为瓶颈，再按实际 CPU 资源调整。 保持原始图片处理与 prompt，不通过降低分辨率改变监督任务。
+
+当前本地采集的训练 split 是 7,597 条。默认 `drop_last=true`，global batch 从 64 改到 512 后， 每轮更新次数从 118 降至
+14，并丢弃尾部 429 条；这是吞吐优先带来的优化行为变化。 学习率保持 2e-5，不按 batch 比例放大。需要更多更新时增加数据量或训练轮数。
+
+在 H200 上比较稳定阶段的 samples/s、有效 tokens/s 和峰值显存；排除模型加载、首步、验证和 checkpoint 时间。 更大 batch
+不保证更快。可通过已有启动脚本比较下面两档；同一预算下，batch 变大可能只增加梯度累积次数：
+
+```bash
+# 较小的每卡 microbatch：32 条，约 8,608 tokens（按上述样本长度）。
+bash examples/game_player/pacman_sft/run_train.sh \
+  train_dataset.batch_size=256 valid_dataset.batch_size=256 \
+  actor.mb_spec.max_tokens_per_mb=16384
+
+# 更大的每卡 microbatch：128 条，约 34,432 tokens，需要实测显存与吞吐。
+bash examples/game_player/pacman_sft/run_train.sh \
+  train_dataset.batch_size=1024 valid_dataset.batch_size=1024 \
+  actor.mb_spec.max_tokens_per_mb=65536
+```
+
+若默认档 OOM，先将 `actor.mb_spec.max_tokens_per_mb=16384`，保持 global batch 512； 这会拆出更多
+microbatch。仍不够时开启重计算：
+
+```bash
+bash examples/game_player/pacman_sft/run_train.sh \
+  actor.mb_spec.max_tokens_per_mb=16384 actor.gradient_checkpointing=true \
+  actor.megatron.recompute_granularity=full actor.megatron.recompute_method=uniform \
+  actor.megatron.recompute_num_layers=1
+```
 
 TP/PP/DP 可通过现有 allocation 参数调整，例如双卡 TP：
 

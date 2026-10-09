@@ -1,0 +1,114 @@
+experiment_name: playjev-pacman-sft
+trial_name: trial0
+allocation_mode: megatron:d1p1t1
+seed: 0
+enable_offload: false
+total_train_epochs: 1
+total_train_steps: null
+tokenizer_path: ${actor.path}
+
+cluster:
+  n_nodes: 1
+  n_gpus_per_node: 1
+  fileroot: ${oc.env:AREAL_OUTPUT_ROOT,/tmp/areal/experiments}
+  name_resolve:
+    type: nfs
+    nfs_record_root: ${cluster.fileroot}/name_resolve
+
+scheduler:
+  type: local
+
+actor:
+  backend: ${allocation_mode}
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${oc.env:MODEL_PATH}
+  init_from_scratch: false
+  gradient_checkpointing: true
+  dtype: bfloat16
+  temperature: 1.0
+  enable_tree_training: false
+  mb_spec:
+    max_tokens_per_mb: 4096
+    n_mbs_divisor: 1
+  megatron:
+    bridge_type: megatron-bridge
+    enable_mtp: false
+    enable_mtp_training: false
+    enable_chunked_logits: false
+    lm_head_loss_chunk_size: 0
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    ddp:
+      use_distributed_optimizer: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+  optimizer:
+    type: adam
+    lr: 2e-5
+    weight_decay: 0.0
+    beta1: 0.9
+    beta2: 0.95
+    eps: 1e-8
+    lr_scheduler_type: cosine
+    warmup_steps_proportion: 0.03
+    warmup_steps: null
+    gradient_clipping: 1.0
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars: {}
+
+train_dataset:
+  path: ${oc.env:PLAYJEV_DATA_ROOT}
+  batch_size: 64
+  shuffle: true
+  num_workers: 4
+  max_length: 4096
+  dataset_kwargs:
+    playjev_root: ${oc.env:PLAYJEV_ROOT}
+    seed: ${seed}
+
+valid_dataset:
+  path: ${train_dataset.path}
+  batch_size: 64
+  shuffle: false
+  drop_last: false
+  num_workers: 4
+  max_length: 4096
+  dataset_kwargs:
+    playjev_root: ${oc.env:PLAYJEV_ROOT}
+    seed: ${seed}
+
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled

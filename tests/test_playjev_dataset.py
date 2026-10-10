@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from areal.dataset.playjev import PlayJevPacmanDataset
@@ -24,9 +25,12 @@ class _Processor:
         }
 
 
+@pytest.mark.parametrize("boost_last", [None, [10, 4], (10, 4), [1, 1]])
+@pytest.mark.parametrize("split", ["train", "validation"])
 def test_adapter_permuted_target_and_multimodal_payload_survive_packing(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, boost_last, split
 ):
+    """Forward optional resampling while preserving target and payload channels."""
     upstream_dir = tmp_path / "playjev"
     upstream_dir.mkdir()
     (upstream_dir / "data.py").touch()
@@ -37,9 +41,15 @@ def test_adapter_permuted_target_and_multimodal_payload_survive_packing(
         "target": [0.7, 0.1, 0.15, 0.05],
         "image": "frame",
     }
+    load_kwargs = {}
+
+    def load_records(*args, **kwargs):
+        load_kwargs.update(kwargs)
+        return [train_record]
+
     upstream = SimpleNamespace(
         __file__=str(upstream_dir / "data.py"),
-        load_records=lambda *args, **kwargs: [train_record],
+        load_records=load_records,
         split_records=lambda records: (records, records),
         SFTDataset=lambda records, **kwargs: [item],
     )
@@ -53,7 +63,14 @@ def test_adapter_permuted_target_and_multimodal_payload_survive_packing(
         lambda name: (upstream if name == "playjev.data" else model),
     )
     dataset = PlayJevPacmanDataset(
-        str(tmp_path), "train", _Processor(), playjev_root=str(tmp_path)
+        str(tmp_path),
+        split,
+        _Processor(),
+        playjev_root=str(tmp_path),
+        boost_last=boost_last,
+    )
+    assert load_kwargs["boost_last"] == (
+        tuple(boost_last) if boost_last is not None else None
     )
     sample = dataset[0]
     assert sample["input_ids"].tolist() == [1, 2, 3, 10]
@@ -79,3 +96,20 @@ def test_adapter_permuted_target_and_multimodal_payload_survive_packing(
         *(f"candidate_id_{i}" for i in range(4)),
         *(f"candidate_target_{i}" for i in range(4)),
     }
+
+
+@pytest.mark.parametrize(
+    "boost_last", [[], [10], [10, 4, 2], [0, 4], [10, -1], [True, 4], [10, 1.5], "10,4"]
+)
+def test_adapter_invalid_boost_last_rejected_before_loading(tmp_path, boost_last):
+    """Reject malformed resampling options before touching the upstream checkout."""
+    with pytest.raises(
+        ValueError, match="boost_last must contain two positive integers"
+    ):
+        PlayJevPacmanDataset(
+            str(tmp_path),
+            "train",
+            _Processor(),
+            playjev_root=str(tmp_path),
+            boost_last=boost_last,
+        )

@@ -2,6 +2,7 @@
 
 import importlib
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +30,18 @@ class PlayJevPacmanDataset(Dataset):
         shards: list[str] | None = None,
         seed: int = 0,
         limit: int = 0,
+        boost_last: Sequence[int] | None = None,
     ) -> None:
+        if boost_last is not None:
+            if (
+                not isinstance(boost_last, Sequence)
+                or len(boost_last) != 2
+                or any(type(value) is not int or value <= 0 for value in boost_last)
+            ):
+                raise ValueError(
+                    "boost_last must contain two positive integers: [last_k, times]"
+                )
+            boost_last = (boost_last[0], boost_last[1])
         root = Path(playjev_root).expanduser().resolve()
         if not (root / "playjev" / "data.py").is_file():
             raise FileNotFoundError(f"Not a PlayJev checkout: {root}")
@@ -41,7 +53,10 @@ class PlayJevPacmanDataset(Dataset):
         if split not in ("train", "validation"):
             raise ValueError("Pacman split must be train or validation")
         records = upstream.load_records(
-            ["pacman"], data_root=Path(path).expanduser(), shards=shards or []
+            ["pacman"],
+            data_root=Path(path).expanduser(),
+            shards=shards or [],
+            boost_last=boost_last,
         )
         train, val = upstream.split_records(records)
         selected = train if split == "train" else val

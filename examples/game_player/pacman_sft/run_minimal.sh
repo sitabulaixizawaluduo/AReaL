@@ -19,4 +19,4 @@ cd "$REPO_ROOT"
   total_train_steps=2 train_dataset.batch_size=2 valid_dataset.batch_size=2 \
   train_dataset.num_workers=0 valid_dataset.num_workers=0 \
   +train_dataset.dataset_kwargs.limit=4 +valid_dataset.dataset_kwargs.limit=2 \
-  actor.optimizer.warmup_steps=0 saver.freq_steps=2 evaluator.freq_steps=2
+  actor.optimizer.warmup_steps=0 saver.freq_steps=2 evaluator.freq_steps=2 "$@"

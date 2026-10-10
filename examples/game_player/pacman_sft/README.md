@@ -173,6 +173,39 @@ head；数值精度、batch packing、调度实现和 worker 随机种子与原�
 有限、候选熵在合理范围，并与未训练模型的验证 CE 比较。 checkpoint 使用 AReaL saver 的 Hugging Face 导出格式，写入
 `AREAL_OUTPUT_ROOT`。 CE 下降说明 teacher imitation 改善，游戏成绩需要另行闭环评估。
 
+## 短局末尾样本加权（boost-last）
+
+通过已有 `dataset_kwargs` 开启 PlayJev 的 `boost_last`，默认不重复样本：
+
+```bash
+bash examples/game_player/pacman_sft/run_train.sh \
+  '+train_dataset.dataset_kwargs.boost_last=[10,4]'
+```
+
+也可在 recipe 的 `train_dataset.dataset_kwargs` 下添加 `boost_last: [10, 4]`。 参数必须是两个正整数
+`[last_k, times]`，`times=1` 表示不增加副本。 加载器直接复用上游 `load_records(boost_last=(10, 4))`：按每个
+shard 内的 `(seed, episode)` 分组，对记录的 `max(step)+1 < 500` 的训练局，最后 10 条 记录各补 3 个副本，总共出现 4
+次；`seed % 10 == 0` 的验证样本不重复。 这是对现有截图与 teacher 软标签的重采样，随后仍由上游随机排列选项，再计算四项 soft CE。
+短局可能是死亡、成功或采集截断，不能将其全部视为死亡局。
+
+该参数作用于所有选中的 shard，包括 cloning 和 DAgger shard。请通过 `dataset_kwargs.shards`
+显式选择本轮混训数据；如果同时设置 `limit`，它在重复和 train/validation 划分后截取样本，可能截掉追加的副本。上游在列表末尾追加副本，因此不要 用很小的
+`limit` 来衡量实际加权效果。重复后每轮样本量和更新次数可能增加。
+
+以下最小和端到端验证命令**未在本地运行**；预期完成训练、验证与 checkpoint 导出， 日志中的候选 soft CE 有限，验证集样本量保持不变：
+
+```bash
+# 单卡最小验证；关闭默认的训练 limit，让追加的副本保留在数据集中。
+bash examples/game_player/pacman_sft/run_minimal.sh \
+  '+train_dataset.dataset_kwargs.boost_last=[10,4]' \
+  train_dataset.dataset_kwargs.limit=0
+
+# 新建 teacher shard → 按同一规则重复末尾样本 → SFT → 验证 → HF checkpoint。
+COLLECT_STEPS=1000 bash examples/game_player/pacman_sft/run_e2e.sh \
+  '+train_dataset.dataset_kwargs.boost_last=[10,4]' \
+  train_dataset.batch_size=8 valid_dataset.batch_size=8
+```
+
 ## 验证脚本
 
 下面的 UT、GPU smoke 和端到端脚本均**未在本地运行**。
